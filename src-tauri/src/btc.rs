@@ -126,18 +126,22 @@ pub fn base58check(payload: &[u8]) -> String {
     bs58_encode(&full)
 }
 
+/// Legacy P2PKH address (mainnet, starts with `1`).  Accepts either a compressed
+/// (33-byte) or uncompressed (65-byte) public key — the only difference is the
+/// input byte format, so the hash160 + base58check path is shared.
 #[inline(always)]
-pub fn p2pkh_compressed(pub_key: &[u8]) -> String {
+pub fn p2pkh(pub_key: &[u8]) -> String {
     let h = hash160(pub_key);
     let mut pld = Vec::with_capacity(21);
-    pld.push(0x00);
+    pld.push(0x00); // mainnet P2PKH version byte
     pld.extend_from_slice(&h);
     base58check(&pld)
 }
 
+/// Legacy P2PKH, mainnet.  Convenience wrapper used by the scanner hot path.
 #[inline(always)]
-pub fn p2pkh_uncompressed(pub_key: &[u8]) -> String {
-    p2pkh_compressed(pub_key)  // same pubkey format; bytes differ only in input
+pub fn p2pkh_compressed(pub_key: &[u8]) -> String {
+    p2pkh(pub_key)
 }
 
 #[inline(always)]
@@ -148,7 +152,7 @@ pub fn p2sh_p2wpkh(pub_key: &[u8]) -> String {
     redeem.extend_from_slice(&h);
     let sh = hash160(&redeem);
     let mut pld = Vec::with_capacity(21);
-    pld.push(0x05);
+    pld.push(0x05); // mainnet P2SH version byte
     pld.extend_from_slice(&sh);
     base58check(&pld)
 }

@@ -33,6 +33,8 @@ base58 = "0.2"
 bech32 = "0.11"
 # hashing
 ripemd = "0.1"
+# HMAC-SHA512 for BIP32 master key derivation
+hmac = "0.12"
 
 # ── GPU (cross-platform via wgpu + naga WGSL→MSL/Vulkan/DX12) ────────────────
 wgpu = "28"

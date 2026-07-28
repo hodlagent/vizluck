@@ -11,6 +11,7 @@ fn greet(name: &str) -> String {
 // primitives the GPU worker needs.
 pub mod btc;
 pub mod gpu;
+pub mod homepage;
 pub mod puzzles;
 pub mod progress;
 pub mod workers;
@@ -19,7 +20,13 @@ pub mod workers;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            homepage::get_puzzles,
+            homepage::random_and_derive,
+            homepage::random_and_hash160,
+            homepage::derive_full
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
