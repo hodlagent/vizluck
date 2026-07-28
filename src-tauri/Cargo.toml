@@ -23,3 +23,44 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# ── BTC / secp256k1 ──────────────────────────────────────────────────────────
+# secp256k1 scalar mult + pubkey derivation (C libsecp256k1 backend).
+secp256k1 = { version = "0.31.1", features = ["hashes", "std"] }
+
+# address base58 encoding (no dependencies, stateless)
+base58 = "0.2"
+# bech32 / bech32m (P2WPKH, P2TR)
+bech32 = "0.11"
+# hashing
+ripemd = "0.1"
+
+# ── GPU (cross-platform via wgpu + naga WGSL→MSL/Vulkan/DX12) ────────────────
+wgpu = "28"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+anyhow = "1"
+
+# parallelism (GPU worker seeding)
+rayon = "1.10"
+
+# fast non-crypto hash for the puzzle lookup index
+rustc-hash = "2.0"
+
+# hex encoding for puzzle JSON parsing
+hex = "0.4"
+
+# RNG — only sys_rng (getrandom 0.4) enabled
+rand = { version = "0.10.2", default-features = false, features = ["sys_rng"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this
+# activates the ARMv8-Crypto SHA256/SHA256H2 instructions, giving ~3-5× SHA256
+# throughput over the pure-Rust fallback.
+sha2 = { version = "0.10", features = ["asm"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows: pure-Rust SHA256 implementation (no asm).
+sha2 = { version = "0.10" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }

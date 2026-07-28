@@ -4,6 +4,17 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+// BTC address derivation helpers + GPU-accelerated secp256k1 scanner.
+// These modules are adapted from the `luckfind` crate (Bitcoin dormant-address
+// lottery). `btc` exposes address derivation; `gpu` exposes the wgpu/WGSL
+// scanner backend; `puzzles`/`progress`/`workers` are the shared scanning
+// primitives the GPU worker needs.
+pub mod btc;
+pub mod gpu;
+pub mod puzzles;
+pub mod progress;
+pub mod workers;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
