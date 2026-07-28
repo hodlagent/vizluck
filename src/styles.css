@@ -198,6 +198,21 @@ body {
   z-index: 1;
 }
 
+/* Hover-cycling cell: lit by the accent while it counts through its range. */
+.cell.cycling {
+  border-color: var(--accent);
+  box-shadow: 0 0 10px rgba(247, 147, 26, 0.55);
+  color: var(--accent);
+}
+
+/* A cell that produced a match: frozen green, hover disabled. */
+.cell.matched {
+  border-color: var(--green);
+  box-shadow: 0 0 10px rgba(46, 204, 113, 0.55);
+  color: var(--green);
+  pointer-events: none;
+}
+
 /* ── Info cards ──────────────────────────────────────────────────────────── */
 
 .info {

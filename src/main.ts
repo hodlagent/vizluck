@@ -8,6 +8,10 @@ interface PuzzleInfo {
   start_hex: string;
   end_hex: string;
   hash160: string;
+  /** Inclusive lower bound of the top byte (first grid cell). */
+  start_top: number;
+  /** Exclusive upper bound of the top byte; 0 encodes overflow (real max 0xFF). */
+  end_top: number;
 }
 
 type RangeSpec =
@@ -70,6 +74,18 @@ function setButtonsDisabled(disabled: boolean) {
 
 let autoTimer: number | null = null;
 let toastTimer: number | null = null;
+
+// ── Hover state ──────────────────────────────────────────────────────────
+// When the grid is fixed (after Random, or Auto paused) hovering a cell cycles
+// that byte +1.  See startHoverCycle / hoverTick.
+const HOVER_INTERVAL_MS = 60;
+let hoverTimer: number | null = null;
+let hoverCellIdx = -1;
+let hoverStartVal = -1;
+/** Inclusive lower bound for a bounded first cell, or null for a free cell. */
+let hoverMinVal: number | null = null;
+/** Inclusive upper bound for a bounded first cell, or null for a free cell. */
+let hoverMaxVal: number | null = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -317,6 +333,7 @@ async function onRandom() {
     setButtonsDisabled(false);
   }
   stopAuto();
+  stopHoverCycle();
   await derive();
 }
 
@@ -333,6 +350,7 @@ function onAuto() {
     matchFound = false;
     setButtonsDisabled(false);
   }
+  stopHoverCycle();
   btnAuto.textContent = "⏸ Stop";
   const tick = async () => {
     await autoTick();
@@ -352,11 +370,147 @@ function stopAuto() {
   btnAuto.textContent = "▶ Auto";
 }
 
+// ── Hover interaction ─────────────────────────────────────────────────────
+// In the "fixed grid" states (after Random, or Auto paused) hovering a cell
+// cycles that byte upward by 1.  Only one cell cycles at a time — hovering a
+// new cell stops the previous cycle and starts the new one.  The grid is left
+// untouched (no renderGrid) so the cycling cell element stays alive.
+
+/** Rewrite the byte backing grid cell `cellIdx` and return the new key hex. */
+function setKeyByte(keyHex: string, cellIdx: number, value: number): string {
+  const byteIdx = 32 - hexBytesLen + cellIdx; // 0-based index into the 32-byte key
+  const charIdx = byteIdx * 2;
+  const hex = value.toString(16).padStart(2, "0");
+  return keyHex.slice(0, charIdx) + hex + keyHex.slice(charIdx + 2);
+}
+
+/** Stop any in-progress hover cycle and clear its visual state. */
+function stopHoverCycle() {
+  if (hoverTimer !== null) {
+    window.clearInterval(hoverTimer);
+    hoverTimer = null;
+  }
+  if (hoverCellIdx >= 0) {
+    const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
+    cell?.classList.remove("cycling");
+  }
+  hoverCellIdx = -1;
+  hoverStartVal = -1;
+  hoverMinVal = null;
+  hoverMaxVal = null;
+}
+
+/**
+ * Inclusive [min, max] the first cell may take, or null when it's free.
+ * `min` is `start_top`; `max` is `end_top - 1` (end_top == 0 means the
+ * overflow case where the range ends at 0xFF…FF → treat as unbounded).
+ */
+function firstCellBounds(): { min: number; max: number } | null {
+  if (hoverCellIdx !== 0 || hexBytesLen === 0) return null;
+  if (rangeSpec.type !== "puzzle") return null;
+  const puzzleNumber = rangeSpec.puzzle_number;
+  const p = puzzles.find((x) => x.puzzle_number === puzzleNumber);
+  if (!p) return null;
+  if (p.end_top === 0) return null; // overflow → unbounded
+  return { min: p.start_top, max: p.end_top - 1 };
+}
+
+/** Begin (or switch to) a hover cycle on the cell at `cellIdx`. */
+function startHoverCycle(cell: HTMLElement, cellIdx: number) {
+  // Only when the grid is fixed: not auto-running, not post-match, not empty.
+  if (autoTimer !== null || matchFound) return;
+  if (hexBytesLen === 0 || !lastKeyHex) return;
+  if (cell.classList.contains("matched")) return;
+
+  // Already cycling this cell → no-op (avoids resetting on re-trigger).
+  if (hoverTimer !== null && hoverCellIdx === cellIdx) return;
+
+  stopHoverCycle();
+
+  hoverCellIdx = cellIdx;
+  hoverStartVal = parseInt(cell.textContent ?? "0", 16);
+  const bounds = firstCellBounds();
+  hoverMinVal = bounds ? bounds.min : null;
+  hoverMaxVal = bounds ? bounds.max : null;
+  cell.classList.add("cycling");
+
+  hoverTimer = window.setInterval(hoverTick, HOVER_INTERVAL_MS);
+}
+
+/** One step of a hover cycle: advance the byte, refresh info, stop at the end. */
+function hoverTick() {
+  const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
+  if (!cell) {
+    stopHoverCycle();
+    return;
+  }
+  const cur = parseInt(cell.textContent ?? "0", 16);
+
+  let next: number;
+  if (hoverMaxVal !== null && hoverMinVal !== null) {
+    // Bounded first cell: increment, wrap from max back to min, and stop
+    // once the cycle returns to the value it started from.
+    next = cur >= hoverMaxVal ? hoverMinVal : cur + 1;
+    if (next === hoverStartVal) {
+      stopHoverCycle();
+      return;
+    }
+  } else {
+    // Free cell: wrap at 0xFF, stop after a full 0-255 cycle.
+    next = (cur + 1) & 0xff;
+    if (next === hoverStartVal) {
+      stopHoverCycle();
+      return;
+    }
+  }
+
+  lastKeyHex = setKeyByte(lastKeyHex, hoverCellIdx, next);
+  cell.textContent = next.toString(16).padStart(2, "0");
+  void refreshHoverInfo(lastKeyHex);
+}
+
+/** Derive + render the bottom info for a hover-produced key (staleness-guarded). */
+async function refreshHoverInfo(keyHex: string) {
+  try {
+    const key = await invoke<KeyInfo>("derive_full", {
+      private_key_hex: keyHex,
+      spec: rangeSpec,
+    });
+    // Only the most recent hover key should update the UI.
+    if (lastKeyHex !== keyHex) return;
+    if (key.address_match === true) {
+      handleHoverMatch(key);
+    } else {
+      renderInfo(key);
+    }
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+/** A hover cycle produced a match: stop, mark the cell, lock the UI. */
+function handleHoverMatch(key: KeyInfo) {
+  const cell =
+    hoverCellIdx >= 0
+      ? (gridEl.children[hoverCellIdx] as HTMLElement | undefined)
+      : undefined;
+  stopHoverCycle();
+  cell?.classList.remove("cycling");
+  cell?.classList.add("matched");
+
+  matchFound = true;
+  stopAuto();
+  setButtonsDisabled(true);
+  renderInfo(key);
+  showMatchBanner(key.save_path ?? "");
+}
+
 // ── Range spec management ─────────────────────────────────────────────────────
 
 /** A puzzle was selected from the dropdown. */
 function selectPuzzle(puzzle: PuzzleInfo) {
   stopAuto();
+  stopHoverCycle();
   // A fresh puzzle selection after a match: unlock the buttons.
   if (matchFound) {
     matchFound = false;
@@ -434,6 +588,29 @@ async function init() {
   rangeInput.addEventListener("input", onInputEdit);
   btnRandom.addEventListener("click", () => void onRandom());
   btnAuto.addEventListener("click", () => onAuto());
+
+  // Hover cycling: delegate on the grid (cells are recreated by renderGrid, so
+  // per-cell listeners would not survive).  Only active in the fixed-grid states
+  // — startHoverCycle no-ops while auto-running or post-match.
+  gridEl.addEventListener("mouseover", (e) => {
+    const target = (e.target as HTMLElement).closest(".cell");
+    if (!target || !gridEl.contains(target)) return;
+    const idx = Array.from(gridEl.children).indexOf(target as Element);
+    if (idx >= 0) startHoverCycle(target as HTMLElement, idx);
+  });
+  // Leaving the cycling cell stops the cycle (and clears its highlight).
+  // `mouseout` (not `mouseleave`) so the delegated listener fires per cell.
+  // The relatedTarget guard skips the event when the pointer merely moves
+  // from the cell onto a descendant (none here, but keeps it robust).
+  gridEl.addEventListener("mouseout", (e) => {
+    const target = (e.target as HTMLElement).closest(".cell");
+    if (!target) return;
+    const idx = Array.from(gridEl.children).indexOf(target as Element);
+    if (idx < 0 || idx !== hoverCellIdx) return;
+    const related = e.relatedTarget as HTMLElement | null;
+    if (related && target.contains(related)) return;
+    stopHoverCycle();
+  });
 
   // Default: select the first puzzle so the page isn't empty.
   if (puzzles.length > 0) {

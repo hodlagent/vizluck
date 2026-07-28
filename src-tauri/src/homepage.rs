@@ -21,6 +21,13 @@ pub struct PuzzleInfo {
     pub end_hex: String,
     /// 40-char hex target hash160 (compressed-pubkey hash).
     pub hash160: String,
+    /// Inclusive lower bound of the top byte (the first grid cell).  Equals
+    /// `start`'s byte at `top_byte_idx`.
+    pub start_top: u8,
+    /// Exclusive upper bound of the top byte.  A value of 0 encodes the overflow
+    /// case where the range ends at 0xFF…FF, so the real inclusive upper bound is
+    /// then 0xFF.  See `PuzzleRange::end_top`.
+    pub end_top: u8,
 }
 
 /// Everything the frontend needs to render for one sampled key.
@@ -481,6 +488,8 @@ pub fn get_puzzles() -> Vec<PuzzleInfo> {
                 start_hex,
                 end_hex,
                 hash160: hex::encode(r.hash160),
+                start_top: r.start_top,
+                end_top: r.end_top,
             }
         })
         .collect()
