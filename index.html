@@ -13,7 +13,7 @@
       <header class="topbar">
         <div class="brand">vizluck</div>
         <div class="controls">
-          <select id="puzzle-select" class="select" title="Choose a puzzle">
+          <select id="group-select" class="select" title="Choose a byte group">
             <option value="">— custom range —</option>
           </select>
 
@@ -42,8 +42,14 @@
           <div id="grid" class="grid"></div>
         </section>
 
-        <!-- ── Bottom info cards ──────────────────────────────────── -->
-        <section class="info" id="info"></section>
+        <!-- Group mode: divider + one puzzle block per puzzle in the group.
+             Both stay hidden in custom-range mode. -->
+        <div id="divider" class="divider" hidden></div>
+        <section id="puzzle-blocks" class="puzzle-blocks" hidden></section>
+
+        <!-- AddrInfo: persistent bottom panel.  One panel per group puzzle,
+             or a single panel for a custom-range result. -->
+        <section id="info" class="info"></section>
       </main>
 
       <!-- ── Toast ───────────────────────────────────────────────── -->

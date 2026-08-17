@@ -41,8 +41,6 @@ pub struct KeyInfo {
     pub xpub: String,
     /// Compressed public key, 66-char hex.
     pub compressed_public_key: String,
-    /// Uncompressed public key, 130-char hex.
-    pub uncompressed_public_key: String,
     /// Legacy P2PKH address.
     pub legacy_address: String,
     /// 40-char hex hash160 of the compressed pubkey (for puzzle comparison).
@@ -279,9 +277,7 @@ fn derive_key_info(
     let (pubkey_hash160, pk) = compute_hash160(key)?;
 
     let compressed = pk.serialize(); // 33 bytes
-    let uncompressed = pk.serialize_uncompressed(); // 65 bytes
     let compressed_hex = hex::encode(compressed);
-    let uncompressed_hex = hex::encode(uncompressed);
     let private_key_hex = hex::encode(key);
     let pubkey_hash160_hex = hex::encode(pubkey_hash160);
 
@@ -302,7 +298,6 @@ fn derive_key_info(
         xprv,
         xpub,
         compressed_public_key: compressed_hex,
-        uncompressed_public_key: uncompressed_hex,
         legacy_address,
         pubkey_hash160: pubkey_hash160_hex,
         address_match,
@@ -376,7 +371,6 @@ fn save_match(info: &KeyInfo, puzzle_number: u32, network: &str) -> Result<Strin
          xprv            : {xprv}\n\
          xpub            : {xpub}\n\
          Public Key (compressed)   : {pk_comp}\n\
-         Public Key (uncompressed) : {pk_uncomp}\n\
          Legacy Address  : {addr}\n\
          hash160         : {h160}\n\
          ============================================\n",
@@ -388,7 +382,6 @@ fn save_match(info: &KeyInfo, puzzle_number: u32, network: &str) -> Result<Strin
         xprv = info.xprv,
         xpub = info.xpub,
         pk_comp = info.compressed_public_key,
-        pk_uncomp = info.uncompressed_public_key,
         addr = info.legacy_address,
         h160 = info.pubkey_hash160,
     );
@@ -591,7 +584,6 @@ pub fn random_and_hash160(
                 xprv: String::new(),
                 xpub: String::new(),
                 compressed_public_key: String::new(),
-                uncompressed_public_key: String::new(),
                 legacy_address: String::new(),
                 pubkey_hash160: hex::encode(h160),
                 address_match,
@@ -628,6 +620,50 @@ pub fn derive_full(
     let (_lo, _hi_excl, expected_hash160) = resolve_range(&spec)?;
 
     derive_key_info(&key, expected_hash160)
+}
+
+/// Derive full info for a batch of keys — one per puzzle in an active group.
+/// Each key's compressed-pubkey hash160 is checked against the *whole* embedded
+/// puzzle set (a key inside a group's key space can only ever belong to that
+/// group's puzzles, and each group's ranges are disjoint), and a match is
+/// persisted next to the executable.  The response is index-aligned with
+/// `private_keys`, so the caller already knows which result maps to which puzzle.
+///
+/// This is the per-hex-iteration workhorse for the group-collision UI: every
+/// grid / puzzle-block hover tick (and each Auto round) sends the group's keys
+/// here in one IPC call.
+#[tauri::command(rename_all = "snake_case")]
+pub fn derive_group(private_keys: Vec<String>) -> Result<Vec<KeyInfo>, String> {
+    let ps = crate::puzzles::puzzle_set();
+    let mut out = Vec::with_capacity(private_keys.len());
+
+    for key_hex in private_keys {
+        let key = parse_lo_hex(&key_hex).map_err(|e| format!("bad private_key_hex: {e}"))?;
+        // Full derivation computes the compressed-pubkey hash160 once.
+        let mut info = derive_key_info(&key, None)?;
+
+        // Re-decode the hash160 (already computed) to look up any matching puzzle.
+        let h160: [u8; 20] = {
+            let bytes = hex::decode(&info.pubkey_hash160)
+                .map_err(|e| format!("hash160 hex: {e}"))?;
+            bytes
+                .try_into()
+                .map_err(|_| "hash160 is not 20 bytes".to_string())?
+        };
+
+        match ps.puzzle_number_for_hash160(&h160) {
+            Some(puzzle_number) => {
+                info.address_match = Some(true);
+                match save_match(&info, puzzle_number, "mainnet") {
+                    Ok(path) => info.save_path = Some(path),
+                    Err(e) => info.save_path = Some(format!("ERROR: {e}")),
+                }
+            }
+            None => info.address_match = Some(false),
+        }
+        out.push(info);
+    }
+    Ok(out)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -924,7 +960,31 @@ mod tests {
         assert!(!full.xprv.is_empty());
         assert!(full.xprv.starts_with("xprv"));
         assert_eq!(full.compressed_public_key.len(), 66);
-        assert_eq!(full.uncompressed_public_key.len(), 130);
+    }
+
+    // ── batch group derivation ───────────────────────────────────────────────
+
+    #[test]
+    fn derive_group_batch_in_puzzle_range() {
+        // Keys in puzzle 71's range [2^70, 2^71): always-valid scalars, never a match.
+        let mut lo = [0u8; 32];
+        lo[23] = 0x40;
+        let mut hi = [0u8; 32];
+        hi[23] = 0x80;
+        let keys: Vec<String> = (0..3)
+            .map(|_| hex::encode(random_key_in_range(&lo, &hi).unwrap()))
+            .collect();
+
+        let results = derive_group(keys.clone()).unwrap();
+        assert_eq!(results.len(), keys.len());
+        for (r, k) in results.iter().zip(&keys) {
+            assert_eq!(r.private_key_hex, *k);
+            assert_eq!(r.address_match, Some(false));
+            assert_eq!(r.save_path, None);
+            assert_eq!(r.pubkey_hash160.len(), 40);
+            assert!(r.legacy_address.starts_with('1'));
+            assert!(r.xprv.starts_with("xprv"));
+        }
     }
 }
 

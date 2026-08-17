@@ -8,10 +8,16 @@ interface PuzzleInfo {
   start_hex: string;
   end_hex: string;
   hash160: string;
-  /** Inclusive lower bound of the top byte (first grid cell). */
+  /** Inclusive lower bound of the top byte (the puzzle's high byte). */
   start_top: number;
   /** Exclusive upper bound of the top byte; 0 encodes overflow (real max 0xFF). */
   end_top: number;
+}
+
+/** A byte-group: puzzles sharing the same `hex_bytes_len`. */
+interface PuzzleGroup {
+  bytes: number;
+  puzzles: PuzzleInfo[];
 }
 
 type RangeSpec =
@@ -23,7 +29,6 @@ interface KeyInfo {
   xprv: string;
   xpub: string;
   compressed_public_key: string;
-  uncompressed_public_key: string;
   legacy_address: string;
   pubkey_hash160: string;
   address_match: boolean | null;
@@ -47,11 +52,13 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
   return el as T;
 };
 
-const puzzleSelect = $<HTMLSelectElement>("puzzle-select");
+const groupSelect = $<HTMLSelectElement>("group-select");
 const rangeInput = $<HTMLInputElement>("range-input");
 const btnRandom = $<HTMLButtonElement>("btn-random");
 const btnAuto = $<HTMLButtonElement>("btn-auto");
 const gridEl = $("grid");
+const dividerEl = $("divider");
+const blocksEl = $("puzzle-blocks");
 const infoEl = $("info");
 const errorEl = $("error");
 const toastEl = $("toast");
@@ -59,11 +66,23 @@ const toastEl = $("toast");
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let puzzles: PuzzleInfo[] = [];
-/** The spec currently in effect (drives the next derive). */
-let rangeSpec: RangeSpec = { type: "custom", start_hex: "", end_hex: "" };
+let groups: PuzzleGroup[] = [];
+/** Which flow is active: a byte-group, or a custom range. */
+let mode: "group" | "custom" = "custom";
+let activeGroup: PuzzleGroup | null = null;
+
+// Group-mode state.
+let baseBytes: string[] = []; // the `bytes - 1` shared random bytes (2-char hex)
+let topByteVals = new Map<number, number>(); // puzzle_number -> current high byte
+let lastInfos = new Map<number, KeyInfo>(); // puzzle_number -> last derived info
+/** Bumped on every new round so stale async derive results are dropped. */
+let groupGen = 0;
+
+// Custom-mode state.
 let hexBytesLen = 0;
-/** Last key shown on the grid during auto mode, so pause can fill in its info. */
+let rangeSpec: RangeSpec = { type: "custom", start_hex: "", end_hex: "" };
 let lastKeyHex = "";
+
 /** Locks the Random/Auto buttons once a match is found, to prevent accidents. */
 let matchFound = false;
 
@@ -76,16 +95,23 @@ let autoTimer: number | null = null;
 let toastTimer: number | null = null;
 
 // ── Hover state ──────────────────────────────────────────────────────────
-// When the grid is fixed (after Random, or Auto paused) hovering a cell cycles
-// that byte +1.  See startHoverCycle / hoverTick.
+// One cycle at a time. `hoverKind` says whether a grid cell or a puzzle block
+// is currently counting through its range; see startHoverCycle / startBlockCycle.
 const HOVER_INTERVAL_MS = 60;
 let hoverTimer: number | null = null;
-let hoverCellIdx = -1;
+let hoverKind: "grid" | "block" | null = null;
+let hoverCellIdx = -1; // grid: cell index
+let hoverPuzzleNum = -1; // block: puzzle number
 let hoverStartVal = -1;
-/** Inclusive lower bound for a bounded first cell, or null for a free cell. */
+/** Inclusive lower bound for a bounded byte, or null for a free cell. */
 let hoverMinVal: number | null = null;
-/** Inclusive upper bound for a bounded first cell, or null for a free cell. */
+/** Inclusive upper bound for a bounded byte, or null for a free cell. */
 let hoverMaxVal: number | null = null;
+
+// ── Bottom AddrInfo panel state ───────────────────────────────────────────────
+
+/** Last full KeyInfo derived in custom mode (shown in the bottom panel). */
+let customInfo: KeyInfo | null = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -115,6 +141,39 @@ async function copyText(text: string, label: string) {
   } catch {
     showToast("copy failed");
   }
+}
+
+/** `n` random bytes, each 00–ff, as 2-char hex strings (CSPRNG). */
+function randomBytes(n: number): string[] {
+  const arr = new Uint8Array(n);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0"));
+}
+
+/** Inclusive [min, max] the puzzle's high byte may take (from start/end hex). */
+function topByteBounds(p: PuzzleInfo): { min: number; max: number } {
+  const max = p.end_top === 0 ? 0xff : p.end_top - 1; // overflow → [start_top, 0xFF]
+  return { min: p.start_top, max };
+}
+
+function randomTopByte(p: PuzzleInfo): number {
+  const { min, max } = topByteBounds(p);
+  const range = max - min + 1;
+  const arr = new Uint8Array(1);
+  crypto.getRandomValues(arr);
+  return min + (arr[0] % range);
+}
+
+/**
+ * Build the 64-char key hex for a puzzle from the current base + high byte:
+ * `00…00 || highByte || baseBytes`, i.e. high bytes 00-padded above the top byte.
+ */
+function puzzleKeyHex(p: PuzzleInfo): string {
+  const topIdx = 32 - p.hex_bytes_len;
+  const pad = "00".repeat(topIdx);
+  const top = (topByteVals.get(p.puzzle_number) ?? 0).toString(16).padStart(2, "0");
+  const low = baseBytes.join("");
+  return pad + top + low;
 }
 
 /**
@@ -151,15 +210,14 @@ function isValidHex(hex: string): boolean {
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
-/** Refresh the grid from a 64-char key hex (low `hexBytesLen` bytes). */
-function renderGrid(keyHex: string) {
-  const bytes = lowBytes(keyHex, hexBytesLen);
-  gridEl.style.gridTemplateColumns = `repeat(${hexBytesLen}, 1fr)`;
+/** Refresh the grid from a list of 2-char hex bytes. */
+function renderGrid(bytes: string[]) {
+  gridEl.style.gridTemplateColumns = `repeat(${bytes.length}, 1fr)`;
   gridEl.replaceChildren();
-  for (let i = 0; i < hexBytesLen; i++) {
+  for (const b of bytes) {
     const cell = document.createElement("div");
     cell.className = "cell";
-    cell.textContent = bytes[i];
+    cell.textContent = b;
     gridEl.appendChild(cell);
   }
 }
@@ -174,23 +232,60 @@ function lowBytes(keyHex: string, n: number): string[] {
   return out;
 }
 
-function renderInfo(key: KeyInfo) {
-  const emoji =
-    key.address_match === null ? "" : key.address_match ? " ✅" : " ❌";
+/** Render one puzzle block per puzzle in the active group. */
+function renderBlocks() {
+  blocksEl.replaceChildren();
+  if (!activeGroup) return;
+  for (const p of activeGroup.puzzles) {
+    const block = document.createElement("div");
+    block.className = "pblock";
+    block.dataset.puzzle = String(p.puzzle_number);
 
+    const num = document.createElement("div");
+    num.className = "pblock-num";
+    num.textContent = `#${p.puzzle_number}`;
+
+    const val = document.createElement("div");
+    val.className = "pblock-val";
+    val.textContent = (topByteVals.get(p.puzzle_number) ?? 0)
+      .toString(16)
+      .padStart(2, "0");
+
+    const range = document.createElement("div");
+    range.className = "pblock-range";
+    const b = topByteBounds(p);
+    range.textContent =
+      `${b.min.toString(16).padStart(2, "0")}–${b.max.toString(16).padStart(2, "0")}`;
+
+    block.appendChild(num);
+    block.appendChild(val);
+    block.appendChild(range);
+    blocksEl.appendChild(block);
+  }
+}
+
+// ── AddrInfo component (bottom panel) ─────────────────────────────────────────
+// The derived-key cards (private key, xprv, compressed pubkey, legacy address),
+// shown persistently at the bottom of the page — one panel per puzzle in the
+// active group, or a single panel for a custom-range result.  Every card is
+// click-to-copy and every derivation tick refreshes its panel in place.
+
+/** Build the 4 click-to-copy cards (no head) for a KeyInfo. */
+function buildAddrInfoCards(info: KeyInfo): HTMLElement[] {
+  const emoji =
+    info.address_match === null ? "" : info.address_match ? " ✅" : " ❌";
   const rows: Array<{ label: string; value: string; cls: string }> = [
-    { label: "Private Key (32 bytes)", value: key.private_key_hex, cls: "pk" },
-    { label: "BIP32 Master Key (xprv)", value: key.xprv, cls: "xprv" },
-    { label: "Public Key (compressed)", value: key.compressed_public_key, cls: "pub" },
-    { label: "Public Key (uncompressed)", value: key.uncompressed_public_key, cls: "pub" },
+    { label: "Private Key (32 bytes)", value: info.private_key_hex, cls: "pk" },
+    { label: "BIP32 Master Key (xprv)", value: info.xprv, cls: "xprv" },
+    { label: "Public Key (compressed)", value: info.compressed_public_key, cls: "pub" },
     {
       label: `Legacy BTC Address${emoji}`,
-      value: key.legacy_address,
-      cls: "addr" + (emoji ? (key.address_match ? " match" : " nomatch") : ""),
+      value: info.legacy_address,
+      cls: "addr" + (emoji ? (info.address_match ? " match" : " nomatch") : ""),
     },
   ];
 
-  infoEl.replaceChildren();
+  const nodes: HTMLElement[] = [];
   for (const row of rows) {
     const card = document.createElement("div");
     card.className = "card " + row.cls;
@@ -207,21 +302,156 @@ function renderInfo(key: KeyInfo) {
     card.appendChild(lab);
     card.appendChild(val);
     card.addEventListener("click", () => copyText(row.value, row.label));
-    infoEl.appendChild(card);
+    nodes.push(card);
+  }
+  return nodes;
+}
+
+/**
+ * Build a bottom-panel AddrInfo: optional `#N` head + the 4 cards.  A matched
+ * panel gets `.matched` (green) so it stands out after the match freeze.
+ */
+function buildAddrInfoPanel(puzzleNum: number | null, info: KeyInfo): HTMLElement {
+  const panel = document.createElement("div");
+  panel.className = "addr-info";
+  if (puzzleNum !== null) panel.dataset.puzzle = String(puzzleNum);
+  if (info.address_match === true) panel.classList.add("matched");
+
+  if (puzzleNum !== null) {
+    const head = document.createElement("div");
+    head.className = "addr-info-head";
+    head.textContent = `Puzzle #${puzzleNum}`;
+    panel.appendChild(head);
+  }
+
+  for (const card of buildAddrInfoCards(info)) panel.appendChild(card);
+  return panel;
+}
+
+/** Re-render the whole bottom section from the current state. */
+function renderInfoSection() {
+  infoEl.replaceChildren();
+  if (mode === "group" && activeGroup) {
+    for (const p of activeGroup.puzzles) {
+      const info = lastInfos.get(p.puzzle_number);
+      if (info) infoEl.appendChild(buildAddrInfoPanel(p.puzzle_number, info));
+    }
+  } else if (customInfo) {
+    infoEl.appendChild(buildAddrInfoPanel(null, customInfo));
   }
 }
 
-function renderEmptyInfo() {
-  infoEl.replaceChildren();
-  const empty = document.createElement("div");
-  empty.className = "empty";
-  empty.textContent = "Pick a puzzle or enter a range, then hit Random.";
-  infoEl.appendChild(empty);
+/** Refresh one panel in place (keeps `.active` highlight across block ticks). */
+function updateInfoPanel(puzzleNum: number | null, info: KeyInfo) {
+  const sel =
+    puzzleNum !== null ? `.addr-info[data-puzzle="${puzzleNum}"]` : ".addr-info";
+  const existing = infoEl.querySelector<HTMLElement>(sel);
+  const fresh = buildAddrInfoPanel(puzzleNum, info);
+  if (existing?.classList.contains("active")) fresh.classList.add("active");
+  if (existing?.parentElement) existing.replaceWith(fresh);
+  else infoEl.appendChild(fresh);
 }
 
-// ── Core actions ──────────────────────────────────────────────────────────────
+// ── Group-mode actions ────────────────────────────────────────────────────────
 
-/** Full derivation (Random button): grid + bottom info in one shot. */
+/** Start a new round for the active group: fresh base + fresh top bytes. */
+function newRound() {
+  if (!activeGroup) return;
+  groupGen++;
+  baseBytes = randomBytes(activeGroup.bytes - 1);
+  for (const p of activeGroup.puzzles) {
+    topByteVals.set(p.puzzle_number, randomTopByte(p));
+  }
+  renderGrid(baseBytes);
+  renderBlocks();
+}
+
+/** Derive + match-check every puzzle in the active group in one IPC call. */
+async function deriveGroupAll() {
+  if (mode !== "group" || !activeGroup || matchFound) return;
+  const gen = groupGen;
+  const keys = activeGroup.puzzles.map((p) => puzzleKeyHex(p));
+  try {
+    const results = await invoke<KeyInfo[]>("derive_group", { private_keys: keys });
+    if (gen !== groupGen || mode !== "group" || !activeGroup) return;
+    for (let i = 0; i < results.length; i++) {
+      const info = results[i];
+      const p = activeGroup.puzzles[i];
+      if (!p) break;
+      lastInfos.set(p.puzzle_number, info);
+      if (info.address_match === true) {
+        handleGroupMatch(p.puzzle_number, info);
+        return;
+      }
+    }
+    // Bottom AddrInfo panels always mirror the latest derivation.
+    renderInfoSection();
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+/** Derive one puzzle's key (used by block-hover top-byte cycling). */
+async function deriveOne(p: PuzzleInfo) {
+  if (mode !== "group" || matchFound) return;
+  const gen = groupGen;
+  const key = puzzleKeyHex(p);
+  try {
+    const results = await invoke<KeyInfo[]>("derive_group", { private_keys: [key] });
+    const info = results[0];
+    if (!info || gen !== groupGen || mode !== "group") return;
+    lastInfos.set(p.puzzle_number, info);
+    if (info.address_match === true) {
+      handleGroupMatch(p.puzzle_number, info);
+      return;
+    }
+    updateInfoPanel(p.puzzle_number, info);
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+/** A group-mode match: freeze everything, persist, celebrate. */
+function handleGroupMatch(puzzleNum: number, info: KeyInfo) {
+  matchFound = true;
+  stopAuto();
+  stopHoverCycle();
+  setButtonsDisabled(true);
+
+  const block = blocksEl.querySelector<HTMLElement>(
+    `.pblock[data-puzzle="${puzzleNum}"]`,
+  );
+  block?.classList.remove("cycling");
+  block?.classList.add("matched");
+
+  // The matched panel is rendered green (via address_match) by the re-render.
+  renderInfoSection();
+
+  showMatchBanner(info.save_path ?? "");
+}
+
+/** A group was picked from the dropdown. */
+function selectGroup(g: PuzzleGroup) {
+  stopAuto();
+  stopHoverCycle();
+  if (matchFound) {
+    matchFound = false;
+    setButtonsDisabled(false);
+  }
+  mode = "group";
+  activeGroup = g;
+  rangeInput.value = "";
+  dividerEl.hidden = false;
+  blocksEl.hidden = false;
+  lastInfos.clear();
+  renderInfoSection(); // drop the previous group's panels immediately
+  newRound();
+  void deriveGroupAll();
+}
+
+// ── Custom-mode actions ───────────────────────────────────────────────────────
+
+/** Full derivation (Random button, custom mode): grid + bottom panel. */
 async function derive() {
   showError("");
   try {
@@ -230,10 +460,11 @@ async function derive() {
       network: "mainnet",
     });
     lastKeyHex = key.private_key_hex;
-    renderGrid(key.private_key_hex);
-    renderInfo(key);
+    renderGrid(lowBytes(key.private_key_hex, hexBytesLen));
+    customInfo = key;
+    renderInfoSection();
 
-    // On a puzzle hit: pause auto mode, lock the buttons and celebrate.
+    // Custom ranges never target a puzzle, but keep the guard for safety.
     if (key.address_match === true) {
       matchFound = true;
       stopAuto();
@@ -246,9 +477,9 @@ async function derive() {
 }
 
 /**
- * Lightweight auto-mode tick: sample a key and compute only its hash160.
- * Refreshes the grid and stashes the key hex, but skips address / xprv / etc.
- * Those are filled in later by `completeLastKey` when auto mode pauses.
+ * Lightweight auto-mode tick (custom mode): sample a key and compute only its
+ * hash160.  Refreshes the grid and stashes the key hex; the full info is filled
+ * in by `completeLastKey` when auto mode pauses.
  */
 async function autoTick() {
   showError("");
@@ -258,10 +489,9 @@ async function autoTick() {
       network: "mainnet",
     });
     lastKeyHex = res.private_key_hex;
-    renderGrid(res.private_key_hex);
+    renderGrid(lowBytes(res.private_key_hex, hexBytesLen));
 
     if (res.address_match === true) {
-      // Match! Stop the loop, lock the buttons, then materialize the full info + banner.
       matchFound = true;
       stopAuto();
       setButtonsDisabled(true);
@@ -275,7 +505,7 @@ async function autoTick() {
 }
 
 /**
- * Run the full derivation for a specific key hex and update the bottom info.
+ * Run the full derivation for a specific key hex and show it in the bottom panel.
  * Guards against stale renders: if `lastKeyHex` has changed by the time the
  * invoke resolves (e.g. the user hit Random), the result is dropped.
  */
@@ -286,10 +516,49 @@ async function completeLastKey(keyHex: string = lastKeyHex) {
       private_key_hex: keyHex,
       spec: rangeSpec,
     });
-    if (lastKeyHex === keyHex) renderInfo(key);
+    if (lastKeyHex === keyHex) {
+      customInfo = key;
+      renderInfoSection();
+    }
   } catch (e) {
     showError(String(e));
   }
+}
+
+// ── Match banner + confetti ───────────────────────────────────────────────────
+
+/**
+ * Show a full-width "MATCH FOUND" banner above the grid with the file the
+ * result was saved to.  Stays visible until the next generate.
+ */
+function showMatchBanner(savePath: string) {
+  document.getElementById("match-banner")?.remove();
+
+  const banner = document.createElement("div");
+  banner.id = "match-banner";
+  banner.className = "match-banner";
+
+  const title = document.createElement("div");
+  title.className = "match-title";
+  title.textContent = "🎉 MATCH FOUND! 🎉";
+
+  const sub = document.createElement("div");
+  sub.className = "match-sub";
+  if (savePath.startsWith("ERROR:")) {
+    sub.textContent = `Could not save file: ${savePath.slice(6).trim()}`;
+  } else if (savePath) {
+    sub.textContent = `Saved to ${savePath}`;
+  } else {
+    sub.textContent = "Puzzle hash160 matched!";
+  }
+
+  banner.appendChild(title);
+  banner.appendChild(sub);
+  banner.addEventListener("click", () => copyText(savePath, "file path"));
+
+  gridEl.parentElement?.insertBefore(banner, gridEl);
+
+  launchConfetti();
 }
 
 /**
@@ -329,7 +598,7 @@ function launchConfetti() {
   // Two side cannons + a central burst.
   const spawn = (originX: number, count: number) => {
     for (let i = 0; i < count; i++) {
-      const angle = (Math.random() * Math.PI); // upward hemisphere
+      const angle = Math.random() * Math.PI; // upward hemisphere
       const speed = 4 + Math.random() * 8;
       particles.push({
         x: originX,
@@ -358,12 +627,12 @@ function launchConfetti() {
 
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
-      p.vy += 0.25 * dt;          // gravity
-      p.vx *= 0.99;               // air drag
+      p.vy += 0.25 * dt; // gravity
+      p.vx *= 0.99; // air drag
       p.x += p.vx * dt * dpr;
       p.y += p.vy * dt * dpr;
       p.rot += p.vrot * dt;
-      p.life -= 0.008 * dt;       // fade out
+      p.life -= 0.008 * dt; // fade out
 
       if (p.life <= 0 || p.y > window.innerHeight * dpr + 40) {
         particles.splice(i, 1);
@@ -394,76 +663,55 @@ function launchConfetti() {
   }, 6000);
 }
 
-/**
- * Show a full-width "MATCH FOUND" banner above the grid with the file the
- * result was saved to.  Stays visible until the next generate.
- */
-function showMatchBanner(savePath: string) {
-  // Remove any previous banner.
-  document.getElementById("match-banner")?.remove();
+// ── Random / Auto (mode-aware) ────────────────────────────────────────────────
 
-  const banner = document.createElement("div");
-  banner.id = "match-banner";
-  banner.className = "match-banner";
-
-  const title = document.createElement("div");
-  title.className = "match-title";
-  title.textContent = "🎉 MATCH FOUND! 🎉";
-
-  const sub = document.createElement("div");
-  sub.className = "match-sub";
-  if (savePath.startsWith("ERROR:")) {
-    sub.textContent = `Could not save file: ${savePath.slice(6).trim()}`;
-  } else if (savePath) {
-    sub.textContent = `Saved to ${savePath}`;
-  } else {
-    sub.textContent = "Puzzle hash160 matched!";
-  }
-
-  banner.appendChild(title);
-  banner.appendChild(sub);
-  banner.addEventListener("click", () => copyText(savePath, "file path"));
-
-  gridEl.parentElement?.insertBefore(banner, gridEl);
-
-  // Celebrate!  Particles auto-expire — no cleanup needed.
-  launchConfetti();
-}
-
-/** Generate one key (Random button): full derivation. */
-async function onRandom() {
+/** Generate a fresh round (group) or a single key (custom). */
+function onRandom() {
   if (matchFound) {
-    // Starting a new search after a match: unlock the buttons.
     matchFound = false;
     setButtonsDisabled(false);
   }
   stopAuto();
   stopHoverCycle();
-  await derive();
+  if (mode === "group" && activeGroup) {
+    newRound();
+    void deriveGroupAll();
+  } else {
+    void derive();
+  }
 }
 
-/** Toggle auto-randomize (Auto button). */
+/** Toggle auto-randomize (Auto button): continuous rounds in group mode. */
 function onAuto() {
   if (autoTimer !== null) {
-    // User clicked Stop: halt the loop, then fill in the last key's info.
     stopAuto();
-    void completeLastKey();
+    if (mode !== "group") void completeLastKey();
     return;
   }
   if (matchFound) {
-    // Starting a new search after a match: unlock the buttons.
     matchFound = false;
     setButtonsDisabled(false);
   }
   stopHoverCycle();
+  // While auto runs, hover is fully inert: cycling is already blocked by the
+  // `autoTimer` guard, and this class also kills the :hover visual feedback.
+  document.body.classList.add("auto-running");
   btnAuto.textContent = "⏸ Stop";
-  const tick = async () => {
-    await autoTick();
-    if (autoTimer !== null) {
-      autoTimer = window.setTimeout(tick, 60);
-    }
-  };
-  autoTimer = window.setTimeout(tick, 0);
+
+  if (mode === "group" && activeGroup) {
+    const tick = async () => {
+      newRound();
+      await deriveGroupAll();
+      if (autoTimer !== null) autoTimer = window.setTimeout(tick, HOVER_INTERVAL_MS);
+    };
+    autoTimer = window.setTimeout(tick, 0);
+  } else {
+    const tick = async () => {
+      await autoTick();
+      if (autoTimer !== null) autoTimer = window.setTimeout(tick, HOVER_INTERVAL_MS);
+    };
+    autoTimer = window.setTimeout(tick, 0);
+  }
 }
 
 /** Stop the auto loop timer and reset the button.  No other side effects. */
@@ -472,14 +720,130 @@ function stopAuto() {
     window.clearTimeout(autoTimer);
     autoTimer = null;
   }
+  document.body.classList.remove("auto-running");
   btnAuto.textContent = "▶ Auto";
 }
 
 // ── Hover interaction ─────────────────────────────────────────────────────
-// In the "fixed grid" states (after Random, or Auto paused) hovering a cell
-// cycles that byte upward by 1.  Only one cell cycles at a time — hovering a
-// new cell stops the previous cycle and starts the new one.  The grid is left
-// untouched (no renderGrid) so the cycling cell element stays alive.
+// Group mode: hovering a grid cell cycles that base byte; hovering a puzzle
+// block cycles its high byte within [start_top, end_top] and shows AddrInfo.
+// Custom mode: hovering a grid cell cycles that key byte (as before).
+
+/** Stop any in-progress hover cycle and clear its visual state. */
+function stopHoverCycle() {
+  if (hoverTimer !== null) {
+    window.clearInterval(hoverTimer);
+    hoverTimer = null;
+  }
+  if (hoverKind === "grid" && hoverCellIdx >= 0) {
+    const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
+    cell?.classList.remove("cycling");
+  } else if (hoverKind === "block" && hoverPuzzleNum >= 0) {
+    blocksEl
+      .querySelector(`.pblock[data-puzzle="${hoverPuzzleNum}"]`)
+      ?.classList.remove("cycling");
+    infoEl
+      .querySelector(`.addr-info[data-puzzle="${hoverPuzzleNum}"]`)
+      ?.classList.remove("active");
+  }
+  hoverKind = null;
+  hoverCellIdx = -1;
+  hoverPuzzleNum = -1;
+  hoverStartVal = -1;
+  hoverMinVal = null;
+  hoverMaxVal = null;
+}
+
+/** Begin (or switch to) a hover cycle on grid cell `cellIdx`. */
+function startHoverCycle(cell: HTMLElement, cellIdx: number) {
+  if (autoTimer !== null || matchFound) return;
+  if (cell.classList.contains("matched")) return;
+
+  if (hoverTimer !== null && hoverKind === "grid" && hoverCellIdx === cellIdx) return;
+  stopHoverCycle();
+
+  hoverKind = "grid";
+  hoverCellIdx = cellIdx;
+  hoverStartVal = parseInt(cell.textContent ?? "0", 16);
+  hoverMinVal = null; // base bytes (group) and custom key bytes are free 00–ff
+  hoverMaxVal = null;
+  cell.classList.add("cycling");
+
+  hoverTimer = window.setInterval(gridHoverTick, HOVER_INTERVAL_MS);
+}
+
+/** One grid hover step: advance the byte, refresh keys, stop at the end. */
+function gridHoverTick() {
+  const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
+  if (!cell) {
+    stopHoverCycle();
+    return;
+  }
+  const cur = parseInt(cell.textContent ?? "0", 16);
+  const next = (cur + 1) & 0xff;
+  if (next === hoverStartVal) {
+    stopHoverCycle();
+    return;
+  }
+  const hex = next.toString(16).padStart(2, "0");
+
+  if (mode === "group") {
+    baseBytes[hoverCellIdx] = hex;
+    cell.textContent = hex;
+    void deriveGroupAll();
+  } else {
+    lastKeyHex = setKeyByte(lastKeyHex, hoverCellIdx, next);
+    cell.textContent = hex;
+    void refreshHoverInfo(lastKeyHex);
+  }
+}
+
+/** Begin a hover cycle on a puzzle block (top byte + AddrInfo popover). */
+function startBlockCycle(block: HTMLElement, puzzleNum: number) {
+  if (autoTimer !== null || matchFound) return;
+  const p = activeGroup?.puzzles.find((x) => x.puzzle_number === puzzleNum);
+  if (!p) return;
+  if (block.classList.contains("matched")) return;
+
+  if (hoverTimer !== null && hoverKind === "block" && hoverPuzzleNum === puzzleNum) return;
+  stopHoverCycle();
+
+  hoverKind = "block";
+  hoverPuzzleNum = puzzleNum;
+  const b = topByteBounds(p);
+  hoverStartVal = topByteVals.get(puzzleNum) ?? b.min;
+  hoverMinVal = b.min;
+  hoverMaxVal = b.max;
+  block.classList.add("cycling");
+
+  // Highlight this puzzle's bottom AddrInfo panel while cycling.
+  infoEl
+    .querySelector(`.addr-info[data-puzzle="${puzzleNum}"]`)
+    ?.classList.add("active");
+
+  hoverTimer = window.setInterval(blockHoverTick, HOVER_INTERVAL_MS);
+}
+
+/** One block hover step: advance the top byte within its range, derive, stop. */
+function blockHoverTick() {
+  const p = activeGroup?.puzzles.find((x) => x.puzzle_number === hoverPuzzleNum);
+  if (!p || hoverMinVal === null || hoverMaxVal === null) {
+    stopHoverCycle();
+    return;
+  }
+  const cur = topByteVals.get(hoverPuzzleNum) ?? hoverMinVal;
+  const next = cur >= hoverMaxVal ? hoverMinVal : cur + 1;
+  if (next === hoverStartVal) {
+    stopHoverCycle();
+    return;
+  }
+  topByteVals.set(hoverPuzzleNum, next);
+  const valEl = blocksEl.querySelector<HTMLElement>(
+    `.pblock[data-puzzle="${hoverPuzzleNum}"] .pblock-val`,
+  );
+  if (valEl) valEl.textContent = next.toString(16).padStart(2, "0");
+  void deriveOne(p);
+}
 
 /** Rewrite the byte backing grid cell `cellIdx` and return the new key hex. */
 function setKeyByte(keyHex: string, cellIdx: number, value: number): string {
@@ -489,104 +853,19 @@ function setKeyByte(keyHex: string, cellIdx: number, value: number): string {
   return keyHex.slice(0, charIdx) + hex + keyHex.slice(charIdx + 2);
 }
 
-/** Stop any in-progress hover cycle and clear its visual state. */
-function stopHoverCycle() {
-  if (hoverTimer !== null) {
-    window.clearInterval(hoverTimer);
-    hoverTimer = null;
-  }
-  if (hoverCellIdx >= 0) {
-    const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
-    cell?.classList.remove("cycling");
-  }
-  hoverCellIdx = -1;
-  hoverStartVal = -1;
-  hoverMinVal = null;
-  hoverMaxVal = null;
-}
-
-/**
- * Inclusive [min, max] the first cell may take, or null when it's free.
- * `min` is `start_top`; `max` is `end_top - 1`. The overflow case
- * (end_top == 0) means the range ends at 0xFF…FF → top byte capped at 0xFF.
- */
-function firstCellBounds(): { min: number; max: number } | null {
-  if (hoverCellIdx !== 0 || hexBytesLen === 0) return null;
-  if (rangeSpec.type !== "puzzle") return null;
-  const puzzleNumber = rangeSpec.puzzle_number;
-  const p = puzzles.find((x) => x.puzzle_number === puzzleNumber);
-  if (!p) return null;
-  if (p.end_top === 0) return { min: p.start_top, max: 0xff }; // overflow → [start_top, 0xFF]
-  return { min: p.start_top, max: p.end_top - 1 };
-}
-
-/** Begin (or switch to) a hover cycle on the cell at `cellIdx`. */
-function startHoverCycle(cell: HTMLElement, cellIdx: number) {
-  // Only when the grid is fixed: not auto-running, not post-match, not empty.
-  if (autoTimer !== null || matchFound) return;
-  if (hexBytesLen === 0 || !lastKeyHex) return;
-  if (cell.classList.contains("matched")) return;
-
-  // Already cycling this cell → no-op (avoids resetting on re-trigger).
-  if (hoverTimer !== null && hoverCellIdx === cellIdx) return;
-
-  stopHoverCycle();
-
-  hoverCellIdx = cellIdx;
-  hoverStartVal = parseInt(cell.textContent ?? "0", 16);
-  const bounds = firstCellBounds();
-  hoverMinVal = bounds ? bounds.min : null;
-  hoverMaxVal = bounds ? bounds.max : null;
-  cell.classList.add("cycling");
-
-  hoverTimer = window.setInterval(hoverTick, HOVER_INTERVAL_MS);
-}
-
-/** One step of a hover cycle: advance the byte, refresh info, stop at the end. */
-function hoverTick() {
-  const cell = gridEl.children[hoverCellIdx] as HTMLElement | undefined;
-  if (!cell) {
-    stopHoverCycle();
-    return;
-  }
-  const cur = parseInt(cell.textContent ?? "0", 16);
-
-  let next: number;
-  if (hoverMaxVal !== null && hoverMinVal !== null) {
-    // Bounded first cell: increment, wrap from max back to min, and stop
-    // once the cycle returns to the value it started from.
-    next = cur >= hoverMaxVal ? hoverMinVal : cur + 1;
-    if (next === hoverStartVal) {
-      stopHoverCycle();
-      return;
-    }
-  } else {
-    // Free cell: wrap at 0xFF, stop after a full 0-255 cycle.
-    next = (cur + 1) & 0xff;
-    if (next === hoverStartVal) {
-      stopHoverCycle();
-      return;
-    }
-  }
-
-  lastKeyHex = setKeyByte(lastKeyHex, hoverCellIdx, next);
-  cell.textContent = next.toString(16).padStart(2, "0");
-  void refreshHoverInfo(lastKeyHex);
-}
-
-/** Derive + render the bottom info for a hover-produced key (staleness-guarded). */
+/** Derive + show the popover for a hover-produced key (custom mode). */
 async function refreshHoverInfo(keyHex: string) {
   try {
     const key = await invoke<KeyInfo>("derive_full", {
       private_key_hex: keyHex,
       spec: rangeSpec,
     });
-    // Only the most recent hover key should update the UI.
     if (lastKeyHex !== keyHex) return;
     if (key.address_match === true) {
       handleHoverMatch(key);
     } else {
-      renderInfo(key);
+      customInfo = key;
+      renderInfoSection();
     }
   } catch (e) {
     showError(String(e));
@@ -606,26 +885,12 @@ function handleHoverMatch(key: KeyInfo) {
   matchFound = true;
   stopAuto();
   setButtonsDisabled(true);
-  renderInfo(key);
+  customInfo = key;
+  renderInfoSection();
   showMatchBanner(key.save_path ?? "");
 }
 
 // ── Range spec management ─────────────────────────────────────────────────────
-
-/** A puzzle was selected from the dropdown. */
-function selectPuzzle(puzzle: PuzzleInfo) {
-  stopAuto();
-  stopHoverCycle();
-  // A fresh puzzle selection after a match: unlock the buttons.
-  if (matchFound) {
-    matchFound = false;
-    setButtonsDisabled(false);
-  }
-  hexBytesLen = puzzle.hex_bytes_len;
-  rangeInput.value = `${puzzle.start_hex}:${puzzle.end_hex}`;
-  rangeSpec = { type: "puzzle", puzzle_number: puzzle.puzzle_number };
-  void derive();
-}
 
 /** The user edited the input box → switch to a custom spec (debounced). */
 let editTimer: number | null = null;
@@ -656,7 +921,19 @@ function onInputEdit() {
       return;
     }
     showError("");
-    puzzleSelect.value = "";
+
+    // Switch out of group mode into custom mode.
+    if (matchFound) {
+      matchFound = false;
+      setButtonsDisabled(false);
+    }
+    mode = "custom";
+    activeGroup = null;
+    groupSelect.value = "";
+    dividerEl.hidden = true;
+    blocksEl.hidden = true;
+    customInfo = null;
+    renderInfoSection();
     hexBytesLen = hbl;
     rangeSpec = { type: "custom", start_hex: start, end_hex: end };
     void derive();
@@ -666,63 +943,82 @@ function onInputEdit() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
-  // Load puzzles into the dropdown.
+  // Load puzzles and group them by byte length.
   try {
     puzzles = await invoke<PuzzleInfo[]>("get_puzzles");
   } catch (e) {
     showError(`failed to load puzzles: ${e}`);
     return;
   }
+  const byBytes = new Map<number, PuzzleInfo[]>();
   for (const p of puzzles) {
+    const arr = byBytes.get(p.hex_bytes_len) ?? [];
+    arr.push(p);
+    byBytes.set(p.hex_bytes_len, arr);
+  }
+  groups = [...byBytes.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([bytes, ps]) => ({
+      bytes,
+      puzzles: ps.sort((a, b) => a.puzzle_number - b.puzzle_number),
+    }));
+
+  for (const g of groups) {
     const opt = document.createElement("option");
-    opt.value = String(p.puzzle_number);
-    opt.textContent = `#${p.puzzle_number}: ${p.hex_bytes_len}bits`;
-    puzzleSelect.appendChild(opt);
+    opt.value = String(g.bytes);
+    opt.textContent = `group_${g.bytes} · ${g.puzzles.length} puzzles`;
+    groupSelect.appendChild(opt);
   }
 
   // Wire events.
-  puzzleSelect.addEventListener("change", () => {
-    const num = Number(puzzleSelect.value);
-    if (!num) {
-      // "custom range" placeholder selected.
-      return;
-    }
-    const p = puzzles.find((x) => x.puzzle_number === num);
-    if (p) selectPuzzle(p);
+  groupSelect.addEventListener("change", () => {
+    const bytes = Number(groupSelect.value);
+    if (!bytes) return; // "custom range" placeholder selected.
+    const g = groups.find((x) => x.bytes === bytes);
+    if (g) selectGroup(g);
   });
   rangeInput.addEventListener("input", onInputEdit);
   btnRandom.addEventListener("click", () => void onRandom());
   btnAuto.addEventListener("click", () => onAuto());
 
-  // Hover cycling: delegate on the grid (cells are recreated by renderGrid, so
-  // per-cell listeners would not survive).  Only active in the fixed-grid states
-  // — startHoverCycle no-ops while auto-running or post-match.
+  // Hover cycling on the grid (cells are recreated by renderGrid, so delegate).
   gridEl.addEventListener("mouseover", (e) => {
     const target = (e.target as HTMLElement).closest(".cell");
     if (!target || !gridEl.contains(target)) return;
     const idx = Array.from(gridEl.children).indexOf(target as Element);
     if (idx >= 0) startHoverCycle(target as HTMLElement, idx);
   });
-  // Leaving the cycling cell stops the cycle (and clears its highlight).
-  // `mouseout` (not `mouseleave`) so the delegated listener fires per cell.
-  // The relatedTarget guard skips the event when the pointer merely moves
-  // from the cell onto a descendant (none here, but keeps it robust).
   gridEl.addEventListener("mouseout", (e) => {
     const target = (e.target as HTMLElement).closest(".cell");
     if (!target) return;
     const idx = Array.from(gridEl.children).indexOf(target as Element);
-    if (idx < 0 || idx !== hoverCellIdx) return;
+    if (idx < 0 || hoverKind !== "grid" || idx !== hoverCellIdx) return;
     const related = e.relatedTarget as HTMLElement | null;
     if (related && target.contains(related)) return;
     stopHoverCycle();
   });
 
-  // Default: select the first puzzle so the page isn't empty.
-  if (puzzles.length > 0) {
-    puzzleSelect.value = String(puzzles[0].puzzle_number);
-    selectPuzzle(puzzles[0]);
-  } else {
-    renderEmptyInfo();
+  // Hover cycling on the puzzle blocks (delegated the same way).
+  blocksEl.addEventListener("mouseover", (e) => {
+    const target = (e.target as HTMLElement).closest(".pblock");
+    if (!target || !blocksEl.contains(target)) return;
+    const puzzleNum = Number((target as HTMLElement).dataset.puzzle);
+    if (Number.isNaN(puzzleNum)) return;
+    startBlockCycle(target as HTMLElement, puzzleNum);
+  });
+  blocksEl.addEventListener("mouseout", (e) => {
+    const target = (e.target as HTMLElement).closest(".pblock");
+    if (!target) return;
+    const puzzleNum = Number((target as HTMLElement).dataset.puzzle);
+    if (hoverKind === "block" && hoverPuzzleNum === puzzleNum) {
+      stopHoverCycle();
+    }
+  });
+
+  // Default: first group so the page isn't empty.
+  if (groups.length > 0) {
+    groupSelect.value = String(groups[0].bytes);
+    selectGroup(groups[0]);
   }
 }
 

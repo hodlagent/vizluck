@@ -213,12 +213,95 @@ body {
   pointer-events: none;
 }
 
+/* ── Group mode: divider + puzzle blocks ────────────────────────────────── */
+
+.divider {
+  border-top: 1px solid var(--border);
+  margin: 4px 0 2px;
+}
+
+.puzzle-blocks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+}
+
+.pblock {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 16px;
+  min-width: 96px;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s, transform 0.1s, box-shadow 0.15s;
+}
+
+.pblock:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+/* Top byte cycling: lit by the accent while it counts through its range. */
+.pblock.cycling {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(247, 147, 26, 0.55);
+  color: var(--accent);
+}
+
+/* A puzzle that matched: frozen green, hover disabled. */
+.pblock.matched {
+  border-color: var(--green);
+  box-shadow: 0 0 12px rgba(46, 204, 113, 0.55);
+  color: var(--green);
+  pointer-events: none;
+}
+
+/* While auto mode runs, mouse hover is fully inert: no accent border, no
+   lift, so cells/blocks read as non-interactive even if the pointer sits on
+   them.  (The cycling itself is also guarded in main.ts.) */
+body.auto-running .cell:hover {
+  border-color: var(--border);
+  transform: none;
+  z-index: auto;
+}
+
+body.auto-running .pblock:hover {
+  border-color: var(--border);
+  transform: none;
+}
+
+.pblock-num {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.pblock-val {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.pblock-range {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
 /* ── Info cards ──────────────────────────────────────────────────────────── */
 
 .info {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  align-items: start;
 }
 
 .card {
@@ -258,6 +341,45 @@ body {
 
 .card.addr.nomatch {
   border-color: var(--red);
+}
+
+/* ── AddrInfo bottom panel ─────────────────────────────────────────────── */
+
+.addr-info {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+/* The hovered puzzle's panel: lit while its block cycles its high byte. */
+.addr-info.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(247, 147, 26, 0.35);
+}
+
+/* A matched puzzle's panel: frozen green. */
+.addr-info.matched {
+  border-color: var(--green);
+  box-shadow: 0 0 12px rgba(46, 204, 113, 0.4);
+}
+
+.addr-info-head {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 0 2px;
+}
+
+.addr-info .card {
+  padding: 10px 12px;
 }
 
 .empty {

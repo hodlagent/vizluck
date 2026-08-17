@@ -25,7 +25,8 @@ pub fn run() {
             homepage::get_puzzles,
             homepage::random_and_derive,
             homepage::random_and_hash160,
-            homepage::derive_full
+            homepage::derive_full,
+            homepage::derive_group
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
