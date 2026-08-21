@@ -29,8 +29,11 @@ interface KeyInfo {
   xprv: string;
   xpub: string;
   compressed_public_key: string;
-  legacy_address: string;
-  pubkey_hash160: string;
+  uncompressed_public_key: string;
+  compressed_legacy_address: string;
+  uncompressed_legacy_address: string;
+  compressed_hash160: string;
+  uncompressed_hash160: string;
   address_match: boolean | null;
   /** Absolute path the match was saved to, or null when no match was saved. */
   save_path: string | null;
@@ -39,7 +42,8 @@ interface KeyInfo {
 /** Lightweight auto-mode result: key + hash160 only (no address/xprv). */
 interface AutoKeyInfo {
   private_key_hex: string;
-  pubkey_hash160: string;
+  compressed_hash160: string;
+  uncompressed_hash160: string;
   address_match: boolean | null;
   save_path: string | null;
 }
@@ -265,23 +269,44 @@ function renderBlocks() {
 }
 
 // ── AddrInfo component (bottom panel) ─────────────────────────────────────────
-// The derived-key cards (private key, xprv, compressed pubkey, legacy address),
-// shown persistently at the bottom of the page — one panel per puzzle in the
-// active group, or a single panel for a custom-range result.  Every card is
-// click-to-copy and every derivation tick refreshes its panel in place.
+// The derived-key cards (private key, xprv, compressed pubkey, compressed +
+// uncompressed BTC addresses), shown persistently at the bottom of the page —
+// one panel per puzzle in the active group, or a single panel for a custom-range
+// result.  Every card is click-to-copy and every derivation tick refreshes its
+// panel in place.
 
-/** Build the 4 click-to-copy cards (no head) for a KeyInfo. */
-function buildAddrInfoCards(info: KeyInfo): HTMLElement[] {
-  const emoji =
-    info.address_match === null ? "" : info.address_match ? " ✅" : " ❌";
+/**
+ * Build the click-to-copy cards (no head) for a KeyInfo.  `targetHash160` is
+ * the puzzle's target when comparing (group mode), or null for custom ranges —
+ * each address card then shows ✅/❌ matching that target, or no badge at all.
+ */
+function buildAddrInfoCards(
+  info: KeyInfo,
+  targetHash160: string | null,
+): HTMLElement[] {
+  const matchState = (h160: string) => {
+    if (targetHash160 === null) return { emoji: "", cls: "addr" };
+    const matched = h160 === targetHash160;
+    return {
+      emoji: matched ? " ✅" : " ❌",
+      cls: "addr " + (matched ? "match" : "nomatch"),
+    };
+  };
+  const comp = matchState(info.compressed_hash160);
+  const uncomp = matchState(info.uncompressed_hash160);
+
   const rows: Array<{ label: string; value: string; cls: string }> = [
     { label: "Private Key (32 bytes)", value: info.private_key_hex, cls: "pk" },
     { label: "BIP32 Master Key (xprv)", value: info.xprv, cls: "xprv" },
-    { label: "Public Key (compressed)", value: info.compressed_public_key, cls: "pub" },
     {
-      label: `Legacy BTC Address${emoji}`,
-      value: info.legacy_address,
-      cls: "addr" + (emoji ? (info.address_match ? " match" : " nomatch") : ""),
+      label: `BTC Address (compressed)${comp.emoji}`,
+      value: info.compressed_legacy_address,
+      cls: comp.cls,
+    },
+    {
+      label: `BTC Address (uncompressed)${uncomp.emoji}`,
+      value: info.uncompressed_legacy_address,
+      cls: uncomp.cls,
     },
   ];
 
@@ -308,14 +333,21 @@ function buildAddrInfoCards(info: KeyInfo): HTMLElement[] {
 }
 
 /**
- * Build a bottom-panel AddrInfo: optional `#N` head + the 4 cards.  A matched
- * panel gets `.matched` (green) so it stands out after the match freeze.
+ * Build a bottom-panel AddrInfo: optional `#N` head + the cards.  A matched
+ * panel gets `.matched` (green) so it stands out after the match freeze.  The
+ * puzzle's target hash160 (when known) is resolved here so each address card
+ * can show its own compressed/uncompressed match status.
  */
 function buildAddrInfoPanel(puzzleNum: number | null, info: KeyInfo): HTMLElement {
   const panel = document.createElement("div");
   panel.className = "addr-info";
   if (puzzleNum !== null) panel.dataset.puzzle = String(puzzleNum);
   if (info.address_match === true) panel.classList.add("matched");
+
+  const targetHash160 =
+    puzzleNum !== null
+      ? (puzzles.find((p) => p.puzzle_number === puzzleNum)?.hash160 ?? null)
+      : null;
 
   if (puzzleNum !== null) {
     const head = document.createElement("div");
@@ -324,7 +356,7 @@ function buildAddrInfoPanel(puzzleNum: number | null, info: KeyInfo): HTMLElemen
     panel.appendChild(head);
   }
 
-  for (const card of buildAddrInfoCards(info)) panel.appendChild(card);
+  for (const card of buildAddrInfoCards(info, targetHash160)) panel.appendChild(card);
   return panel;
 }
 
