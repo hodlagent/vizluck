@@ -445,6 +445,63 @@ body.auto-running .pblock:hover {
 
 /* ── Game tab ────────────────────────────────────────────────────────────── */
 
+/* A sibling of `.main`, not a reuse of it: the Hex regression net measures
+   `main.main` globally, and two matches would break it. Same reasoning for
+   `.game-brand` over `.brand` and `#game-info` over `#info`. */
+.game-main {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.game-brand {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: var(--green);
+}
+
+.game-status {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* The run's only handle on the key. Deliberately mirrors the Hex tab's grid
+   cells without reusing its `#grid` id — the two tabs are queried separately. */
+.game-bytes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.gbyte {
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-card);
+  color: var(--accent);
+}
+
+.game-bytes-note {
+  margin-left: 6px;
+  color: var(--text-dim);
+}
+
+.game-hint {
+  text-align: center;
+  color: var(--text-dim);
+  padding: 18px 20px;
+  font-size: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
 /* Phaser is deliberately configured with `Scale.NONE`, so it never measures
    anything itself — this box sets the size and `GameState.resize()` pushes the
    resulting dimensions into `game.scale.resize()`. */
@@ -480,6 +537,25 @@ body.auto-running .pblock:hover {
 
 .game-hud b {
   color: var(--text);
+}
+
+.game-hud .hp-bar {
+  display: inline-block;
+  vertical-align: middle;
+  width: 54px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.game-hud .hp-fill {
+  display: block;
+  height: 100%;
+  background: var(--green);
+  transition: width 0.15s linear;
 }
 
 /* ── Toast ───────────────────────────────────────────────────────────────── */

@@ -1,61 +1,131 @@
 // Game tab state — one instance per `<Game>` mount, mirroring `HexState`.
 //
-// The split that matters: everything Phaser owns is a plain field, and the only
-// things that reach `$state` are the handful of numbers the HUD prints, pushed
-// at STATS_INTERVAL_MS. Writing them per frame instead would run 60 reactivity
-// passes a second for a number nobody can read that fast.
+// Two clocks live here, and keeping them apart is most of the design:
+//
+//   * the **simulation** clock, which Phaser owns. `game.pause()` stops
+//     `update()`, and with it the sim step, the survival timer and every
+//     respawn timer, in one call.
+//   * the **key** clock, which is `loop()` below. It samples the live sim,
+//     turns it into a private key and asks the backend to match it.
+//
+// "暂停 = 停止搜索" (design §8) means a pause has to stop *both*, so
+// `syncStatus()` is the single place that decides, and nothing else calls
+// `pause()`/`resume()` or touches the key loop.
 
 import Phaser from "phaser";
-import { GAME_STATS, gameConfig, type GameStats } from "./config";
-import { BootScene } from "./scenes/BootScene";
+import { deriveGroup, getPuzzles } from "../hex/api";
+import type { KeyInfo, PuzzleInfo } from "../hex/types";
+import { GAME_STATS, SCENE_KEY, gameConfig, type GameStats } from "./config";
+import { gameKeyHex } from "./keymap";
+import { GameScene } from "./scenes/GameScene";
+import { keyRateFor } from "./sim";
 
-export type GameStatus = "idle" | "booting" | "running" | "paused" | "error";
+/** Floor on the gap between key ticks, so a huge hashpower can't flood the IPC. */
+const MIN_TICK_MS = 20;
+
+const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+
+export type GameStatus =
+  | "idle"
+  | "booting"
+  | "ready"
+  | "running"
+  | "paused"
+  | "dead"
+  | "matched"
+  | "error";
 
 export class GameState {
-  // ── Reactive: HUD numbers only, written on the scene's throttle ──────────
+  // ── Selection ────────────────────────────────────────────────────────────
+  puzzles = $state<PuzzleInfo[]>([]);
+  /** `<select>` value: a puzzle number as a string, or "" for the placeholder. */
+  selected = $state("");
+
+  /** The chosen puzzle, or null while the placeholder is selected. */
+  puzzle = $derived(this.puzzles.find((p) => String(p.puzzle_number) === this.selected) ?? null);
+
+  // ── Run intent + status ──────────────────────────────────────────────────
+  /** The user's intent, not the engine's state — see `syncStatus()`. */
+  running = $state(false);
   status = $state<GameStatus>("idle");
-  frames = $state(0);
-  fps = $state(0);
   error = $state("");
 
-  // ── Not reactive: the engine and everything Phaser touches ───────────────
+  // ── HUD numbers (throttled by the scene) ─────────────────────────────────
+  frames = $state(0);
+  fps = $state(0);
+  survival = $state(0);
+  bestSurvival = $state(0);
+  alive = $state(false);
+  level = $state(1);
+  hp = $state(0);
+  maxHp = $state(0);
+  kills = $state(0);
+  hashpower = $state(0);
+  /** Keys actually sampled this run — the real cost of the run, not a rate. */
+  keysScanned = $state(0);
+
+  // ── Key output ───────────────────────────────────────────────────────────
+  /** Latest sampled key's full info, shown in the reused AddrInfoPanel. */
+  info = $state<KeyInfo | null>(null);
+  /** The `b - 1` free bytes the game is driving, as 2-char hex. */
+  baseBytes = $state<string[]>([]);
+  /** Who owns each of those bytes (design §10.2). Parallel to `baseBytes`. */
+  owners = $state<string[]>([]);
+
+  // ── Match ────────────────────────────────────────────────────────────────
+  matched = $state(false);
+  matchBanner = $state<string | null>(null);
+  /** Bumped per match so the banner remounts (and re-fires the confetti). */
+  matchSeq = $state(0);
+
+  /**
+   * Requirement 1: the game cannot start before a puzzle is chosen — without
+   * one there is no byte layout, so there is nothing to sample. A match locks
+   * it too, so a celebration cannot be overwritten by a stray click.
+   *
+   * Declared down here, after both of the fields it reads: class field
+   * initializers run in source order, so a `$derived` above its inputs is a
+   * "used before its initialization" error.
+   */
+  canRun = $derived(this.puzzle !== null && !this.matched);
+
+  // ── Not reactive: the engine, and everything Phaser or a timer touches ───
   private game: Phaser.Game | null = null;
   private host: HTMLElement | null = null;
   private resizeObserver: ResizeObserver | null = null;
-  /** Desired running state; can arrive before the engine has finished booting. */
+  /** Whether the Game tab is the visible one. */
   private active = false;
-  /** Set once Phaser has emitted READY — before that `pause()`/`resize()` are meaningless. */
-  private ready = false;
+  /** Set once Phaser has emitted READY — before that `pause()` is meaningless. */
+  private engineReady = false;
+  /** True once a run has been created. Distinguishes "ready" from "dead". */
+  private hasRun = false;
+  /** Bumped on every new run so results in flight are dropped. */
+  private generation = 0;
+  private ticking = false;
+  private tickTimer: number | null = null;
 
   // Arrow-function fields so `off()` can be handed the identical reference.
   private onStats = (stats: GameStats) => {
     this.frames = stats.frames;
     this.fps = Math.round(stats.fps);
+    this.level = stats.level;
+    this.hp = stats.hp;
+    this.maxHp = stats.maxHp;
+    this.kills = stats.kills;
+    this.hashpower = stats.hashpower;
+    // Death lands here first (the feed is 4 Hz). `syncStatus()` reads it back
+    // off the live scene and does the bookkeeping.
+    this.syncStatus();
   };
 
   private onReady = () => {
-    this.ready = true;
+    this.engineReady = true;
     this.resize();
     // A tab switch can land before READY, so reconcile rather than assume.
     this.syncStatus();
   };
 
-  /**
-   * The single place `status` is decided. Setting it at each call site instead
-   * is how you end up with a game that is genuinely paused but labelled
-   * "running": `$effect` pauses before READY, then READY re-labels it and the
-   * second pause is a no-op because the engine is already paused.
-   */
-  private syncStatus(): void {
-    const game = this.game;
-    if (!this.ready || !game) return;
-    if (this.active) {
-      if (game.isPaused) game.resume();
-    } else if (!game.isPaused) {
-      game.pause();
-    }
-    this.status = this.active ? "running" : "paused";
-  }
+  // ── Lifecycle ────────────────────────────────────────────────────────────
 
   mount(host: HTMLElement): void {
     this.host = host;
@@ -67,7 +137,7 @@ export class GameState {
     host.replaceChildren();
 
     try {
-      this.game = new Phaser.Game(gameConfig(host, [BootScene]));
+      this.game = new Phaser.Game(gameConfig(host, [GameScene]));
     } catch (err) {
       this.status = "error";
       this.error = err instanceof Error ? err.message : String(err);
@@ -85,10 +155,12 @@ export class GameState {
   }
 
   unmount(): void {
+    this.stopTick();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.host = null;
-    this.ready = false;
+    this.engineReady = false;
+    this.hasRun = false;
 
     const game = this.game;
     this.game = null;
@@ -104,18 +176,272 @@ export class GameState {
    * The tab's pause protocol. `App.svelte` keeps both panels mounted and only
    * toggles `hidden`, which Phaser cannot see: its built-in visibility handling
    * watches `document.visibilitychange` (the whole window going to the
-   * background), and the document stays visible when we switch tabs. Without
-   * this call a hidden Game tab keeps rendering next to the GPU scanner.
+   * background), and the document stays visible when we switch tabs.
+   *
+   * Requirement 1 makes this stricter than the Hex tab: switching away clears
+   * the *run intent* too, so coming back shows ▶ and needs a deliberate click.
+   * The Hex tab, by contrast, deliberately keeps scanning in the background.
    */
   setActive(on: boolean): void {
+    if (on === this.active) return;
     this.active = on;
+    if (!on) this.running = false;
     this.syncStatus();
+  }
+
+  // ── Controls ─────────────────────────────────────────────────────────────
+
+  /** The dropdown changed. Selection is what gates the run button. */
+  onSelect(raw: string): void {
+    if (this.matched) return; // locked once a match is on screen
+    this.selected = raw;
+    this.running = false;
+    this.generation++;
+    this.stopTick();
+
+    // Changing the puzzle invalidates the run: a new byte layout means the
+    // arena's history no longer maps to anything.
+    const scene = this.scene();
+    scene?.clearRun();
+    this.hasRun = false;
+    this.alive = false;
+    this.survival = 0;
+    this.keysScanned = 0;
+    this.info = null;
+    this.baseBytes = [];
+    this.owners = [];
+    this.error = "";
+
+    // Pre-build the arena so the player can see what they are about to walk
+    // into. It stays frozen at the first frame until ▶ — that is the READY
+    // state in design §8, not an accident.
+    if (this.puzzle && scene) {
+      scene.startRun();
+      this.hasRun = true;
+      this.alive = true;
+    }
+    this.syncStatus();
+  }
+
+  /** ▶ / ⏸. Also the restart button after a death. */
+  toggle(): void {
+    if (!this.canRun) return;
+    if (this.running) {
+      this.running = false;
+    } else {
+      if (!this.alive) this.restart();
+      this.running = true;
+    }
+    this.syncStatus();
+  }
+
+  private restart(): void {
+    const scene = this.scene();
+    if (!scene) return;
+    this.generation++;
+    this.stopTick();
+    scene.startRun();
+    this.hasRun = true;
+    this.alive = true;
+    this.survival = 0;
+    this.keysScanned = 0;
+    this.info = null;
+    this.baseBytes = [];
+    this.owners = [];
+    this.error = "";
+  }
+
+  async copyText(text: string, label: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      this.error = `failed to copy ${label}`;
+    }
+  }
+
+  // ── The single decision point ────────────────────────────────────────────
+
+  /**
+   * Reconcile `running`, the engine's pause state, the key loop and `status`.
+   *
+   * Everything that can change any of them funnels through here — tab switch,
+   * button, selection, match, the 4 Hz stats feed. Setting status at each call
+   * site instead is how you end up with a game that is genuinely paused but
+   * labelled "running".
+   */
+  private syncStatus(): void {
+    this.syncLive();
+
+    // Death ends the run: freeze the intent and bank the score. Both halves
+    // matter — without `running = false` the ▶ button would keep claiming a
+    // dead run is running, and the key loop would sample a frozen sim forever.
+    if (this.hasRun && !this.alive && this.running) {
+      this.running = false;
+      this.bestSurvival = Math.max(this.bestSurvival, this.survival);
+    }
+
+    const game = this.game;
+    if (game && this.engineReady) {
+      const engineRunning = this.active && this.running && !this.matched;
+      if (engineRunning) {
+        if (game.isPaused) game.resume();
+      } else if (!game.isPaused) {
+        game.pause();
+      }
+    }
+
+    if (this.shouldTick()) this.ensureTick();
+    else this.stopTick();
+
+    this.status = this.computeStatus();
+  }
+
+  /**
+   * Pull survival/alive off the live sim rather than off the throttled stats.
+   *
+   * The stats feed is 4 Hz, and a user who pauses within one interval of dying
+   * would otherwise leave a dead run labelled "paused" and re-startable in
+   * place. The scene is the truth; this is the read.
+   */
+  private syncLive(): void {
+    const scene = this.scene();
+    if (!scene) return;
+    if (scene.hasRun()) {
+      this.hasRun = true;
+      this.survival = scene.elapsed();
+    }
+    this.alive = scene.isAlive();
+    if (this.survival > this.bestSurvival) this.bestSurvival = this.survival;
+  }
+
+  private computeStatus(): GameStatus {
+    if (this.error) return "error";
+    if (this.matched) return "matched";
+    if (!this.puzzle) return "idle";
+    if (!this.engineReady) return "booting";
+    if (this.running) return "running";
+    if (this.hasRun && !this.alive) return "dead";
+    return this.survival > 0 ? "paused" : "ready";
+  }
+
+  private shouldTick(): boolean {
+    return this.engineReady && this.active && this.running && !this.matched;
+  }
+
+  // ── The key clock ────────────────────────────────────────────────────────
+  //
+  // [imperative] A `while` loop over an await, not an `$effect`: the interval
+  // depends on the run's hashpower, which only exists inside the simulation,
+  // and the await of the IPC round-trip *is* the backpressure. An `$effect`
+  // reading reactive state here would fire on every HUD write.
+
+  private ensureTick(): void {
+    if (this.ticking) return;
+    this.ticking = true;
+    void this.loop();
+  }
+
+  private stopTick(): void {
+    this.ticking = false;
+    if (this.tickTimer !== null) {
+      window.clearTimeout(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
+
+  private async loop(): Promise<void> {
+    while (this.ticking) {
+      const started = performance.now();
+      await this.tickOnce();
+      if (!this.ticking) return;
+
+      // Target the rate the run has earned, minus what the IPC just cost, so a
+      // slow round-trip throttles the rate rather than stacking requests.
+      const interval = 1000 / keyRateFor(this.hashpower);
+      const wait = Math.max(MIN_TICK_MS, interval - (performance.now() - started));
+      await sleep(wait);
+    }
+  }
+
+  /** One sample: sim → key → match check. Never throws. */
+  private async tickOnce(): Promise<void> {
+    const scene = this.scene();
+    const puzzle = this.puzzle;
+    if (!scene || !puzzle) return;
+
+    // Requirement 6, the whole point: read the scene *now*, map it to bytes,
+    // and hand the result to the same command the Hex tab's group mode uses.
+    const snap = scene.currentSnapshot();
+    if (!snap) return;
+
+    const { keyHex, baseBytes, owners } = gameKeyHex(snap, puzzle);
+    const gen = this.generation;
+
+    try {
+      const results = await deriveGroup([keyHex]);
+      // A restart, a selection change or a pause can all land during the await.
+      if (gen !== this.generation || !this.ticking) return;
+
+      const info = results[0];
+      if (!info) return;
+
+      this.error = "";
+      this.keysScanned++;
+      this.info = info;
+      this.baseBytes = baseBytes;
+      this.owners = owners;
+
+      if (info.address_match === true) this.handleMatch(info);
+    } catch (e) {
+      this.error = String(e);
+      this.running = false;
+      this.syncStatus();
+    }
+  }
+
+  /**
+   * A match: freeze everything, then let the reused banner celebrate.
+   *
+   * The private key is already on disk — `derive_group` is the one command
+   * that calls `save_match` (src-tauri/src/homepage.rs), which is exactly why
+   * the game routes through it instead of `derive_full`.
+   */
+  private handleMatch(info: KeyInfo): void {
+    this.matched = true;
+    this.running = false;
+    this.info = info;
+    this.matchBanner = info.save_path ?? "";
+    this.matchSeq++;
+    this.bestSurvival = Math.max(this.bestSurvival, this.survival);
+    this.syncStatus();
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────────────
+
+  async init(): Promise<void> {
+    try {
+      const puzzles = await getPuzzles();
+      this.puzzles = puzzles.sort((a, b) => a.puzzle_number - b.puzzle_number);
+    } catch (e) {
+      this.error = `failed to load puzzles: ${e}`;
+      this.status = "error";
+    }
+  }
+
+  // ── Internals ────────────────────────────────────────────────────────────
+
+  private scene(): GameScene | null {
+    const game = this.game;
+    if (!game || !this.engineReady) return null;
+    // Returns undefined rather than null when the scene has not been created
+    // yet, despite what the type says.
+    return game.scene.getScene<GameScene>(SCENE_KEY) ?? null;
   }
 
   private resize(): void {
     const game = this.game;
     const host = this.host;
-    if (!this.ready || !game || !host) return;
+    if (!this.engineReady || !game || !host) return;
 
     // A hidden panel is `display: none`, so both are 0 while the Hex tab is
     // showing. Resizing to 0 would wedge the renderer; the ResizeObserver fires

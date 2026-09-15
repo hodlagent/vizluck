@@ -10,20 +10,42 @@ import Phaser from "phaser";
 export const GAME_WIDTH = 960;
 export const GAME_HEIGHT = 540;
 
+/** Key the scene is registered under, so `GameState` can reach it. */
+export const SCENE_KEY = "Game";
+
 /** Event the scene publishes throttled HUD numbers on. */
 export const GAME_STATS = "game:stats";
 
-/** What `GAME_STATS` carries. Produced by the scene, consumed by `GameState`. */
+/**
+ * What `GAME_STATS` carries. Produced by the scene, consumed by `GameState`.
+ *
+ * Deliberately a throttled summary rather than a live handle on the sim: these
+ * are the numbers the HUD prints, and writing them every frame would mean 60
+ * reactivity passes a second for digits nobody can read that fast.
+ */
 export interface GameStats {
   frames: number;
   fps: number;
+  /** Seconds survived this run. */
+  survival: number;
+  /** False once the player has died; the run is over. */
+  alive: boolean;
+  /** False until a puzzle is selected and a run has been created. */
+  ready: boolean;
+  level: number;
+  hp: number;
+  maxHp: number;
+  kills: number;
+  hashpower: number;
 }
 
 /**
  * Reads a colour out of the global stylesheet, so the canvas tracks whatever
  * `:root` says instead of hard-coding a second copy of the palette.
+ *
+ * Exported so the scene can tint monsters from the same palette.
  */
-function themeColor(name: string, fallback: string): string {
+export function themeColor(name: string, fallback: string): string {
   const value = getComputedStyle(document.documentElement)
     .getPropertyValue(name)
     .trim();
