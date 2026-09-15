@@ -28,6 +28,7 @@ import {
 import { gameKeyHex } from "./keymap";
 import { GameScene } from "./scenes/GameScene";
 import { keyRateFor } from "./sim";
+import type { ItemKind } from "./types";
 
 /** Floor on the gap between key ticks, so a huge hashpower can't flood the IPC. */
 const MIN_TICK_MS = 20;
@@ -87,9 +88,14 @@ export class GameState {
   bestSurvival = $state(0);
   alive = $state(false);
   level = $state(1);
+  /** XP banked toward the next level, and that level's price. */
+  xp = $state(0);
+  xpNext = $state(100);
   hp = $state(0);
   maxHp = $state(0);
   kills = $state(0);
+  /** Potions collected this run, per kind (design §8.3). */
+  pickups = $state<Record<ItemKind, number>>({ heal: 0, power: 0, agility: 0, vitality: 0 });
   hashpower = $state(0);
   /** Keys actually sampled this run — the real cost of the run, not a rate. */
   keysScanned = $state(0);
@@ -139,9 +145,12 @@ export class GameState {
     this.frames = stats.frames;
     this.fps = Math.round(stats.fps);
     this.level = stats.level;
+    this.xp = stats.xp;
+    this.xpNext = stats.xpNext;
     this.hp = stats.hp;
     this.maxHp = stats.maxHp;
     this.kills = stats.kills;
+    this.pickups = stats.pickups;
     this.hashpower = stats.hashpower;
     // Death lands here first (the feed is 4 Hz). `syncStatus()` reads it back
     // off the live scene and does the bookkeeping.

@@ -5,6 +5,7 @@
 // duplicated here.
 
 import Phaser from "phaser";
+import type { ItemKind } from "./types";
 
 /** Logical canvas size — matches the 16:9 stage in `styles.css`. */
 export const GAME_WIDTH = 960;
@@ -33,9 +34,14 @@ export interface GameStats {
   /** False until a puzzle is selected and a run has been created. */
   ready: boolean;
   level: number;
+  /** XP banked toward the next level, and what that next level costs. */
+  xp: number;
+  xpNext: number;
   hp: number;
   maxHp: number;
   kills: number;
+  /** Potions picked up this run, per kind (design §8.3) — the HUD's tally. */
+  pickups: Record<ItemKind, number>;
   hashpower: number;
 }
 

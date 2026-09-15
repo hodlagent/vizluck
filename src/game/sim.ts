@@ -12,6 +12,8 @@ import {
   mirrorDirY,
   type Dir,
   type GameSnapshot,
+  type ItemKind,
+  type ItemStats,
   type MonsterKind,
   type MonsterStats,
   type MoveInput,
@@ -54,6 +56,28 @@ export const TUNING = {
   escalateRespawn: 0.9,
   maxTargetCount: 14,
   minRespawn: 0.8,
+
+  /**
+   * Monster HP escalation (design §4.4, requirement 1). Every `monsterHpEvery`
+   * seconds survived, a monster spawned from then on carries `monsterHpGrowth`
+   * times the HP of one spawned a minute earlier — compounding.
+   */
+  monsterHpEvery: 60,
+  monsterHpGrowth: 1.05,
+
+  /** What a level is worth (design §8.2, requirement 2). */
+  levelHpGrowth: 1.05,
+
+  /** Potions (design §8.3, requirement 3). */
+  potionGrowth: 1.05,
+  /** Fraction of max HP a heal potion pours back in. */
+  healPotion: 0.3,
+  /** Pickup radius in px, centre to centre. */
+  pickupRadius: 5,
+  /** Seconds a potion lies on the floor before it fades. */
+  itemLifetime: 30,
+  /** Seconds of blinking before `itemLifetime` runs out. */
+  itemFlicker: 10,
 
   /** Wander behaviour for monsters that have not sensed the player. */
   wanderSpeedScale: 0.45,
@@ -121,6 +145,52 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
 /** XP needed to advance *from* `level`. */
 export const xpForNext = (level: number): number => 100 * level;
 
+/**
+ * Monster HP escalation factor at `time` seconds into a run (design §4.4).
+ *
+ * Derived from the survival clock rather than carried in a field: it is a pure
+ * function of `time`, so there is no second piece of state to keep in sync with
+ * the clock, and a test can state the expected factor without stepping the sim.
+ */
+export function monsterHpMul(time: number): number {
+  return TUNING.monsterHpGrowth ** Math.floor(time / TUNING.monsterHpEvery);
+}
+
+/** The four potions, in a fixed order — the drop roll and the HUD both walk it. */
+export const ITEM_KINDS: readonly ItemKind[] = ["heal", "power", "agility", "vitality"];
+
+/**
+ * Per-kill drop chance, one **independent** roll per kind (design §8.3).
+ *
+ * Independent rather than a weighted pick from a 100% table, which is the
+ * user's call and changes what the numbers mean: a kill can now drop nothing
+ * at all (~52%, the product of the four complements) or, rarely, two things at
+ * once. `heal` is the common one because it is the only potion that does
+ * nothing permanent; `vitality` is the rarest because its +5% compounds for the
+ * rest of the run.
+ */
+export const DROP_CHANCE: Record<ItemKind, number> = {
+  heal: 0.22,
+  power: 0.14,
+  agility: 0.14,
+  vitality: 0.09,
+};
+
+/**
+ * What one kill leaves behind: anywhere from nothing to all four.
+ *
+ * Consumes exactly `ITEM_KINDS.length` draws **whatever the outcome**. That is
+ * deliberate and load-bearing for the tests: the rng stream advances by a fixed
+ * amount per kill, so a seeded run stays reproducible no matter what dropped.
+ */
+export function rollDrops(rng: () => number): ItemKind[] {
+  const out: ItemKind[] = [];
+  for (const kind of ITEM_KINDS) {
+    if (rng() < DROP_CHANCE[kind]) out.push(kind);
+  }
+  return out;
+}
+
 /** Key sampling rate for a hashpower value, in keys/s (design §8.1). */
 export function keyRateFor(hashpower: number): number {
   const frac = Math.max(0, Math.min(1, hashpower / TUNING.hashpowerMax));
@@ -134,6 +204,10 @@ export interface SimState {
   height: number;
   player: PlayerStats;
   monsters: MonsterStats[];
+  /** Potions on the floor, waiting to be walked over (design §8.3). */
+  items: ItemStats[];
+  /** How many of each potion has been picked up this run — HUD only. */
+  pickups: Record<ItemKind, number>;
   configs: RegionConfig[];
   regions: RegionRuntime[];
 
@@ -209,6 +283,13 @@ export function buildRegions(width: number, height: number): RegionConfig[] {
 function spawnMonster(s: SimState, cfg: RegionConfig, kind: MonsterKind): MonsterStats {
   const arch = MONSTER_ARCHETYPES[kind];
   const pad = TUNING.spawnPad;
+  // Requirement 1: the arena gets tougher on a clock. Applied here, at the
+  // moment of spawning, rather than retro-fitted onto monsters already on the
+  // floor — a monster whose bar grew while the player was hitting it reads as a
+  // bug, not as difficulty. Nothing is lost by it: a region turns its whole
+  // population over in 2.5-6s, so within a minute essentially every monster on
+  // screen was spawned under the new factor anyway.
+  const hp = arch.hp * monsterHpMul(s.time);
   const m: MonsterStats = {
     id: s.nextId++,
     kind,
@@ -218,8 +299,8 @@ function spawnMonster(s: SimState, cfg: RegionConfig, kind: MonsterKind): Monste
     attackPower: arch.attackPower,
     attackRange: arch.attackRange,
     senseRange: arch.senseRange,
-    hp: arch.hp,
-    maxHp: arch.hp,
+    hp,
+    maxHp: hp,
     posX: cfg.x + pad + s.rng() * Math.max(1, cfg.w - pad * 2),
     posY: cfg.y + pad + s.rng() * Math.max(1, cfg.h - pad * 2),
     // Stagger the first swing so a freshly populated region doesn't volley.
@@ -256,6 +337,8 @@ export function createSim(opts: SimOptions = {}): SimState {
       posY: configs[0].y + configs[0].h / 2,
     },
     monsters: [],
+    items: [],
+    pickups: { heal: 0, power: 0, agility: 0, vitality: 0 },
     configs,
     regions: configs.map((config): RegionRuntime => ({ config, pending: [] })),
     time: 0,
@@ -303,6 +386,24 @@ function countInRegion(s: SimState, region: number): number {
   return n;
 }
 
+/**
+ * Did the player's path this step pass close enough to `it` to collect it?
+ *
+ * Point-to-**segment**, not point-to-endpoint. `dt` is clamped to `maxDt`, but
+ * that is still ~8px of travel on a slow frame — more than the 5px pickup
+ * radius — and agility potions compound, so a fast player covers more than the
+ * potion's whole diameter in a single step. Testing only where they ended up
+ * would let them walk clean over a potion and leave it lying there.
+ */
+function pickedUp(it: ItemStats, fromX: number, fromY: number, toX: number, toY: number): boolean {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const len2 = dx * dx + dy * dy;
+  // Standing still degenerates the segment to the point they are standing on.
+  const t = len2 > 0 ? clamp(((it.posX - fromX) * dx + (it.posY - fromY) * dy) / len2, 0, 1) : 0;
+  return Math.hypot(it.posX - (fromX + dx * t), it.posY - (fromY + dy * t)) <= TUNING.pickupRadius;
+}
+
 function nearestMonster(s: SimState, x: number, y: number, maxDist: number): MonsterStats | null {
   const limit = maxDist * maxDist;
   let best: MonsterStats | null = null;
@@ -330,14 +431,74 @@ function damagePlayer(s: SimState, amount: number): void {
   }
 }
 
+/**
+ * What a level is worth (design §8.2, requirement 2): a bigger life bar, and
+ * nothing else.
+ *
+ * Attack power, attack speed and move speed deliberately do **not** grow here.
+ * A level used to raise all of them, which would have made every potion a
+ * slower-acting level-up — the drop table only means something if the floor is
+ * where combat strength comes from. Note also that the *current* hp is left
+ * alone: a level raises the ceiling, and filling the bar back up is what the
+ * heal potion is for.
+ */
 function applyLevelUp(p: PlayerStats): void {
-  p.maxHp += 10;
-  p.hp = Math.min(p.maxHp, p.hp + 10);
-  p.attackPower += 1;
-  p.moveSpeed += 2;
-  p.attackSpeed += 0.05;
-  p.attackRange += 1;
-  p.hpSpeed += 0.1;
+  p.maxHp *= TUNING.levelHpGrowth;
+}
+
+/**
+ * Pour a potion into the player (design §8.3, requirement 3).
+ *
+ * The four effects are the whole reward economy, so each one is stated once,
+ * here, and nothing else in the sim touches these stats mid-run.
+ */
+function applyItem(s: SimState, kind: ItemKind): void {
+  const p = s.player;
+  s.pickups[kind]++;
+
+  switch (kind) {
+    case "heal":
+      // 30% of the max, capped: a surplus is spilled, not banked.
+      p.hp = Math.min(p.maxHp, p.hp + p.maxHp * TUNING.healPotion);
+      break;
+    case "power":
+      p.attackPower *= TUNING.potionGrowth;
+      p.attackSpeed *= TUNING.potionGrowth;
+      break;
+    case "agility":
+      p.moveSpeed *= TUNING.potionGrowth;
+      break;
+    case "vitality":
+      // The ceiling moves, the current hp does not — that is exactly what
+      // separates this from the heal potion, and why both exist.
+      p.maxHp *= TUNING.potionGrowth;
+      break;
+    default: {
+      // Exhaustiveness: a fifth potion must be given an effect, not silently
+      // dropped by the switch.
+      const never: never = kind;
+      throw new Error(`unhandled item kind: ${String(never)}`);
+    }
+  }
+}
+
+/** Drop what a kill leaves behind, spread so two potions don't stack. */
+function dropLoot(s: SimState, m: MonsterStats): void {
+  const kinds = rollDrops(s.rng);
+  for (let i = 0; i < kinds.length; i++) {
+    // One potion lands exactly where the monster fell; several are spread on a
+    // small ring, since two items at identical coordinates are one item as far
+    // as the player can see (and only the nearer would ever be picked up first).
+    const a = kinds.length > 1 ? (i / kinds.length) * Math.PI * 2 : 0;
+    const r = kinds.length > 1 ? 11 : 0;
+    s.items.push({
+      id: s.nextId++,
+      kind: kinds[i],
+      posX: clamp(m.posX + Math.cos(a) * r, 0, s.width),
+      posY: clamp(m.posY + Math.sin(a) * r, 0, s.height),
+      life: TUNING.itemLifetime,
+    });
+  }
 }
 
 function killMonster(s: SimState, m: MonsterStats): void {
@@ -354,6 +515,11 @@ function killMonster(s: SimState, m: MonsterStats): void {
     s.level++;
     applyLevelUp(s.player);
   }
+
+  // Requirement 3: a kill leaves potions on the floor, where the monster died
+  // rather than where the player is standing. Combat happens at the edge of
+  // `attackRange`, so this is what turns "kill" into "and now go and get it".
+  dropLoot(s, m);
 
   // Respawn after this region's delay, in this region (requirement: "杀死后 n
   // 秒后刷新出来", per-region and independent).
@@ -420,10 +586,32 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
   }
 
   // ── Player ───────────────────────────────────────────────────────────────
+  // Where the player stood before moving, kept for the pickup test below.
+  const fromX = p.posX;
+  const fromY = p.posY;
   if (input.dx !== 0 || input.dy !== 0) {
     p.dir = dirFromVector(input.dx, input.dy);
     p.posX = clamp(p.posX + input.dx * p.moveSpeed * dt, 0, s.width);
     p.posY = clamp(p.posY + input.dy * p.moveSpeed * dt, 0, s.height);
+  }
+
+  // ── Potions on the floor (design §8.3) ───────────────────────────────────
+  // The order inside this loop — age first, then collect — is load-bearing for
+  // the renderer. It means an item can only ever expire on the step where its
+  // *previously observed* `life` was already ≤ dt, which is how the scene tells
+  // a pickup from a fade without guessing from distance (see `GameScene.observe`).
+  // Reverse index, because the loop splices.
+  for (let i = s.items.length - 1; i >= 0; i--) {
+    const it = s.items[i];
+    it.life -= dt;
+    if (it.life <= 0) {
+      s.items.splice(i, 1);
+      continue;
+    }
+    if (pickedUp(it, fromX, fromY, p.posX, p.posY)) {
+      s.items.splice(i, 1);
+      applyItem(s, it.kind);
+    }
   }
 
   s.sinceDamage += dt;

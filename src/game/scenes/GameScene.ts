@@ -46,12 +46,15 @@ import {
   regionIndexAt,
   snapshot as simSnapshot,
   stepSim,
+  TUNING,
+  xpForNext,
   type SimState,
 } from "../sim";
 import {
   DIR_VECTORS,
   NO_INPUT,
   type GameSnapshot,
+  type ItemKind,
   type MonsterKind,
   type MoveInput,
   type RegionConfig,
@@ -74,6 +77,12 @@ const PLAYER_RADIUS = 9;
  */
 const SENSE_RING_MARGIN = 60;
 const MONSTER_RADIUS: Record<MonsterKind, number> = { wanderer: 6, hunter: 7, brute: 11 };
+
+/**
+ * A potion's visual radius, deliberately equal to `TUNING.pickupRadius` — the
+ * picture and the rule should agree about how close you have to get to it.
+ */
+const ITEM_RADIUS = 5;
 const HP_BAR_W = 18;
 const HP_BAR_H = 3;
 
@@ -150,7 +159,23 @@ interface Palette {
   monster: Record<MonsterKind, number>;
   /** One step lighter than the body, for rims and facing ticks. */
   monsterRim: Record<MonsterKind, number>;
+  /** Drop colours, one per potion kind (design §8.3). */
+  item: Record<ItemKind, number>;
+  itemRim: Record<ItemKind, number>;
 }
+
+/**
+ * The four potion colours, read from `:root` like every other colour here.
+ *
+ * `styles.css` uses these same four variables for the HUD's potion legend, so
+ * the dot next to "heal 3" cannot drift away from the thing on the canvas.
+ */
+const LOOT_FALLBACK: Record<ItemKind, string> = {
+  heal: "#2ecc71",
+  power: "#f7931a",
+  agility: "#39c5e0",
+  vitality: "#e05fa8",
+};
 
 function readPalette(): Palette {
   const accent = cssToInt(themeColor("--accent", "#f7931a"), 0xf7931a);
@@ -164,6 +189,14 @@ function readPalette(): Palette {
     hunter: accent,
     brute: red,
   };
+
+  const item = {} as Record<ItemKind, number>;
+  const itemRim = {} as Record<ItemKind, number>;
+  for (const kind of Object.keys(LOOT_FALLBACK) as ItemKind[]) {
+    const fallback = LOOT_FALLBACK[kind];
+    item[kind] = cssToInt(themeColor(`--loot-${kind}`, fallback), cssToInt(fallback, 0));
+    itemRim[kind] = shade(item[kind], 0.55);
+  }
 
   return {
     floor: FLOOR,
@@ -181,8 +214,22 @@ function readPalette(): Palette {
       hunter: shade(accent, 0.4),
       brute: shade(red, 0.4),
     },
+    item,
+    itemRim,
   };
 }
+
+/**
+ * What a pickup throws off. Two or three characters, because these float off
+ * the player in the middle of a fight and have to be read at a glance — and
+ * because the alternative, naming the potion, is already the HUD's job.
+ */
+const ITEM_LABEL: Record<ItemKind, string> = {
+  heal: "HEAL",
+  power: "ATK+",
+  agility: "SPD+",
+  vitality: "MAX+",
+};
 
 /** The tier's label, painted into the corner of each region. */
 const TIER_LABEL: Record<RegionConfig["tier"], string> = {
@@ -223,6 +270,27 @@ interface Floater {
   vy: number;
   life: number;
   max: number;
+}
+
+/**
+ * Per-item bookkeeping, kept in its own map rather than folded into `Tracked`.
+ *
+ * Item and monster ids share one counter in the sim, and `Tracked.kind` is a
+ * `MonsterKind` — merging the two would force that to widen and put monster
+ * rendering code one bad branch away from drawing a potion.
+ */
+interface TrackedItem {
+  x: number;
+  y: number;
+  kind: ItemKind;
+  /**
+   * The item's `life` the last time it was seen alive. This is what tells a
+   * pickup from a fade-out exactly, with no distance guessing: the sim ages an
+   * item *before* it tests for pickup, so an item can only ever expire on the
+   * step where its previously observed `life` was already ≤ `dt`.
+   */
+  life: number;
+  stamp: number;
 }
 
 /** Per-monster bookkeeping the sim has no business carrying. */
@@ -267,6 +335,7 @@ export class GameScene extends Phaser.Scene {
   private bursts: Burst[] = [];
   private trail: { x: number; y: number }[] = [];
   private tracked = new Map<number, Tracked>();
+  private trackedItems = new Map<number, TrackedItem>();
   private stamp = 0;
   /** Seconds left on the player's swing arc, and the direction it went out in. */
   private swing = 0;
@@ -811,7 +880,12 @@ export class GameScene extends Phaser.Scene {
       );
     }
 
-    // 6. Monsters.
+    // 6. Potions on the floor. Above the rings, below the bodies: an item is a
+    //    decal on the ground, so a monster standing on one has to occlude it,
+    //    never the other way round.
+    this.drawItems(g, sim);
+
+    // 7. Monsters.
     for (const m of sim.monsters) {
       const color = p.monster[m.kind];
       const rim = p.monsterRim[m.kind];
@@ -869,7 +943,7 @@ export class GameScene extends Phaser.Scene {
       this.drawHpBar(g, m.posX, m.posY - r - 9, m.hp / m.maxHp, color);
     }
 
-    // 7. Player — or its husk. Death has to change the *body*, not just dim the
+    // 8. Player — or its husk. Death has to change the *body*, not just dim the
     //    frame: a corpse still glowing green under a GAME OVER card reads as a
     //    rendering bug, and it is the last thing the run leaves on screen.
     if (!sim.alive) {
@@ -926,7 +1000,7 @@ export class GameScene extends Phaser.Scene {
       );
     }
 
-    // 8. The swing, when there is one: a fan of dots out along the facing.
+    // 9. The swing, when there is one: a fan of dots out along the facing.
     if (this.swing > 0) {
       const f = this.swing / SWING_S;
       const base = (this.swingDir * Math.PI) / 4;
@@ -938,7 +1012,7 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // 9. Sparks and shock rings, above everything they came from.
+    // 10. Sparks and shock rings, above everything they came from.
     for (const s of this.sparks) {
       g.fillStyle(s.color, Math.max(0, s.life / s.max));
       g.fillPoint(s.x, s.y, s.size);
@@ -947,6 +1021,96 @@ export class GameScene extends Phaser.Scene {
       const f = b.life / b.max;
       g.lineStyle(b.width * f, b.color, 0.7 * f);
       g.strokeCircle(b.x, b.y, b.r);
+    }
+  }
+
+  /**
+   * The potions lying on the floor.
+   *
+   * Each kind gets its own *silhouette*, not just its own colour — the rule the
+   * monsters already follow, and for the same reason. Two potions dropped close
+   * together, or one read through a sense ring, defeats colour alone; a cross
+   * and a ring never do.
+   *
+   * The whole thing is drawn into the caller's shared `Graphics`, so a dozen
+   * items cost a dozen small primitives and no new `Text` objects. That matters
+   * more than it looks: under the Canvas renderer every `Text` is its own render
+   * pass and texture, which is why the floater pool is capped at 12.
+   */
+  private drawItems(g: Phaser.GameObjects.Graphics, sim: SimState): void {
+    const p = this.palette;
+    const t = this.clock;
+
+    for (const it of sim.items) {
+      const color = p.item[it.kind];
+
+      // Expiring: dim and breathe, rather than blink on and off. A hard toggle
+      // at 60fps across a dozen items is a strobe, and the arena is only
+      // allowed one blinking thing — the aggro ring, which is a threat.
+      //
+      // The *decision* to flicker comes from the sim's clock (`it.life`), the
+      // ramp from the render clock (`this.clock`), which deliberately keeps
+      // running while paused. Two clocks, two jobs.
+      const expiring = it.life <= TUNING.itemFlicker;
+      const alpha = expiring ? 0.45 + 0.4 * (0.5 + 0.5 * Math.sin(t * 9)) : 1;
+
+      // Ground glow — nested translucent discs, the only glow the Canvas
+      // renderer can promise. It is also what makes a 5px object findable.
+      g.fillStyle(color, 0.16 * alpha);
+      g.fillCircle(it.posX, it.posY, ITEM_RADIUS + 6);
+      g.fillStyle(color, 0.2 * alpha);
+      g.fillCircle(it.posX, it.posY, ITEM_RADIUS + 2.5);
+      // A dark backing disc, so the bright glyph has something to sit on.
+      g.fillStyle(shade(color, -0.45), 0.9 * alpha);
+
+      switch (it.kind) {
+        case "heal": {
+          // A cross: the one symbol that already means "restore" everywhere.
+          g.fillCircle(it.posX, it.posY, ITEM_RADIUS);
+          const arm = ITEM_RADIUS * 1.5;
+          const thick = ITEM_RADIUS * 0.6;
+          g.fillStyle(0xffffff, 0.92 * alpha);
+          g.fillRect(it.posX - arm / 2, it.posY - thick / 2, arm, thick);
+          g.fillRect(it.posX - thick / 2, it.posY - arm / 2, thick, arm);
+          break;
+        }
+        case "power":
+          // An upright triangle — a blade.
+          g.fillCircle(it.posX, it.posY, ITEM_RADIUS);
+          g.fillStyle(color, alpha);
+          g.fillTriangle(
+            it.posX,
+            it.posY - ITEM_RADIUS * 0.82,
+            it.posX - ITEM_RADIUS * 0.78,
+            it.posY + ITEM_RADIUS * 0.62,
+            it.posX + ITEM_RADIUS * 0.78,
+            it.posY + ITEM_RADIUS * 0.62,
+          );
+          break;
+        case "agility":
+          // The same triangle laid on its side: motion, not force.
+          g.fillCircle(it.posX, it.posY, ITEM_RADIUS);
+          g.fillStyle(color, alpha);
+          g.fillTriangle(
+            it.posX + ITEM_RADIUS * 0.82,
+            it.posY,
+            it.posX - ITEM_RADIUS * 0.62,
+            it.posY - ITEM_RADIUS * 0.78,
+            it.posX - ITEM_RADIUS * 0.62,
+            it.posY + ITEM_RADIUS * 0.78,
+          );
+          break;
+        case "vitality":
+          // A ring — a bigger vessel, which is exactly what it buys.
+          g.lineStyle(2.2, color, alpha);
+          g.strokeCircle(it.posX, it.posY, ITEM_RADIUS * 0.68);
+          break;
+      }
+
+      // A bright rim, so an item survives the 0.78 death veil and the region
+      // washes the same way the husk does.
+      g.lineStyle(1, p.itemRim[it.kind], 0.85 * alpha);
+      g.strokeCircle(it.posX, it.posY, ITEM_RADIUS + 3);
     }
   }
 
@@ -1066,6 +1230,10 @@ export class GameScene extends Phaser.Scene {
     this.bursts.length = 0;
     this.trail.length = 0;
     this.tracked.clear();
+    // Not optional: `createSim` restarts `nextId` at 1, so a surviving entry
+    // from the previous run collides with a brand-new item's id and throws a
+    // phantom pickup effect onto the first frames of the next run.
+    this.trackedItems.clear();
     this.swing = 0;
     this.hurt = 0;
     this.announceLife = 0;
@@ -1083,7 +1251,7 @@ export class GameScene extends Phaser.Scene {
    * the state it already holds. Every effect here therefore has exactly one
    * possible cause, and `sim.ts` never learns that it is being watched.
    */
-  private observe(before: { hp: number; cooldown: number; level: number }): void {
+  private observe(before: { cooldown: number; level: number }, dt: number): void {
     const sim = this.sim;
     if (!sim) return;
     const p = this.palette;
@@ -1091,7 +1259,15 @@ export class GameScene extends Phaser.Scene {
 
     // Damage to the player: vignette + a shock ring, so a hit registers even
     // when the eye is on the other side of the arena.
-    if (player.hp < before.hp) {
+    //
+    // Read off `sinceDamage` — which `damagePlayer` alone zeroes — rather than
+    // off `hp < before.hp`. Those two were the same test until potions existed,
+    // and they no longer are: a hit and a heal landing in the same step leave
+    // `hp` level or higher, and the diffing version would swallow the hit
+    // exactly when the player most needs to see it. `sinceDamage` is bumped by
+    // `dt` at the top of every live step, so it reads 0 if and only if a blow
+    // landed during this one.
+    if (dt > 0 && sim.sinceDamage === 0) {
       this.hurt = HURT_S;
       this.bursts.push({
         x: player.posX,
@@ -1170,6 +1346,66 @@ export class GameScene extends Phaser.Scene {
         track.y - MONSTER_RADIUS[track.kind] - 4,
         p.accent,
       );
+    }
+
+    // Potions: the same sweep, reusing this frame's stamp, but with an exact
+    // answer to "picked up or timed out" instead of a distance guess.
+    //
+    // Age-then-collect in the sim means an item can only expire on the step
+    // where the `life` we last *saw* was already ≤ `dt` — anything that had more
+    // than one step left could not have run out. So the last observed `life` is
+    // a complete discriminator, with no radius constant and no misclassification
+    // for a player who happens to be standing near an item as it fades.
+    for (const it of sim.items) {
+      const track = this.trackedItems.get(it.id);
+      if (!track) {
+        this.trackedItems.set(it.id, {
+          x: it.posX,
+          y: it.posY,
+          kind: it.kind,
+          life: it.life,
+          stamp: this.stamp,
+        });
+        continue;
+      }
+      track.x = it.posX;
+      track.y = it.posY;
+      track.kind = it.kind;
+      track.life = it.life;
+      track.stamp = this.stamp;
+    }
+
+    for (const [id, track] of this.trackedItems) {
+      if (track.stamp === this.stamp) continue;
+      this.trackedItems.delete(id);
+      const color = p.item[track.kind];
+
+      if (track.life > dt) {
+        // Walked over: loud, and fired off the *player*, because the reward is
+        // theirs and the potion is already gone from the floor. Distinct from
+        // the `+N` hashpower floater above, which stays where the kill happened.
+        this.bursts.push({
+          x: player.posX,
+          y: player.posY,
+          r: PLAYER_RADIUS,
+          maxR: PLAYER_RADIUS + 30,
+          life: 0.35,
+          max: 0.35,
+          color,
+          width: 2.5,
+        });
+        this.spray(player.posX, player.posY, color, 6, 70);
+        this.spawnFloater(
+          ITEM_LABEL[track.kind],
+          player.posX,
+          player.posY - PLAYER_RADIUS - 10,
+          color,
+        );
+      } else {
+        // Timed out: quiet, and where it lay. It is a missed opportunity, not
+        // an event — a burst here would read as a pickup.
+        this.spray(track.x, track.y, color, 4, 28);
+      }
     }
   }
 
@@ -1265,9 +1501,16 @@ export class GameScene extends Phaser.Scene {
       alive: sim?.alive ?? false,
       ready: sim !== null,
       level: sim?.level ?? 1,
+      xp: sim?.xp ?? 0,
+      // `xpForNext` is the sim's own formula, not a copy of it — the HUD must
+      // never disagree with the rule that actually levels the player up.
+      xpNext: xpForNext(sim?.level ?? 1),
       hp: sim?.player.hp ?? 0,
       maxHp: sim?.player.maxHp ?? 0,
       kills: sim?.kills ?? 0,
+      // Frozen along with every other number here while the run is paused —
+      // that is the 4 Hz feed's contract, not an oversight.
+      pickups: sim?.pickups ?? { heal: 0, power: 0, agility: 0, vitality: 0 },
       hashpower: sim?.hashpower ?? 0,
     };
     this.game.events.emit(GAME_STATS, stats);
@@ -1282,13 +1525,9 @@ export class GameScene extends Phaser.Scene {
     const sim = this.sim;
     if (sim && !this.paused) {
       if (sim.alive) {
-        const before = {
-          hp: sim.player.hp,
-          cooldown: sim.attackCooldown,
-          level: sim.level,
-        };
+        const before = { cooldown: sim.attackCooldown, level: sim.level };
         stepSim(sim, this.readInput(), dt);
-        this.observe(before);
+        this.observe(before, dt);
 
         const last = this.trail[this.trail.length - 1];
         if (!last || Math.hypot(last.x - sim.player.posX, last.y - sim.player.posY) > 3) {

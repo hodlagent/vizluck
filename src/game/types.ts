@@ -91,6 +91,35 @@ export interface MonsterStats {
   wanderTimer: number;
 }
 
+// ── Drops (design §8.3, requirement 3) ──────────────────────────────────────
+
+/**
+ * The four potions a kill can leave on the floor.
+ *
+ * Named for the *effect*, not the colour: `vitality` raises the ceiling while
+ * `heal` fills the bar back up, and keeping those two apart is the whole reason
+ * the drop table has four entries instead of one.
+ */
+export type ItemKind = "heal" | "power" | "agility" | "vitality";
+
+/**
+ * A potion lying on the arena floor, waiting to be walked over.
+ *
+ * Deliberately **absent from `GameSnapshot`**: a drop is not key material. It
+ * reaches the key indirectly, by moving the player stats `V` already carries
+ * (design §3.4) — and `V`'s fixed length is load-bearing, so an item window
+ * would shift every byte's owner and make the HUD's ownership readout jump
+ * every time something dropped.
+ */
+export interface ItemStats {
+  id: number;
+  kind: ItemKind;
+  posX: number;
+  posY: number;
+  /** Seconds left before it fades away. */
+  life: number;
+}
+
 // ── Scene (design §4, requirement 4) ────────────────────────────────────────
 
 /** Where a region sits in the 3x3 grid; drives its difficulty tier. */

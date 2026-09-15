@@ -12,7 +12,7 @@
  * What lives here rather than in `game-tab.mjs`: everything that needs either
  * determinism (an injected rng) or wall-clock the UI test can't afford — dying,
  * respawn timing, the region leash, and the byte-distribution guarantee that
- * design §2.2 rests on.
+ * design §3.3 rests on.
  *
  * Usage:
  *   npm run test:e2e                 # starts a dev server if none is running
@@ -112,6 +112,9 @@ async function run() {
     /** Strip the arena down to one puppet so a step is fully determined. */
     const solo = (s, kind, region, place) => {
       s.monsters.length = 0;
+      // Potions from an earlier kill would otherwise be lying around for the
+      // player to walk into mid-test, changing stats the check thought it owned.
+      s.items.length = 0;
       const cfg = s.configs[region];
       const m = {
         id: 999, kind, dir: 0, moveSpeed: 0, attackSpeed: 1,
@@ -264,6 +267,285 @@ async function run() {
       check(inRegion(s.monsters[0], cfg), "it respawns inside that region's bounds");
     }
 
+    // ── §4.4 + §8.2 + §8.3 The upgrade system ──────────────────────────────
+    //
+    // Everything below runs on `bare()`: an arena with no monsters, so the only
+    // thing that can move a stat is the potion the check itself put on the
+    // floor. `maxHp` and friends leave the sim as products of 1.05s, so every
+    // float assertion goes through `near` rather than `===`.
+    {
+      const near = (a, b, eps = 1e-9) => Math.abs(a - b) <= eps;
+      const bare = () => {
+        const s = fresh();
+        s.monsters.length = 0;
+        s.items.length = 0;
+        // `createSim` starts the player *out* of combat (`sinceDamage` already
+        // past the delay), so a bare arena drips 1 hp/s back on. Suppressing it
+        // keeps each check about the one stat it placed and nothing else — an
+        // "hp is unchanged" assertion would otherwise fail on a 0.05 regen tick.
+        s.sinceDamage = 0;
+        return s;
+      };
+      const step = (s) => sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+      /** Put a potion under the player's feet (or `at` a given offset). */
+      const floor = (s, kind, dx = 0, dy = 0, life = sim.TUNING.itemLifetime) => {
+        s.items.push({
+          id: 9000 + s.items.length,
+          kind,
+          posX: s.player.posX + dx,
+          posY: s.player.posY + dy,
+          life,
+        });
+      };
+
+      // Monster HP escalation is a pure function of survival time...
+      check(sim.monsterHpMul(0) === 1, "monsterHpMul(0) is 1", sim.monsterHpMul(0));
+      check(sim.monsterHpMul(59.9) === 1, "monsterHpMul is flat until the minute is up");
+      check(near(sim.monsterHpMul(60), 1.05), "monsterHpMul(60) is ×1.05", sim.monsterHpMul(60));
+      check(
+        near(sim.monsterHpMul(180), 1.05 ** 3),
+        "monsterHpMul compounds per minute",
+        sim.monsterHpMul(180),
+      );
+
+      // ...and it reaches a spawn that happens *after* the minute, not before.
+      {
+        const home = 4;
+        const cfg = fresh().configs[home];
+        const early = fresh();
+        const m0 = solo(early, "hunter", home, () => {});
+        m0.hp = 1;
+        m0.posX = early.player.posX;
+        m0.posY = early.player.posY;
+        early.attackCooldown = 0;
+        sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
+
+        const s = fresh();
+        const m = solo(s, "hunter", home, () => {});
+        m.hp = 1;
+        m.posX = s.player.posX;
+        m.posY = s.player.posY;
+        s.attackCooldown = 0;
+        s.time = sim.TUNING.monsterHpEvery; // one minute already survived
+        sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+        check(s.kills === 1, "the puppet dies in both arms of the HP check");
+
+        let t = 0;
+        while (t < cfg.respawnSeconds + 0.3) {
+          sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+          sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
+          t += 0.05;
+        }
+        // Both respawns happened after minute 1 for `s` and minute 0 for
+        // `early`, so the pair isolates the multiplier from the archetype.
+        check(
+          near(early.monsters[0]?.maxHp ?? 0, 35, 1e-9),
+          "a monster spawned in the first minute has the archetype's raw hp",
+          early.monsters[0]?.maxHp,
+        );
+        check(
+          near(s.monsters[0]?.maxHp ?? 0, 35 * 1.05, 1e-6),
+          "a monster spawned after a minute has ×1.05 hp",
+          s.monsters[0]?.maxHp,
+        );
+        check(
+          s.monsters[0]?.hp === s.monsters[0]?.maxHp,
+          "it spawns at full health, not merely with a bigger ceiling",
+        );
+      }
+
+      // Level-up: the ceiling moves, the current hp does not (design §8.2).
+      {
+        const s = bare();
+        const m = solo(s, "hunter", 4, () => {});
+        m.hp = 1;
+        m.posX = s.player.posX;
+        m.posY = s.player.posY;
+        s.attackCooldown = 0;
+        s.xp = 95; // hunter pays 20, so this crosses the 100-point bar
+        s.player.hp = 50;
+        sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+        check(s.level === 2, "crossing the xp bar levels the player up", s.level);
+        check(s.xp === 15, "the surplus carries into the next level", s.xp);
+        check(near(s.player.maxHp, 105, 1e-6), "a level raises max hp ×1.05", s.player.maxHp);
+        check(s.player.hp === 50, "a level does not heal", s.player.hp);
+        check(
+          s.player.attackPower === sim.TUNING.attackPower &&
+            s.player.moveSpeed === sim.TUNING.moveSpeed,
+          "a level grants no attack power or speed — potions own those",
+        );
+      }
+
+      // The drop table. `rollDrops` is a plain function over `rng`, so the whole
+      // probability model can be driven from stubs and from one seeded stream.
+      {
+        check(
+          sim.rollDrops(() => 0).length === 4,
+          "rng 0 everywhere drops all four potions",
+          sim.rollDrops(() => 0).join(","),
+        );
+        check(
+          sim.rollDrops(() => 0.99).length === 0,
+          "rng 0.99 everywhere drops nothing — a kill is not guaranteed loot",
+        );
+
+        // Independence, stated as a sequence: only the power trial passes, and
+        // the three failures around it neither cancel it nor add to it.
+        const seq = [0.99, 0.01, 0.99, 0.99];
+        let i = 0;
+        const got = sim.rollDrops(() => seq[i++]);
+        check(
+          got.length === 1 && got[0] === "power",
+          "each kind is an independent trial, not one weighted pick",
+          got.join(","),
+        );
+
+        let draws = 0;
+        sim.rollDrops(() => (draws++, 0.5));
+        check(draws === 4, "a kill consumes exactly four rng draws", draws);
+
+        // The distribution itself, off a fixed seed.
+        const rng = rngFrom(987654321);
+        const counts = { heal: 0, power: 0, agility: 0, vitality: 0 };
+        const N = 20000;
+        let empty = 0;
+        for (let k = 0; k < N; k++) {
+          const kinds = sim.rollDrops(rng);
+          if (kinds.length === 0) empty++;
+          for (const kind of kinds) counts[kind]++;
+        }
+        const frac = empty / N;
+        check(
+          frac > 0.4 && frac < 0.56,
+          "most kills drop nothing",
+          `${(frac * 100).toFixed(1)}% empty`,
+        );
+        check(
+          Object.values(counts).every((c) => c > 0),
+          "all four potions do drop",
+          JSON.stringify(counts),
+        );
+        check(
+          counts.heal > counts.power && counts.power > counts.vitality,
+          "the rarer potions are actually rarer",
+          JSON.stringify(counts),
+        );
+        const total = Object.values(counts).reduce((a, b) => a + b, 0) / N;
+        const expected = Object.values(sim.DROP_CHANCE).reduce((a, b) => a + b, 0);
+        check(
+          near(total, expected, 0.03),
+          "the observed drop rate matches the sum of the per-kind chances",
+          `${total.toFixed(3)} vs ${expected.toFixed(3)}`,
+        );
+      }
+
+      // Pickup is by radius, and the radius is centre-to-centre.
+      {
+        const s = bare();
+        floor(s, "heal", sim.TUNING.pickupRadius + 1, 0);
+        step(s);
+        check(
+          s.items.length === 1 && s.pickups.heal === 0,
+          `a potion ${sim.TUNING.pickupRadius + 1}px away is not picked up`,
+        );
+
+        const t = bare();
+        floor(t, "heal", sim.TUNING.pickupRadius - 1, 0);
+        step(t);
+        check(
+          t.items.length === 0 && t.pickups.heal === 1,
+          `a potion ${sim.TUNING.pickupRadius - 1}px away is picked up`,
+        );
+      }
+
+      // The four effects, each asserted against the other three: a swapped
+      // `switch` arm is the kind of bug that otherwise ships silently.
+      {
+        const s = bare();
+        s.player.hp = 90;
+        floor(s, "heal");
+        step(s);
+        check(s.player.hp === 100, "a heal potion tops up to the cap, never past it", s.player.hp);
+        check(s.player.maxHp === 100, "a heal potion does not raise the cap", s.player.maxHp);
+        floor(s, "heal");
+        step(s);
+        check(s.player.hp === 100, "a heal at full hp overflows nothing", s.player.hp);
+        check(s.pickups.heal === 2, "both heals were counted", s.pickups.heal);
+
+        const p = bare();
+        floor(p, "power");
+        step(p);
+        check(
+          near(p.player.attackPower, 8 * 1.05, 1e-9) && near(p.player.attackSpeed, 1.5 * 1.05, 1e-9),
+          "a power potion raises attack power and attack speed together",
+          `${p.player.attackPower} / ${p.player.attackSpeed}`,
+        );
+        check(p.player.moveSpeed === 160, "a power potion leaves move speed alone");
+
+        const a = bare();
+        floor(a, "agility");
+        step(a);
+        check(
+          near(a.player.moveSpeed, 160 * 1.05, 1e-9),
+          "an agility potion raises move speed",
+          a.player.moveSpeed,
+        );
+        check(a.player.attackPower === 8, "an agility potion leaves attack power alone");
+
+        const v = bare();
+        v.player.hp = 60;
+        floor(v, "vitality");
+        step(v);
+        check(
+          near(v.player.maxHp, 105, 1e-6),
+          "a vitality potion raises the cap ×1.05",
+          v.player.maxHp,
+        );
+        check(v.player.hp === 60, "a vitality potion restores nothing", v.player.hp);
+      }
+
+      // Aging happens before collection, and expiry is what that ordering buys.
+      {
+        const s = bare();
+        floor(s, "heal", 200, 0, 0.05);
+        step(s);
+        check(s.items.length === 0, "a potion past its lifetime is gone");
+
+        const t = bare();
+        floor(t, "heal", 200, 0, 0.06);
+        step(t);
+        check(t.items.length === 1, "a potion still inside its lifetime survives the step");
+
+        // The load-bearing half: a potion that expires under the player's feet
+        // expires, rather than being counted as a pickup. The renderer reads a
+        // vanished item as one or the other purely from this ordering.
+        const u = bare();
+        floor(u, "heal", 0, 0, 0.05);
+        step(u);
+        check(
+          u.items.length === 0 && u.pickups.heal === 0,
+          "an expiring potion is not collected on its way out",
+        );
+      }
+
+      // Items are not key material (design §8.4): `V` is fixed-length, so a
+      // dropped potion must not shift a single byte's owner.
+      {
+        const s = bare();
+        s.player.hp = 70;
+        floor(s, "power", 30, 30);
+        floor(s, "vitality", -30, 20);
+        const withItems = keymap.buildStateVector(sim.snapshot(s));
+        s.items.length = 0;
+        const without = keymap.buildStateVector(sim.snapshot(s));
+        check(
+          withItems.length === without.length && withItems.every((b, j) => b === without[j]),
+          "potions on the floor do not touch the state vector",
+          `${withItems.join(",")} vs ${without.join(",")}`,
+        );
+      }
+    }
+
     // ── §3 Key mapping ─────────────────────────────────────────────────────
     {
       const s = fresh();
@@ -294,7 +576,7 @@ async function run() {
       check(keymap.gameKeyHex(snap, puzzleA).owners.length === b - 1, "every free byte has an owner label");
     }
 
-    // ── §2.2 The reason for the hybrid mapping ─────────────────────────────
+    // ── §3.3 The reason for the hybrid mapping ─────────────────────────────
     {
       const s = fresh();
       s.monsters.length = 0;

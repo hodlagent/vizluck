@@ -11,6 +11,14 @@
   --accent-dim: #b86e12;
   --green: #2ecc71;
   --red: #e74c3c;
+  /* Potion colours. The canvas reads these same four via `themeColor()` in
+     `GameScene.readPalette()`, so the HUD legend and the thing on the floor can
+     never drift apart. Hue carries the family; the canvas gives each kind its
+     own silhouette too, because colour alone fails on overlap. */
+  --loot-heal: #2ecc71;
+  --loot-power: #f7931a;
+  --loot-agility: #39c5e0;
+  --loot-vitality: #e05fa8;
   --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", Menlo,
     Consolas, monospace;
 
@@ -598,6 +606,34 @@ body.auto-running .pblock:hover {
 
 .game-hud b {
   color: var(--text);
+}
+
+/* The potion legend: a coloured dot per kind, matching the canvas glyphs. The
+   HUD is the only place the player ever learns which colour is which. */
+.game-hud .loot-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 4px;
+  border-radius: 50%;
+  vertical-align: baseline;
+}
+
+.game-hud .loot-heal {
+  background: var(--loot-heal);
+}
+.game-hud .loot-power {
+  background: var(--loot-power);
+}
+.game-hud .loot-agility {
+  background: var(--loot-agility);
+}
+.game-hud .loot-vitality {
+  background: var(--loot-vitality);
+}
+
+.game-hud .loot-count {
+  margin-right: 10px;
 }
 
 .game-hud .hp-bar {

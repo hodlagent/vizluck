@@ -174,6 +174,13 @@ async function run() {
   assert((await keys()) > 0, "keys are sampled while running");
   const survived = await page.locator("#game-survival").textContent();
   assert(/^00:0\d\.\d$/.test(survived.trim()), "survival clock is ticking", survived);
+  // Requirement 2: the level-up progress is on the HUD, next to the level it
+  // feeds. A fresh run is `0/100`, and the pair is what the player watches.
+  const xp = ((await page.locator("#game-xp").textContent()) ?? "").trim();
+  assert(/^\d+\/\d+$/.test(xp), "xp renders as banked/next", xp);
+  // Requirement 3's legend: one dot per potion kind, so the colours on the
+  // canvas have somewhere to be explained.
+  assert((await page.locator(".game-hud .loot-dot").count()) === 4, "all four potions are in the HUD legend");
   assert((await page.locator("#game-bytes .gbyte").count()) === 8, "the 8 free bytes are on display (b=9)");
   // The key readout lives on the `survive` title row, not in a bottom panel.
   assert((await page.locator("#game-pk").count()) === 1, "the sampled key is on the title row");

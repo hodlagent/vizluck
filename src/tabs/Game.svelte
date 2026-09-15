@@ -3,6 +3,7 @@
   import MatchBanner from "../hex/MatchBanner.svelte";
   import { keyRateFor, TUNING } from "../game/sim";
   import { GameState } from "../game/state.svelte";
+  import type { ItemKind } from "../game/types";
 
   /** Whether this tab is the visible one — driven by `App.svelte`. */
   let { active = false }: { active?: boolean } = $props();
@@ -37,6 +38,25 @@
 
   const rate = $derived(keyRateFor(state.hashpower).toFixed(1));
   const hpFrac = $derived(state.maxHp > 0 ? state.hp / state.maxHp : 0);
+
+  /** What each potion does — the HUD is the only place the drop table is stated. */
+  const LOOT_LABEL: Record<ItemKind, string> = {
+    heal: "heal — restores 30% of max HP",
+    power: "power — attack power and attack speed +5%",
+    agility: "agility — move speed +5%",
+    vitality: "vitality — max HP +5%, does not heal",
+  };
+
+  /**
+   * The potion tally, in the same order as the canvas legend. One entry per kind
+   * even at zero, so the row does not reflow every time something is collected.
+   */
+  const loot = $derived(
+    (["heal", "power", "agility", "vitality"] as const).map((kind) => ({
+      kind,
+      count: state.pickups[kind],
+    })),
+  );
 
   /**
    * Every free byte, in key order — this strip is the Game tab's answer to the
@@ -162,13 +182,26 @@
     <span>survived <b id="game-survival">{fmtTime(state.survival)}</b></span>
     <span>best <b id="game-best">{fmtTime(state.bestSurvival)}</b></span>
     <span>level <b id="game-level">{state.level}</b></span>
+    <span>xp <b id="game-xp">{state.xp}/{state.xpNext}</b></span>
     <span>
-      hp <b id="game-hp">{Math.ceil(state.hp)}/{state.maxHp}</b>
+      <!-- `maxHp` is a product of 1.05s in the sim and carries float dust
+           (`1.5 * 1.05` is not `1.575`), so the ceiling is rounded for display
+           rather than rounded in the sim, where it would compound. -->
+      hp <b id="game-hp">{Math.ceil(state.hp)}/{Math.round(state.maxHp)}</b>
       <span class="hp-bar" aria-hidden="true">
         <span class="hp-fill" style="width: {Math.round(hpFrac * 100)}%"></span>
       </span>
     </span>
     <span>kills <b id="game-kills">{state.kills}</b></span>
+    <span title="Walk within 5px of a potion to collect it">
+      drops
+      {#each loot as item (item.kind)}
+        <span class="loot-count">
+          <span class="loot-dot loot-{item.kind}" title={LOOT_LABEL[item.kind]}></span>
+          <b>{item.count}</b>
+        </span>
+      {/each}
+    </span>
     <span>
       hashpower <b id="game-hashpower">{Math.round(state.hashpower)}/{TUNING.hashpowerMax}</b>
     </span>
