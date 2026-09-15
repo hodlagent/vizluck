@@ -2,20 +2,29 @@
 //
 // Two clocks live here, and keeping them apart is most of the design:
 //
-//   * the **simulation** clock, which Phaser owns. `game.pause()` stops
-//     `update()`, and with it the sim step, the survival timer and every
-//     respawn timer, in one call.
+//   * the **simulation** clock, which the scene owns. `scene.setPaused()` stops
+//     the sim step, and with it the survival timer and every respawn timer.
 //   * the **key** clock, which is `loop()` below. It samples the live sim,
 //     turns it into a private key and asks the backend to match it.
 //
 // "暂停 = 停止搜索" (design §8) means a pause has to stop *both*, so
-// `syncStatus()` is the single place that decides, and nothing else calls
-// `pause()`/`resume()` or touches the key loop.
+// `syncStatus()` is the single place that decides, and nothing else pauses the
+// scene or touches the key loop.
+//
+// The scene keeps *rendering* through all of it. Only the engine's own
+// `pause()` — which stops the renderer as well — is still used, and only while
+// the tab is off screen.
 
 import Phaser from "phaser";
 import { deriveGroup, getPuzzles } from "../hex/api";
 import type { KeyInfo, PuzzleInfo } from "../hex/types";
-import { GAME_STATS, SCENE_KEY, gameConfig, type GameStats } from "./config";
+import {
+  GAME_STATS,
+  SCENE_KEY,
+  gameConfig,
+  type GameOverlay,
+  type GameStats,
+} from "./config";
 import { gameKeyHex } from "./keymap";
 import { GameScene } from "./scenes/GameScene";
 import { keyRateFor } from "./sim";
@@ -24,6 +33,27 @@ import { keyRateFor } from "./sim";
 const MIN_TICK_MS = 20;
 
 const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+
+/**
+ * Which full-screen message the arena should be showing.
+ *
+ * The three states that need one are exactly the three where the picture *is*
+ * the feedback: a run armed but not started, a run deliberately halted, and a
+ * run that ended. `matched` and `error` are already announced loudly in the DOM
+ * and would only be buried by a panel across the arena.
+ */
+function overlayForStatus(status: GameStatus): GameOverlay {
+  switch (status) {
+    case "ready":
+      return "ready";
+    case "paused":
+      return "paused";
+    case "dead":
+      return "dead";
+    default:
+      return "none";
+  }
+}
 
 export type GameStatus =
   | "idle"
@@ -280,10 +310,31 @@ export class GameState {
       this.bestSurvival = Math.max(this.bestSurvival, this.survival);
     }
 
+    // Resolve the status first, because the arena's full-screen message is
+    // derived from it.
+    const status = this.computeStatus();
+    const scene = this.scene();
+    scene?.setOverlay(overlayForStatus(status));
+
+    // Two pauses, and they are not the same pause.
+    //
+    //   * the *simulation* stops whenever the run is not actually running —
+    //     that is requirement 1 and design §8, and it is `setPaused()`.
+    //   * the *engine* stops only when the tab is off screen. A hidden panel is
+    //     `display: none`, so its frames are invisible and painting them would
+    //     burn the GPU right next to the scanner (see `App.svelte`).
+    //
+    // `game.pause()` used to cover both, which also stopped the renderer while
+    // the tab *was* visible. The engine is paused from boot until the first tab
+    // switch, so the very first frame was never painted and the arena showed up
+    // black — and because resizing a canvas clears it, no later draw while
+    // paused survived either.
+    const simRunning = this.active && this.running && !this.matched;
+    scene?.setPaused(!simRunning);
+
     const game = this.game;
     if (game && this.engineReady) {
-      const engineRunning = this.active && this.running && !this.matched;
-      if (engineRunning) {
+      if (this.active) {
         if (game.isPaused) game.resume();
       } else if (!game.isPaused) {
         game.pause();
@@ -293,7 +344,7 @@ export class GameState {
     if (this.shouldTick()) this.ensureTick();
     else this.stopTick();
 
-    this.status = this.computeStatus();
+    this.status = status;
   }
 
   /**

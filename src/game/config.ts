@@ -40,6 +40,16 @@ export interface GameStats {
 }
 
 /**
+ * The full-screen message the arena paints over itself.
+ *
+ * On the scene rather than in the DOM because these three states have no DOM
+ * moment of their own: a run that is armed but not started, a run the user
+ * paused, and a run that ended. The HUD can say "paused" in a word, but the
+ * arena has to *look* paused or the frozen frame reads as a rendering bug.
+ */
+export type GameOverlay = "none" | "ready" | "paused" | "dead";
+
+/**
  * Reads a colour out of the global stylesheet, so the canvas tracks whatever
  * `:root` says instead of hard-coding a second copy of the palette.
  *
