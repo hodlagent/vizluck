@@ -37,10 +37,58 @@ body {
   padding: 20px 24px 60px;
 }
 
+/* ── Tab bar (Hex / Game) ────────────────────────────────────────────────── */
+
+.tabbar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  appearance: none;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px; /* overlap the .tabbar rule so the active tab sits on it */
+  padding: 10px 18px;
+  font-family: inherit;
+  font-size: 15px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Both tab panels stay mounted at all times — switching tabs only toggles
+   `hidden`, so the Hex tab's auto loop keeps running in the background.
+   Stated explicitly so a future `display` on .panel can't defeat [hidden]. */
+.panel[hidden] {
+  display: none;
+}
+
 /* ── Top bar ─────────────────────────────────────────────────────────────── */
 
 .topbar {
   margin-bottom: 28px;
+}
+
+.brand-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
 .brand {
@@ -48,7 +96,13 @@ body {
   font-weight: 800;
   letter-spacing: -0.5px;
   color: var(--accent);
-  margin-bottom: 16px;
+}
+
+.keys-rate {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
 }
 
 .controls {
