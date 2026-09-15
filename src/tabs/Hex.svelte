@@ -86,16 +86,18 @@
 
 <!-- ── Grid ────────────────────────────────────────────────── -->
 <main class="main">
-  <Grid {state}>
-    {#snippet banner()}
-      {#if state.matchBanner !== null}
-        {#key state.matchSeq}
-          {@const savePath = state.matchBanner}
-          <MatchBanner {savePath} oncopy={() => void state.copyText(savePath, "file path")} />
-        {/key}
-      {/if}
-    {/snippet}
-  </Grid>
+  <!-- A sibling of `.grid-wrap`, not a child: `.grid-wrap` is a `display: flex`
+       row, so a banner inside it rendered as a narrow column beside the grid and
+       shoved the grid off-centre.  `.main` is a column, so here it spans the
+       content width and sits above the grid, which is what it was always for. -->
+  {#if state.matchBanner !== null}
+    {#key state.matchSeq}
+      {@const savePath = state.matchBanner}
+      <MatchBanner {savePath} oncopy={() => void state.copyText(savePath, "file path")} />
+    {/key}
+  {/if}
+
+  <Grid {state} />
 
   <!-- Group mode: divider + one puzzle block per puzzle in the group.  Both are
        absent — not merely hidden — in custom-range mode. -->

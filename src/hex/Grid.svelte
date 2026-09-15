@@ -1,23 +1,10 @@
 <script lang="ts">
-  import type { Snippet } from "svelte";
   import type { HexState } from "./state.svelte";
 
-  let {
-    state,
-    banner,
-  }: {
-    state: HexState;
-    /**
-     * Rendered inside `.grid-wrap`, immediately before `#grid` — the slot the
-     * match banner has always occupied.  Kept here (rather than as a sibling of
-     * `.grid-wrap`) so the banner's box stays exactly where it was.
-     */
-    banner?: Snippet;
-  } = $props();
+  let { state }: { state: HexState } = $props();
 </script>
 
 <section class="grid-wrap">
-  {@render banner?.()}
   <div
     id="grid"
     class="grid"
