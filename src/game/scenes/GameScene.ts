@@ -63,7 +63,17 @@ import {
 /** How often the scene hands fresh numbers to the HUD. */
 const STATS_INTERVAL_MS = 250;
 
-const PLAYER_RADIUS = 9;
+/**
+ * Read from the sim rather than written down again here.
+ *
+ * These two are the *rule's* radii, not the renderer's: the sim decides a
+ * pickup from `playerRadius + pickupRadius`, so drawing the player and the
+ * potions at any other size would put the picture and the rule back out of
+ * step — which is exactly the bug §8.4 records (a 5px threshold under a 9px
+ * body, and a dead band in between where a potion looked collected and was
+ * not). One constant, two consumers, no way to drift.
+ */
+const PLAYER_RADIUS = TUNING.playerRadius;
 
 /**
  * How far outside a monster's `senseRange` its ring is still drawn.
@@ -79,10 +89,12 @@ const SENSE_RING_MARGIN = 60;
 const MONSTER_RADIUS: Record<MonsterKind, number> = { wanderer: 6, hunter: 7, brute: 11 };
 
 /**
- * A potion's visual radius, deliberately equal to `TUNING.pickupRadius` — the
- * picture and the rule should agree about how close you have to get to it.
+ * A potion's visual radius, deliberately *the* `TUNING.pickupRadius` — the
+ * picture and the rule should agree about how big the thing on the floor is.
+ * How close you have to get is that plus the player's own body; see
+ * `PLAYER_RADIUS` above.
  */
-const ITEM_RADIUS = 5;
+const ITEM_RADIUS = TUNING.pickupRadius;
 const HP_BAR_W = 18;
 const HP_BAR_H = 3;
 

@@ -286,7 +286,9 @@ async function run() {
         s.sinceDamage = 0;
         return s;
       };
-      const step = (s) => sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+      // Standing still by default; the pickup checks pass a direction to drive
+      // the player past a potion, which is the case that used to fail.
+      const step = (s, input = { dx: 0, dy: 0 }, dt = 0.05) => sim.stepSim(s, input, dt);
       /** Put a potion under the player's feet (or `at` a given offset). */
       const floor = (s, kind, dx = 0, dy = 0, life = sim.TUNING.itemLifetime) => {
         s.items.push({
@@ -439,22 +441,57 @@ async function run() {
         );
       }
 
-      // Pickup is by radius, and the radius is centre-to-centre.
+      // Pickup is by radius, and the radius is **two bodies touching**, not the
+      // player's centre landing inside the potion (design §8.4). The player's
+      // own radius counts.
+      const REACH = sim.TUNING.playerRadius + sim.TUNING.pickupRadius;
       {
         const s = bare();
-        floor(s, "heal", sim.TUNING.pickupRadius + 1, 0);
+        floor(s, "heal", REACH + 1, 0);
         step(s);
-        check(
-          s.items.length === 1 && s.pickups.heal === 0,
-          `a potion ${sim.TUNING.pickupRadius + 1}px away is not picked up`,
-        );
+        check(s.items.length === 1 && s.pickups.heal === 0, `a potion ${REACH + 1}px away is not picked up`);
 
         const t = bare();
-        floor(t, "heal", sim.TUNING.pickupRadius - 1, 0);
+        floor(t, "heal", REACH - 1, 0);
         step(t);
+        check(t.items.length === 0 && t.pickups.heal === 1, `a potion ${REACH - 1}px away is picked up`);
+      }
+
+      // The same rule has to hold while the player is *moving*, which is where
+      // it used to fail. A player steers with the eight directions, so they
+      // sweep past a potion rather than threading their centre through it; a
+      // threshold measured from the centre alone meant the sweep collected
+      // nothing, and the potion only popped once they had stopped and nudged
+      // their centre into the last few pixels. Every case below is a run
+      // straight along +x with the potion set off to one side.
+      {
+        const walk = (side) => {
+          const s = bare();
+          floor(s, "heal", 30, side);
+          for (let i = 0; i < 60 && s.items.length > 0; i++) step(s, { dx: 1, dy: 0 }, 1 / 60);
+          return s;
+        };
+
+        // 8px off the path: the player's body covers the potion for the whole
+        // pass. This is the exact case that went uncollected before.
+        const clipped = walk(8);
         check(
-          t.items.length === 0 && t.pickups.heal === 1,
-          `a potion ${sim.TUNING.pickupRadius - 1}px away is picked up`,
+          clipped.pickups.heal === 1,
+          "a potion 8px off the path is picked up while running past it",
+          `items=${clipped.items.length} pickups=${clipped.pickups.heal}`,
+        );
+
+        const grazed = walk(REACH - 1);
+        check(grazed.pickups.heal === 1, "a potion grazed at the edge of the reach is picked up");
+
+        // Outside the reach, running over it is not enough. The potion is a
+        // place to go (design §8.3), not a magnet — this is the check that
+        // fails if the radius is ever widened into one.
+        const missed = walk(REACH + 2);
+        check(
+          missed.items.length === 1 && missed.pickups.heal === 0,
+          "a potion outside the reach is left on the floor",
+          `items=${missed.items.length} pickups=${missed.pickups.heal}`,
         );
       }
 

@@ -72,8 +72,19 @@ export const TUNING = {
   potionGrowth: 1.05,
   /** Fraction of max HP a heal potion pours back in. */
   healPotion: 0.3,
-  /** Pickup radius in px, centre to centre. */
+  /**
+   * A potion's radius in px — its body, and the radius it is *drawn* at.
+   *
+   * Not the pickup threshold on its own: collecting is two bodies touching, so
+   * the trigger distance is this plus `playerRadius`. See `pickedUp()`.
+   */
   pickupRadius: 5,
+  /**
+   * The player's body radius in px. `GameScene` draws the player at exactly
+   * this radius, which is the point: "looks like I stepped on it" and "counts
+   * as stepped on it" are the same line, and there is one constant behind both.
+   */
+  playerRadius: 9,
   /** Seconds a potion lies on the floor before it fades. */
   itemLifetime: 30,
   /** Seconds of blinking before `itemLifetime` runs out. */
@@ -389,11 +400,22 @@ function countInRegion(s: SimState, region: number): number {
 /**
  * Did the player's path this step pass close enough to `it` to collect it?
  *
+ * Two bodies **touching**, not the player's centre landing inside the potion:
+ * the threshold is `playerRadius + pickupRadius` (design §8.4). Testing only
+ * the centre against the potion's own 5px left a dead band — from 5px out to
+ * the 14px where the two discs actually meet — in which the player was drawn
+ * standing square on top of a potion that the rule insisted they had not
+ * reached. Worse, that band is where a player *moving* almost always is: they
+ * steer with the eight directions, so they sweep past rather than thread the
+ * needle, and the potion only ever popped once they stopped and jiggled the
+ * centre into the last 5px. §8.3 makes "walk over there" the cost of a drop;
+ * it must not also cost pixel-perfect alignment.
+ *
  * Point-to-**segment**, not point-to-endpoint. `dt` is clamped to `maxDt`, but
- * that is still ~8px of travel on a slow frame — more than the 5px pickup
- * radius — and agility potions compound, so a fast player covers more than the
- * potion's whole diameter in a single step. Testing only where they ended up
- * would let them walk clean over a potion and leave it lying there.
+ * that is still ~8px of travel on a slow frame and agility potions compound,
+ * so a fast player covers more ground in a single step than the trigger
+ * distance. Testing only where they ended up would let them walk clean over a
+ * potion and leave it lying there.
  */
 function pickedUp(it: ItemStats, fromX: number, fromY: number, toX: number, toY: number): boolean {
   const dx = toX - fromX;
@@ -401,7 +423,8 @@ function pickedUp(it: ItemStats, fromX: number, fromY: number, toX: number, toY:
   const len2 = dx * dx + dy * dy;
   // Standing still degenerates the segment to the point they are standing on.
   const t = len2 > 0 ? clamp(((it.posX - fromX) * dx + (it.posY - fromY) * dy) / len2, 0, 1) : 0;
-  return Math.hypot(it.posX - (fromX + dx * t), it.posY - (fromY + dy * t)) <= TUNING.pickupRadius;
+  const reach = TUNING.playerRadius + TUNING.pickupRadius;
+  return Math.hypot(it.posX - (fromX + dx * t), it.posY - (fromY + dy * t)) <= reach;
 }
 
 function nearestMonster(s: SimState, x: number, y: number, maxDist: number): MonsterStats | null {
