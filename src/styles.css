@@ -443,6 +443,45 @@ body.auto-running .pblock:hover {
   font-size: 15px;
 }
 
+/* ── Game tab ────────────────────────────────────────────────────────────── */
+
+/* Phaser is deliberately configured with `Scale.NONE`, so it never measures
+   anything itself — this box sets the size and `GameState.resize()` pushes the
+   resulting dimensions into `game.scale.resize()`. */
+.game-stage {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.game-host {
+  width: 100%;
+  height: 100%;
+}
+
+/* Phaser appends the canvas itself; `display: block` is the one thing it does
+   not set, and the inline baseline gap would otherwise show under the canvas. */
+.game-host canvas {
+  display: block;
+}
+
+.game-hud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin-top: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.game-hud b {
+  color: var(--text);
+}
+
 /* ── Toast ───────────────────────────────────────────────────────────────── */
 
 .toast {

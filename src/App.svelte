@@ -31,6 +31,10 @@
 <div class="panel" hidden={active !== "hex"}>
   <Hex />
 </div>
+<!-- `active` is the Game tab's pause protocol. It cannot be left to Phaser's
+     built-in visibility handling: that watches `document.visibilitychange`,
+     which never fires for a `hidden` attribute. Without it a backgrounded game
+     would keep rendering next to the GPU scanner. -->
 <div class="panel" hidden={active !== "game"}>
-  <Game />
+  <Game active={active === "game"} />
 </div>

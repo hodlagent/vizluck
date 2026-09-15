@@ -185,7 +185,11 @@ async function run() {
   await tab("Game").click();
   await page.waitForTimeout(200);
   assert(!(await page.locator("#grid").isVisible()), "Hex hidden on Game tab");
-  assert(await page.getByText("coming soon").isVisible(), "Game placeholder visible");
+  // Phaser boots asynchronously, so wait for the canvas rather than asserting
+  // on it directly. Only the placeholder assertion needed changing here — the
+  // "two tabs / labels are Hex,Game" checks above still hold.
+  await page.waitForSelector(".game-host canvas", { timeout: 5000 });
+  assert(await page.locator(".game-host canvas").isVisible(), "Game canvas mounted");
   const h1 = await gridText();
   await page.waitForTimeout(900);
   assert(h1 !== (await gridText()), "auto keeps advancing while Hex is hidden");

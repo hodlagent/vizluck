@@ -1,0 +1,60 @@
+// Phaser configuration for the Game tab.
+//
+// A function rather than a module constant: the parent element comes from the
+// mount, and the colours are read from the live stylesheet rather than being
+// duplicated here.
+
+import Phaser from "phaser";
+
+/** Logical canvas size — matches the 16:9 stage in `styles.css`. */
+export const GAME_WIDTH = 960;
+export const GAME_HEIGHT = 540;
+
+/** Event the scene publishes throttled HUD numbers on. */
+export const GAME_STATS = "game:stats";
+
+/** What `GAME_STATS` carries. Produced by the scene, consumed by `GameState`. */
+export interface GameStats {
+  frames: number;
+  fps: number;
+}
+
+/**
+ * Reads a colour out of the global stylesheet, so the canvas tracks whatever
+ * `:root` says instead of hard-coding a second copy of the palette.
+ */
+function themeColor(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+  return value || fallback;
+}
+
+export function gameConfig(
+  parent: HTMLElement,
+  scenes: Phaser.Types.Scenes.SceneType[],
+): Phaser.Types.Core.GameConfig {
+  return {
+    // AUTO rather than WEBGL: WEBGL has no Canvas fallback and throws wherever a
+    // WebGL context can't be created — which is exactly the headless Chromium
+    // the Playwright regression net runs in.
+    type: Phaser.AUTO,
+    parent,
+    width: GAME_WIDTH,
+    height: GAME_HEIGHT,
+    backgroundColor: themeColor("--bg", "#0b0e14"),
+
+    // NONE is already the default; stating it explicitly keeps a future
+    // FIT/RESIZE from quietly letting Phaser measure the parent behind our back.
+    // Sizing is driven from the outside via `game.scale.resize()`.
+    scale: { mode: Phaser.Scale.NONE },
+
+    // A BTC scanner has no use for an AudioContext.
+    audio: { noAudio: true },
+
+    // Console noise the regression net has no reason to see.
+    banner: false,
+
+    scene: scenes,
+  };
+}
