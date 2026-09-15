@@ -41,16 +41,10 @@ pub struct KeyInfo {
     pub xpub: String,
     /// Compressed public key, 66-char hex.
     pub compressed_public_key: String,
-    /// Uncompressed public key, 130-char hex (starts with `04`).
-    pub uncompressed_public_key: String,
     /// Legacy P2PKH address derived from the compressed pubkey.
     pub compressed_legacy_address: String,
-    /// Legacy P2PKH address derived from the uncompressed pubkey.
-    pub uncompressed_legacy_address: String,
     /// 40-char hex hash160 of the compressed pubkey (for puzzle comparison).
     pub compressed_hash160: String,
-    /// 40-char hex hash160 of the uncompressed pubkey (for puzzle comparison).
-    pub uncompressed_hash160: String,
     /// `None` = custom range (no emoji); `Some(matched)` = puzzle comparison result.
     pub address_match: Option<bool>,
     /// When a match is found, the absolute path of the file the result was saved
@@ -250,8 +244,6 @@ pub struct AutoKeyInfo {
     pub private_key_hex: String,
     /// 40-char hex hash160 of the compressed pubkey (for puzzle comparison).
     pub compressed_hash160: String,
-    /// 40-char hex hash160 of the uncompressed pubkey (for puzzle comparison).
-    pub uncompressed_hash160: String,
     /// `None` = custom range; `Some(matched)` = puzzle comparison result.
     pub address_match: Option<bool>,
     /// Absolute path saved to on a match, `None` otherwise.
@@ -260,47 +252,40 @@ pub struct AutoKeyInfo {
 
 // ── Core + full derivation ──────────────────────────────────────────────────
 
-/// The unavoidable core: turn a private key into both its compressed and
-/// uncompressed pubkey hash160 values.  Scalar multiplication is required to
-/// compute a hash160, so this is the one cost every check must pay.
-/// Returns `((compressed_h160, uncompressed_h160), public_key)` — the
+/// The unavoidable core: turn a private key into its compressed-pubkey hash160.
+/// Scalar multiplication is required to compute a hash160, so this is the one
+/// cost every check must pay.  Returns `(compressed_h160, public_key)` — the
 /// `PublicKey` lets the full path reuse the already-computed point.
-fn compute_both_hash160(
+fn compute_compressed_hash160(
     key: &[u8; 32],
-) -> Result<(([u8; 20], [u8; 20]), secp256k1::PublicKey), String> {
+) -> Result<([u8; 20], secp256k1::PublicKey), String> {
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
     let secp = Secp256k1::new();
     let sk = SecretKey::from_byte_array(*key).map_err(|e| format!("invalid scalar: {e}"))?;
     let pk = PublicKey::from_secret_key(&secp, &sk);
     let h160_compressed = crate::btc::hash160(&pk.serialize());
-    let h160_uncompressed = crate::btc::hash160(&pk.serialize_uncompressed());
-    Ok(((h160_compressed, h160_uncompressed), pk))
+    Ok((h160_compressed, pk))
 }
 
 /// Derive every display field from a 32-byte private key.  Returns `Err` if the
 /// key is not a valid secp256k1 scalar, or if the BIP32 master key isn't a valid
 /// scalar (≈2^-128) — the caller regenerates in that case.
 ///
-/// Both compressed and uncompressed pubkey hash160 values are checked against
-/// the puzzle target — a match on either format counts as a hit.
+/// Only the compressed-pubkey hash160 is checked against the puzzle target.
 fn derive_key_info(
     key: &[u8; 32],
     expected_hash160: Option<[u8; 20]>,
 ) -> Result<KeyInfo, String> {
     use secp256k1::SecretKey;
 
-    let ((h160_compressed, h160_uncompressed), pk) = compute_both_hash160(key)?;
+    let (h160_compressed, pk) = compute_compressed_hash160(key)?;
 
     let compressed = pk.serialize(); // 33 bytes
-    let uncompressed = pk.serialize_uncompressed(); // 65 bytes
     let compressed_hex = hex::encode(compressed);
-    let uncompressed_hex = hex::encode(uncompressed);
     let private_key_hex = hex::encode(key);
     let compressed_hash160_hex = hex::encode(h160_compressed);
-    let uncompressed_hash160_hex = hex::encode(h160_uncompressed);
 
     let compressed_legacy_address = crate::btc::p2pkh(&compressed);
-    let uncompressed_legacy_address = crate::btc::p2pkh(&uncompressed);
 
     // BIP32 master key.  The HMAC left half must also be a valid scalar; if not,
     // signal the caller to regenerate (probability ≈ 2^-128).
@@ -310,19 +295,15 @@ fn derive_key_info(
     let xprv = serialize_xprv(&chain_code, &master_key);
     let xpub = serialize_xpub(&chain_code, &compressed);
 
-    let address_match =
-        expected_hash160.map(|target| h160_compressed == target || h160_uncompressed == target);
+    let address_match = expected_hash160.map(|target| h160_compressed == target);
 
     Ok(KeyInfo {
         private_key_hex,
         xprv,
         xpub,
         compressed_public_key: compressed_hex,
-        uncompressed_public_key: uncompressed_hex,
         compressed_legacy_address,
-        uncompressed_legacy_address,
         compressed_hash160: compressed_hash160_hex,
-        uncompressed_hash160: uncompressed_hash160_hex,
         address_match,
         save_path: None,
     })
@@ -394,11 +375,8 @@ fn save_match(info: &KeyInfo, puzzle_number: u32, network: &str) -> Result<Strin
          xprv            : {xprv}\n\
          xpub            : {xpub}\n\
          Public Key (compressed)   : {pk_comp}\n\
-         Public Key (uncompressed) : {pk_uncomp}\n\
          Legacy Address (compressed)   : {addr_comp}\n\
-         Legacy Address (uncompressed) : {addr_uncomp}\n\
          hash160 (compressed)   : {h160_comp}\n\
-         hash160 (uncompressed) : {h160_uncomp}\n\
          ============================================\n",
         ts = label,
         puzzle = puzzle_number,
@@ -408,11 +386,8 @@ fn save_match(info: &KeyInfo, puzzle_number: u32, network: &str) -> Result<Strin
         xprv = info.xprv,
         xpub = info.xpub,
         pk_comp = info.compressed_public_key,
-        pk_uncomp = info.uncompressed_public_key,
         addr_comp = info.compressed_legacy_address,
-        addr_uncomp = info.uncompressed_legacy_address,
         h160_comp = info.compressed_hash160,
-        h160_uncomp = info.uncompressed_hash160,
     );
 
     std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -566,11 +541,10 @@ pub fn random_and_derive(
     }
 }
 
-/// Lightweight auto-mode tick: sample a random key in the range and compute both
-/// its compressed and uncompressed pubkey hash160 (plus the puzzle comparison).
-/// Skips address encoding and BIP32 — everything the grid doesn't need.
-/// On a match the result is saved and the path returned so the frontend can
-/// pause + celebrate.
+/// Lightweight auto-mode tick: sample a random key in the range and compute its
+/// compressed-pubkey hash160 (plus the puzzle comparison).  Skips address
+/// encoding and BIP32 — everything the grid doesn't need.  On a match the result
+/// is saved and the path returned so the frontend can pause + celebrate.
 #[tauri::command]
 pub fn random_and_hash160(
     spec: RangeSpec,
@@ -594,7 +568,7 @@ pub fn random_and_hash160(
         } else {
             random_key_from(&lo)
         };
-        let ((h160_comp, h160_uncomp), _pk) = match compute_both_hash160(&key) {
+        let (h160_comp, _pk) = match compute_compressed_hash160(&key) {
             Ok(r) => r,
             Err(_) => {
                 attempts += 1;
@@ -605,8 +579,7 @@ pub fn random_and_hash160(
             }
         };
 
-        let address_match =
-            expected_hash160.map(|target| h160_comp == target || h160_uncomp == target);
+        let address_match = expected_hash160.map(|target| h160_comp == target);
         let mut save_path = None;
         if address_match == Some(true) {
             // Build a minimal KeyInfo to reuse the save helper.
@@ -615,11 +588,8 @@ pub fn random_and_hash160(
                 xprv: String::new(),
                 xpub: String::new(),
                 compressed_public_key: String::new(),
-                uncompressed_public_key: String::new(),
                 compressed_legacy_address: String::new(),
-                uncompressed_legacy_address: String::new(),
                 compressed_hash160: hex::encode(h160_comp),
-                uncompressed_hash160: hex::encode(h160_uncomp),
                 address_match,
                 save_path: None,
             };
@@ -631,7 +601,6 @@ pub fn random_and_hash160(
         return Ok(AutoKeyInfo {
             private_key_hex: hex::encode(key),
             compressed_hash160: hex::encode(h160_comp),
-            uncompressed_hash160: hex::encode(h160_uncomp),
             address_match,
             save_path,
         });
@@ -658,12 +627,11 @@ pub fn derive_full(
 }
 
 /// Derive full info for a batch of keys — one per puzzle in an active group.
-/// Each key's compressed- and uncompressed-pubkey hash160 are checked against
-/// the *whole* embedded puzzle set (a key inside a group's key space can only
-/// ever belong to that group's puzzles, and each group's ranges are disjoint),
-/// and a match is persisted next to the executable.  The response is
-/// index-aligned with `private_keys`, so the caller already knows which result
-/// maps to which puzzle.
+/// Each key's compressed-pubkey hash160 is checked against the *whole* embedded
+/// puzzle set (a key inside a group's key space can only ever belong to that
+/// group's puzzles, and each group's ranges are disjoint), and a match is
+/// persisted next to the executable.  The response is index-aligned with
+/// `private_keys`, so the caller already knows which result maps to which puzzle.
 ///
 /// This is the per-hex-iteration workhorse for the group-collision UI: every
 /// grid / puzzle-block hover tick (and each Auto round) sends the group's keys
@@ -675,10 +643,9 @@ pub fn derive_group(private_keys: Vec<String>) -> Result<Vec<KeyInfo>, String> {
 
     for key_hex in private_keys {
         let key = parse_lo_hex(&key_hex).map_err(|e| format!("bad private_key_hex: {e}"))?;
-        // Full derivation computes both compressed and uncompressed hash160.
         let mut info = derive_key_info(&key, None)?;
 
-        // Check both hash160s against the puzzle set.
+        // Check the compressed hash160 against the puzzle set.
         let h160_comp: [u8; 20] = {
             let bytes = hex::decode(&info.compressed_hash160)
                 .map_err(|e| format!("hash160 hex: {e}"))?;
@@ -686,17 +653,8 @@ pub fn derive_group(private_keys: Vec<String>) -> Result<Vec<KeyInfo>, String> {
                 .try_into()
                 .map_err(|_| "hash160 is not 20 bytes".to_string())?
         };
-        let h160_uncomp: [u8; 20] = {
-            let bytes = hex::decode(&info.uncompressed_hash160)
-                .map_err(|e| format!("uncompressed hash160 hex: {e}"))?;
-            bytes
-                .try_into()
-                .map_err(|_| "uncompressed hash160 is not 20 bytes".to_string())?
-        };
 
-        let puzzle_number = ps
-            .puzzle_number_for_hash160(&h160_comp)
-            .or_else(|| ps.puzzle_number_for_hash160(&h160_uncomp));
+        let puzzle_number = ps.puzzle_number_for_hash160(&h160_comp);
 
         match puzzle_number {
             Some(puzzle_number) => {
@@ -957,7 +915,7 @@ mod tests {
 
     #[test]
     fn auto_tick_produces_hash160_in_range() {
-        // Puzzle 71 range; every tick must land in [2^70, 2^71) with both hash160s.
+        // Puzzle 71 range; every tick must land in [2^70, 2^71) with a hash160.
         for _ in 0..50 {
             let res = random_and_hash160(
                 RangeSpec::Puzzle { puzzle_number: 71 },
@@ -966,9 +924,6 @@ mod tests {
             .unwrap();
             assert_eq!(res.private_key_hex.len(), 64);
             assert_eq!(res.compressed_hash160.len(), 40);
-            assert_eq!(res.uncompressed_hash160.len(), 40);
-            // Compressed and uncompressed hash160s must differ (different input bytes).
-            assert_ne!(res.compressed_hash160, res.uncompressed_hash160);
             // address_match is Some (puzzle mode) but almost always false.
             assert!(res.address_match.is_some());
         }
@@ -1005,19 +960,11 @@ mod tests {
 
         assert_eq!(full.private_key_hex, hex);
         assert_eq!(full.compressed_hash160.len(), 40);
-        assert_eq!(full.uncompressed_hash160.len(), 40);
-        assert_ne!(full.compressed_hash160, full.uncompressed_hash160);
         assert!(!full.compressed_legacy_address.is_empty());
         assert!(full.compressed_legacy_address.starts_with('1'));
-        assert!(!full.uncompressed_legacy_address.is_empty());
-        assert!(full.uncompressed_legacy_address.starts_with('1'));
-        // Compressed and uncompressed addresses must differ.
-        assert_ne!(full.compressed_legacy_address, full.uncompressed_legacy_address);
         assert!(!full.xprv.is_empty());
         assert!(full.xprv.starts_with("xprv"));
         assert_eq!(full.compressed_public_key.len(), 66);
-        assert_eq!(full.uncompressed_public_key.len(), 130);
-        assert!(full.uncompressed_public_key.starts_with("04"));
     }
 
     // ── batch group derivation ───────────────────────────────────────────────
@@ -1040,13 +987,8 @@ mod tests {
             assert_eq!(r.address_match, Some(false));
             assert_eq!(r.save_path, None);
             assert_eq!(r.compressed_hash160.len(), 40);
-            assert_eq!(r.uncompressed_hash160.len(), 40);
-            assert_ne!(r.compressed_hash160, r.uncompressed_hash160);
             assert_eq!(r.compressed_public_key.len(), 66);
-            assert_eq!(r.uncompressed_public_key.len(), 130);
             assert!(r.compressed_legacy_address.starts_with('1'));
-            assert!(r.uncompressed_legacy_address.starts_with('1'));
-            assert_ne!(r.compressed_legacy_address, r.uncompressed_legacy_address);
             assert!(r.xprv.starts_with("xprv"));
         }
     }

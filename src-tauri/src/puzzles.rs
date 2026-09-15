@@ -22,7 +22,7 @@ const PUZZLES_JSON: &str = r#"[{"puzzle_number":71,"hex_bytes_len":9,"start_hex"
 #[derive(Debug, Clone)]
 pub struct PuzzleRange {
     pub puzzle_number: u32,
-    /// Target RIPEMD-160 hash (compressed-pubkey hash; we also check uncompressed).
+    /// Target RIPEMD-160 hash (of the compressed public key).
     pub hash160: [u8; 20],
     /// Number of significant bytes in the range (9..=20).  Only used during
     /// parsing to compute `top_byte_idx`; not read on the hot path.
