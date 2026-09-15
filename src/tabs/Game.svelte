@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import AddrInfoPanel from "../hex/AddrInfoPanel.svelte";
   import MatchBanner from "../hex/MatchBanner.svelte";
   import { keyRateFor, TUNING } from "../game/sim";
   import { GameState } from "../game/state.svelte";
@@ -54,43 +53,98 @@
       ? bytePairs.slice(0, 4).map((p) => p.owner).join(" · ") + " · …"
       : bytePairs.map((p) => p.owner).join(" · "),
   );
+
+  /**
+   * The key's live part. Everything above the puzzle's range is `00` padding
+   * (`puzzleKeyHex`), so the full 64 chars would be a wall of zeroes with the
+   * run's actual output hidden at the far end. Stripped, it is the key the
+   * player is watching — and it fits on the title row.
+   */
+  const keyTail = $derived(state.info?.private_key_hex.replace(/^(00)+/, "") ?? "");
+
+  /** Click-to-copy on a chip, plus the keyboard path `AddrInfoCard` offered. */
+  function chipKey(e: KeyboardEvent, value: string, label: string): void {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      void state.copyText(value, label);
+    }
+  }
 </script>
 
-<!-- ── Top bar: exactly the two controls requirement 1 asks for ─────── -->
+<!-- ── Top bar: one row — readout on the left, requirement 1's two controls
+     pushed to the right edge ──────────────────────────────────────── -->
 <header class="topbar">
-  <div class="brand-row">
+  <div class="brand-row game-brand-row">
     <div class="game-brand">survive</div>
+
+    <!-- The key readout rides the title row: which key the run is producing,
+         what address it lands on, and whether that address is the target. -->
+    {#if state.info}
+      {@const info = state.info}
+      <div class="game-key">
+        <span
+          id="game-pk"
+          class="gk gk-pk"
+          role="button"
+          tabindex="0"
+          title="Private key, above-range zero padding stripped — click to copy all 64 chars"
+          onclick={() => void state.copyText(info.private_key_hex, "private key")}
+          onkeydown={(e) => chipKey(e, info.private_key_hex, "private key")}
+        >{keyTail}</span>
+
+        <span
+          id="game-addr"
+          class="gk gk-addr"
+          class:match={info.address_match === true}
+          class:nomatch={info.address_match === false}
+          role="button"
+          tabindex="0"
+          title="BTC address (compressed) — click to copy"
+          onclick={() => void state.copyText(info.compressed_legacy_address, "BTC address")}
+          onkeydown={(e) => chipKey(e, info.compressed_legacy_address, "BTC address")}
+        >{info.compressed_legacy_address}</span>
+
+        <span
+          id="game-flag"
+          class="gk-flag"
+          title={info.address_match === true ? "target hit" : "not the target"}
+        >{info.address_match === true ? "✅" : "❌"}</span>
+      </div>
+    {/if}
+
     <div id="game-status" class="game-status" title="Run state">
       {state.status}
     </div>
-  </div>
 
-  <div class="controls">
-    <select
-      id="puzzle-select"
-      class="select"
-      title="Pick a puzzle — the run cannot start without one"
-      disabled={state.matched}
-      bind:value={state.selected}
-      onchange={(e) => state.onSelect(e.currentTarget.value)}
-    >
-      <option value="">— select a puzzle —</option>
-      {#each state.puzzles as p (p.puzzle_number)}
-        <option value={String(p.puzzle_number)}>
-          #{p.puzzle_number} · {p.hex_bytes_len} bytes
-        </option>
-      {/each}
-    </select>
+    <!-- Requirement 1's two controls, on the same row and pushed to the far
+         edge — the left half stays a pure readout. -->
+    <div class="controls">
+      <select
+        id="puzzle-select"
+        class="select"
+        title="Pick a puzzle — the run cannot start without one"
+        disabled={state.matched}
+        bind:value={state.selected}
+        onchange={(e) => state.onSelect(e.currentTarget.value)}
+      >
+        <option value="">— select a puzzle —</option>
+        {#each state.puzzles as p (p.puzzle_number)}
+          <option value={String(p.puzzle_number)}>
+            #{p.puzzle_number} · {p.hex_bytes_len} bytes
+          </option>
+        {/each}
+      </select>
 
-    <button
-      id="btn-run"
-      class="btn"
-      title={state.alive ? "Pause" : "Start a new run"}
-      disabled={!state.canRun}
-      onclick={() => state.toggle()}
-    >
-      {state.running ? "⏸" : "▶"}
-    </button>
+      <button
+        id="btn-run"
+        class="btn"
+        title={state.alive ? "Pause" : "Start a new run"}
+        disabled={!state.canRun}
+        onclick={() => state.toggle()}
+      >
+        {state.running ? "⏸" : "▶"}
+      </button>
+    </div>
   </div>
 
   {#if state.error}
@@ -156,15 +210,4 @@
     </div>
   {/if}
 
-  {#if state.info}
-    <section id="game-info" class="info">
-      <AddrInfoPanel
-        puzzleNum={state.puzzle?.puzzle_number ?? null}
-        info={state.info}
-        targetHash160={state.puzzle?.hash160 ?? null}
-        active={false}
-        oncopy={(value, label) => void state.copyText(value, label)}
-      />
-    </section>
-  {/if}
 </main>

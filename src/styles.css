@@ -468,6 +468,67 @@ body.auto-running .pblock:hover {
   white-space: nowrap;
 }
 
+/* The key readout rides the `survive` title row. Same information the Hex tab
+   spends three bottom cards on, compressed into the one line: which key the
+   run is producing, its compressed address, and whether that address is the
+   target. `.brand-row` is shared with the Hex tab, hence the extra class —
+   only this row needs to wrap. */
+.game-brand-row {
+  flex-wrap: wrap;
+  row-gap: 8px;
+  /* Centre, not the shared row's baseline: form controls have no useful
+     baseline to align a 28px title against. */
+  align-items: center;
+}
+
+/* Requirement 1's controls ride the title row too, pushed to the far edge so
+   everything to their left stays a pure readout. */
+.game-brand-row .controls {
+  margin-left: auto;
+}
+
+.game-key {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+/* Both values stay click-to-copy; the underline is the only affordance, so the
+   row keeps reading as a title rather than a toolbar. */
+.game-key .gk {
+  cursor: pointer;
+  border-bottom: 1px dotted transparent;
+  transition: border-color 0.15s ease;
+}
+
+.game-key .gk:hover,
+.game-key .gk:focus-visible {
+  border-bottom-color: var(--border);
+}
+
+.gk-pk {
+  color: var(--accent);
+}
+
+.gk-addr {
+  color: var(--text);
+}
+
+.gk-addr.match {
+  color: var(--green);
+}
+
+.gk-addr.nomatch {
+  color: var(--text-dim);
+}
+
+.gk-flag {
+  font-size: 12px;
+}
+
 /* The run's only handle on the key. Deliberately mirrors the Hex tab's grid
    cells without reusing its `#grid` id — the two tabs are queried separately. */
 .game-bytes {

@@ -370,7 +370,7 @@ hp +10 · attackPower +1 · moveSpeed +2 · attackSpeed +0.05 · attackRange +1 
 2. 游戏状态 → `b-1` 个自由字节（§3.3）
 3. `puzzleKeyHex()` → 64 字符私钥 hex
 4. 调 **`derive_group([keyHex])`**（`src/hex/api.ts`）
-5. 命中 → 暂停 + 落盘 + `MatchBanner` + `AddrInfoPanel`
+5. 命中 → 暂停 + 落盘 + `MatchBanner` + 标题行上的 ✅
 
 > ⚠️ **必须用 `derive_group`，不能用 `derive_full`。**
 > `derive_full`（`src-tauri/src/homepage.rs:618-627`）只做比对，**从不调用 `save_match`**，命中结果不会落盘。
@@ -381,10 +381,29 @@ hp +10 · attackPower +1 · moveSpeed +2 · attackSpeed +0.05 · attackRange +1 
 
 ## 10. UI
 
+### 10.0 顶栏 = 一行
+
+标题行不再是「标题 + 状态」，而是整条顶栏：左边是读数，右边是 §10.1 的两个控件。
+
+```
+survive  efc98e13967c0a07…  1KKKK…KKKKK  ❌  running        [ #130 · 17 bytes ▾ ]  [ ⏸ ]
+└ 标题 ┘ └─ 私钥非零部分 ─┘ └ 压缩地址 ┘ 命中  状态 ┘        └──── 需求第 1 条的 2 个控件 ────┘
+```
+
+控件用 `margin-left: auto` 顶到最右，与左侧读数分开——两者性质不同，一片留白比一个 gap 更能说明这件事。窗口变窄时整行 `flex-wrap` 换行，控件连同状态落到第二行，仍然靠右，不溢出。
+
+左侧读数三项：
+
+- **私钥的非零部分**：`puzzleKeyHex()` 在 range 之上全是 `00` 填充，展示完整 64 字符等于一堵零墙，把本局真正的产出挤到最右边。剥掉填充后剩下的就是玩家正在推动的那一段。点击复制完整 64 字符。
+- **压缩地址**：点击复制。命中时转绿（`✅`），未命中为暗色（`❌`）。
+- **命中图标**：`address_match`，与 `handleMatch()` 读的是同一个字段。
+
+> 早期版本在底部复用 `AddrInfoPanel` 显示私钥 / xprv / 地址三张卡片。xprv 对本局没有意义（它由私钥唯一决定，不会随玩法变化），三张卡片的信息密度又远低于它占的位置，因此收进标题行。
+
 ### 10.1 控件（需求第 1 条：只要 2 个）
 
 ```
-[ puzzle 下拉框 ▾ ]        [ ▶ / ⏸ ]
+[ puzzle 下拉框 ▾ ]   [ ▶ / ⏸ ]        ← 位于 §10.0 的顶栏右端
 ```
 
 - **下拉框**：列出全部 puzzle，显示 `#71 · 9 bytes`。选中后才允许运行。
@@ -451,7 +470,7 @@ byte2 ← player.posX    byte3 ← player.posY    byte16 ← m[0].dir   …
 | `src/game/keymap.ts` | **纯映射**：`V` 构造、`fold` / `expand`、`snapshotToBaseBytes()` 及归属信息。可单测 |
 | `src/game/scenes/GameScene.ts` | Phaser 渲染 + 键盘输入 → 意图。**只渲染，不含任何规则** |
 | `src/game/state.svelte.ts` | puzzle 选择、运行意图、密钥 tick、命中处理。`syncStatus()` 是暂停语义的唯一决策点 |
-| `src/tabs/Game.svelte` | 下拉框 + 按钮 + HUD + 复用 MatchBanner / AddrInfoPanel |
+| `src/tabs/Game.svelte` | 下拉框 + 按钮 + HUD + 标题行密钥读数 + 复用 MatchBanner |
 
 **测试：**
 
@@ -467,7 +486,6 @@ byte2 ← player.posX    byte3 ← player.posY    byte16 ← m[0].dir   …
 | `src/hex/range.ts` | `randomTopByte()`、`puzzleKeyHex()` |
 | `src/hex/api.ts` | `getPuzzles()`、`derive_group()` |
 | `src/hex/MatchBanner.svelte` | 命中横幅 + confetti |
-| `src/hex/AddrInfoPanel.svelte` | 密钥详情面板 |
 | `src/App.svelte` | `active` prop 暂停协议 |
 
 ---

@@ -175,7 +175,14 @@ async function run() {
   const survived = await page.locator("#game-survival").textContent();
   assert(/^00:0\d\.\d$/.test(survived.trim()), "survival clock is ticking", survived);
   assert((await page.locator("#game-bytes .gbyte").count()) === 8, "the 8 free bytes are on display (b=9)");
-  assert((await page.locator("#game-info .addr-info").count()) === 1, "AddrInfo panel shows the sampled key");
+  // The key readout lives on the `survive` title row, not in a bottom panel.
+  assert((await page.locator("#game-pk").count()) === 1, "the sampled key is on the title row");
+  // Puzzle #71 is 9 bytes, so the key is 64 hex chars of which only the low 9
+  // bytes are live — the strip leaves exactly 18.
+  assert(/^[0-9a-f]{18}$/.test((await page.locator("#game-pk").textContent()).trim()), "private key shown with its zero padding stripped", await page.locator("#game-pk").textContent());
+  assert(((await page.locator("#game-addr").textContent()) ?? "").startsWith("1A"), "compressed address is on the title row");
+  assert((await page.locator("#game-flag").textContent()).trim() === "❌", "miss icon while no match");
+  assert((await page.locator("#game-info").count()) === 0, "no bottom puzzle card");
 
   console.log("\n[4] ⏸ pauses the search, not just the picture (design §8)");
   await page.locator("#btn-run").click();
@@ -218,7 +225,8 @@ async function run() {
   assert((await status()) === "matched", "status is matched", await status());
   assert(await page.locator("#btn-run").isDisabled(), "run button locked after a match");
   assert(await page.locator("#puzzle-select").isDisabled(), "puzzle dropdown locked after a match");
-  assert((await page.locator("#game-info .addr-info").count()) === 1, "AddrInfo panel still shows the matched key");
+  assert((await page.locator("#game-flag").textContent()).trim() === "✅", "hit icon flipped on the title row");
+  assert(await page.locator("#game-addr.match").isVisible(), "address is badged as the target");
   const atMatch = await keys();
   await page.waitForTimeout(1200);
   assert((await keys()) === atMatch, "key loop stopped by the match", `${atMatch} -> ${await keys()}`);
