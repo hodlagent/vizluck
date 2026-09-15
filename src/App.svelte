@@ -25,9 +25,9 @@
 </nav>
 
 <!-- Both panels stay mounted at all times; switching tabs only toggles
-     `hidden`. Unmounting Hex would orphan the element refs `hex/hex.ts`
-     captured and strand its auto loop writing into a detached DOM tree —
-     which would look exactly like the tab "resetting" on switch-back. -->
+     `hidden`, which is what lets a hidden Hex tab keep running its auto loop.
+     Unmounting it would destroy its `HexState` and stop the loop, so switching
+     back would come up empty — exactly the "tab reset" Auto mode must survive. -->
 <div class="panel" hidden={active !== "hex"}>
   <Hex />
 </div>
