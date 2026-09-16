@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import MatchBanner from "../hex/MatchBanner.svelte";
-  import { keyRateFor, TUNING } from "../game/sim";
   import { GameState } from "../game/state.svelte";
   import type { ItemKind } from "../game/types";
 
@@ -36,7 +35,6 @@
     return `${String(m).padStart(2, "0")}:${rest.toFixed(1).padStart(4, "0")}`;
   }
 
-  const rate = $derived(keyRateFor(state.hashpower).toFixed(1));
   const hpFrac = $derived(state.maxHp > 0 ? state.hp / state.maxHp : 0);
 
   /** What each potion does — the HUD is the only place the drop table is stated. */
@@ -202,11 +200,10 @@
         </span>
       {/each}
     </span>
-    <span>
-      hashpower <b id="game-hashpower">{Math.round(state.hashpower)}/{TUNING.hashpowerMax}</b>
-    </span>
-    <span>sampling <b id="game-rate">{rate}</b> keys/s</span>
-    <span>keys <b id="game-keys">{state.keysScanned}</b></span>
+    <!-- One number, not a rate: the key advances when the world changes, so
+         "keys sampled" is the whole of what the run has cost. There is no
+         cadence to report, and printing one would invent a knob. -->
+    <span title="Every key this run has handed to the backend">keys <b id="game-keys">{state.keysScanned}</b></span>
   </div>
 
   <!-- The bytes the gameplay is driving. This is the game's answer to the Hex

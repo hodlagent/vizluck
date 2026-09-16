@@ -152,12 +152,10 @@ export interface RegionRuntime {
 
 /**
  * The read-only view the key map consumes. Deliberately a snapshot rather than
- * a live handle on the sim: the key tick fires on its own schedule and must not
- * observe the sim mid-step.
+ * a live handle on the sim: it is read from inside a frame, after the sim has
+ * been stepped and before the next step, and must not observe the sim mid-step.
  */
 export interface GameSnapshot {
-  /** Simulation steps so far — `V[0]`, so a static scene still moves the key. */
-  tick: number;
   width: number;
   height: number;
   player: PlayerStats;
@@ -166,7 +164,8 @@ export interface GameSnapshot {
   region: RegionConfig;
   kills: number;
   level: number;
-  hashpower: number;
+  /** XP banked toward the next level — `V[10]`, normalised by `xpForNext`. */
+  xp: number;
 }
 
 /** Player movement intent for one step, each component in {-1, 0, 1}. */

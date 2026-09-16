@@ -1,15 +1,18 @@
 // Game tab state — one instance per `<Game>` mount, mirroring `HexState`.
 //
-// Two clocks live here, and keeping them apart is most of the design:
+// There is one clock here now, and it belongs to the scene: the **simulation**
+// clock. `scene.setPaused()` stops the sim step, and with it the survival timer
+// and every respawn timer.
 //
-//   * the **simulation** clock, which the scene owns. `scene.setPaused()` stops
-//     the sim step, and with it the survival timer and every respawn timer.
-//   * the **key** clock, which is `loop()` below. It samples the live sim,
-//     turns it into a private key and asks the backend to match it.
+// The key has no clock of its own. It is a pure function of the live world
+// (design §3.4): the scene calls `onFrame` at the end of each `update()`, this
+// samples the sim it just stepped, and a world identical to the last one
+// submitted produces nothing. No timer, no rate constant — a busy world streams
+// keys at the frame rate and a still one produces none.
 //
-// "暂停 = 停止搜索" (design §8) means a pause has to stop *both*, so
-// `syncStatus()` is the single place that decides, and nothing else pauses the
-// scene or touches the key loop.
+// "暂停 = 停止搜索" (design §8) therefore needs no second switch. `syncStatus()`
+// is still the single place that decides a pause, but it only has to stop the
+// *simulation*: a frozen sim is a frozen key stream, structurally.
 //
 // The scene keeps *rendering* through all of it. Only the engine's own
 // `pause()` — which stops the renderer as well — is still used, and only while
@@ -25,15 +28,20 @@ import {
   type GameOverlay,
   type GameStats,
 } from "./config";
-import { gameKeyHex } from "./keymap";
+import { gameBaseBytes, keyHexFromBase, type GameKeyBytes } from "./keymap";
 import { GameScene } from "./scenes/GameScene";
-import { keyRateFor } from "./sim";
 import type { ItemKind } from "./types";
 
-/** Floor on the gap between key ticks, so a huge hashpower can't flood the IPC. */
-const MIN_TICK_MS = 20;
-
-const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+/**
+ * How often the key readout and the byte strip are repainted, in ms.
+ *
+ * Sampling runs as fast as the IPC allows; *display* does not. The two are
+ * different jobs: `keysScanned` is a cost counter and wants every key, while
+ * the byte strip is 20-odd DOM nodes and the address card above it — at 60 Hz
+ * that is an unreadable blur, and it competes with the canvas for the main
+ * thread the synchronous `derive_group` call is already using.
+ */
+const DISPLAY_MS = 100;
 
 /**
  * Which full-screen message the arena should be showing.
@@ -96,8 +104,10 @@ export class GameState {
   kills = $state(0);
   /** Potions collected this run, per kind (design §8.3). */
   pickups = $state<Record<ItemKind, number>>({ heal: 0, power: 0, agility: 0, vitality: 0 });
-  hashpower = $state(0);
-  /** Keys actually sampled this run — the real cost of the run, not a rate. */
+  /**
+   * Keys actually sampled this run — the real cost of the run, not a rate.
+   * Counts every derived key, including the ones the display throttle skips.
+   */
   keysScanned = $state(0);
 
   // ── Key output ───────────────────────────────────────────────────────────
@@ -137,8 +147,17 @@ export class GameState {
   private hasRun = false;
   /** Bumped on every new run so results in flight are dropped. */
   private generation = 0;
-  private ticking = false;
-  private tickTimer: number | null = null;
+  /**
+   * The free bytes of the last state handed to the backend, joined into one
+   * string so a frame can compare them with `===`. Empty means "nothing
+   * submitted yet in this run" — reset at every run boundary, never on a pause,
+   * because a pause must not manufacture a key on the way back out.
+   */
+  private lastBase = "";
+  /** True while a `derive_group` call is outstanding. */
+  private inFlight = false;
+  /** `performance.now()` at the last repaint of the key readout. */
+  private lastPaint = 0;
 
   // Arrow-function fields so `off()` can be handed the identical reference.
   private onStats = (stats: GameStats) => {
@@ -151,7 +170,6 @@ export class GameState {
     this.maxHp = stats.maxHp;
     this.kills = stats.kills;
     this.pickups = stats.pickups;
-    this.hashpower = stats.hashpower;
     // Death lands here first (the feed is 4 Hz). `syncStatus()` reads it back
     // off the live scene and does the bookkeeping.
     this.syncStatus();
@@ -159,9 +177,53 @@ export class GameState {
 
   private onReady = () => {
     this.engineReady = true;
+
+    // The key's trigger, installed once. Phaser's `SceneManager` boots the
+    // scenes off this same READY event and subscribes first, so the scene
+    // exists by the time this runs.
+    const scene = this.scene();
+    if (scene) scene.onFrame = this.onFrame;
+
     this.resize();
     // A tab switch can land before READY, so reconcile rather than assume.
     this.syncStatus();
+  };
+
+  /**
+   * The key sampler (design §9.4) — the scene calls this once per frame, after
+   * it has stepped the sim.
+   *
+   * There is no timer behind this and no rate constant in front of it. A frame
+   * either produced a world that has not been submitted yet or it did not;
+   * everything else — the pause, the tab switch, the death, the match — is
+   * already resolved by the time this is reached, because all of them freeze
+   * the simulation and a frozen simulation repeats itself.
+   */
+  private onFrame = (): void => {
+    const scene = this.scene();
+    const puzzle = this.puzzle;
+    if (!scene || !puzzle || !this.canSample()) return;
+
+    const snap = scene.currentSnapshot();
+    if (!snap) return;
+
+    const base = gameBaseBytes(snap, puzzle);
+
+    // Compared against the *free bytes*, never the finished key: `randomTopByte`
+    // is a fresh CSPRNG draw on every call (`src/hex/range.ts`), so two keys
+    // over an identical world always differ. Key hex against key hex would call
+    // a frozen world new on every frame and submit forever — including while
+    // paused, which is exactly what must not happen.
+    const sig = base.baseBytes.join("");
+    if (sig === this.lastBase) return;
+
+    // Mid-flight: rather than queue this, do nothing and let `submit()` look at
+    // the world again when it lands. A queued state is strictly older than
+    // whatever is current then, so there is nothing here worth remembering.
+    if (this.inFlight) return;
+
+    this.lastBase = sig;
+    void this.submit(puzzle, base);
   };
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -194,7 +256,11 @@ export class GameState {
   }
 
   unmount(): void {
-    this.stopTick();
+    // The scene dies with the game, so there is nothing to detach — but a
+    // result can still be in flight, and it must not paint itself into a tab
+    // that is gone.
+    this.generation++;
+    this.lastBase = "";
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.host = null;
@@ -236,7 +302,7 @@ export class GameState {
     this.selected = raw;
     this.running = false;
     this.generation++;
-    this.stopTick();
+    this.lastBase = "";
 
     // Changing the puzzle invalidates the run: a new byte layout means the
     // arena's history no longer maps to anything.
@@ -278,7 +344,9 @@ export class GameState {
     const scene = this.scene();
     if (!scene) return;
     this.generation++;
-    this.stopTick();
+    // A new run is a new world, and its first state has to be submitted even if
+    // it happens to hash the same way the last run's did.
+    this.lastBase = "";
     scene.startRun();
     this.hasRun = true;
     this.alive = true;
@@ -350,9 +418,9 @@ export class GameState {
       }
     }
 
-    if (this.shouldTick()) this.ensureTick();
-    else this.stopTick();
-
+    // No key switch to flip here any more. `running` and `setPaused()` above
+    // are the whole of it: the sampler reads the sim, so a sim that is not
+    // running is a sampler with nothing to send.
     this.status = status;
   }
 
@@ -384,78 +452,77 @@ export class GameState {
     return this.survival > 0 ? "paused" : "ready";
   }
 
-  private shouldTick(): boolean {
+  /**
+   * Whether a world state may be handed to the backend right now.
+   *
+   * This is the old `shouldTick()`, and it is still load-bearing: the scene
+   * calls `onFrame` on every frame it renders, including the frames of a run
+   * that is armed (READY) but not started. Those frames are frozen, but they
+   * are the *first* state of a run, so they differ from `lastBase` and would
+   * submit one key before ▶ — which requirement 1 forbids.
+   */
+  private canSample(): boolean {
     return this.engineReady && this.active && this.running && !this.matched;
   }
 
-  // ── The key clock ────────────────────────────────────────────────────────
+  // ── The key sampler, part two: the IPC round-trip ────────────────────────
   //
-  // [imperative] A `while` loop over an await, not an `$effect`: the interval
-  // depends on the run's hashpower, which only exists inside the simulation,
-  // and the await of the IPC round-trip *is* the backpressure. An `$effect`
+  // [imperative] An `await`, not an `$effect`: the pause between keys is how
+  // long the backend takes, and that await *is* the backpressure. An `$effect`
   // reading reactive state here would fire on every HUD write.
 
-  private ensureTick(): void {
-    if (this.ticking) return;
-    this.ticking = true;
-    void this.loop();
-  }
-
-  private stopTick(): void {
-    this.ticking = false;
-    if (this.tickTimer !== null) {
-      window.clearTimeout(this.tickTimer);
-      this.tickTimer = null;
-    }
-  }
-
-  private async loop(): Promise<void> {
-    while (this.ticking) {
-      const started = performance.now();
-      await this.tickOnce();
-      if (!this.ticking) return;
-
-      // Target the rate the run has earned, minus what the IPC just cost, so a
-      // slow round-trip throttles the rate rather than stacking requests.
-      const interval = 1000 / keyRateFor(this.hashpower);
-      const wait = Math.max(MIN_TICK_MS, interval - (performance.now() - started));
-      await sleep(wait);
-    }
-  }
-
-  /** One sample: sim → key → match check. Never throws. */
-  private async tickOnce(): Promise<void> {
-    const scene = this.scene();
-    const puzzle = this.puzzle;
-    if (!scene || !puzzle) return;
-
-    // Requirement 6, the whole point: read the scene *now*, map it to bytes,
-    // and hand the result to the same command the Hex tab's group mode uses.
-    const snap = scene.currentSnapshot();
-    if (!snap) return;
-
-    const { keyHex, baseBytes, owners } = gameKeyHex(snap, puzzle);
+  /** One sample: key → derive_group → match check. Never throws. */
+  private async submit(puzzle: PuzzleInfo, base: GameKeyBytes): Promise<void> {
+    this.inFlight = true;
+    const keyHex = keyHexFromBase(puzzle, base);
     const gen = this.generation;
 
     try {
       const results = await deriveGroup([keyHex]);
-      // A restart, a selection change or a pause can all land during the await.
-      if (gen !== this.generation || !this.ticking) return;
+      // A restart or a selection change can land during the await, and those
+      // are the only two that invalidate this result: both replace the world
+      // wholesale, so a key from before them belongs to a run that is gone.
+      //
+      // A pause, a death or a match deliberately does *not* invalidate it. None
+      // of them changes the world — they only stop it — so this key came from
+      // exactly the state the arena is now frozen on and is consistent with
+      // what is on screen. What a pause must prevent is *starting* the next
+      // submission, and `canSample()` does that at `onFrame`'s door.
+      if (gen !== this.generation) return;
 
       const info = results[0];
       if (!info) return;
 
       this.error = "";
       this.keysScanned++;
-      this.info = info;
-      this.baseBytes = baseBytes;
-      this.owners = owners;
+
+      // The cost counter above is exact; the readout is throttled. See
+      // `DISPLAY_MS` — the two are answering different questions. A match is
+      // exempt: the key that won is the one key that must never be throttled
+      // out of the panel it is about to be celebrated in.
+      const now = performance.now();
+      if (info.address_match === true || now - this.lastPaint >= DISPLAY_MS) {
+        this.lastPaint = now;
+        this.info = info;
+        this.baseBytes = base.baseBytes;
+        this.owners = base.owners;
+      }
 
       if (info.address_match === true) this.handleMatch(info);
     } catch (e) {
       this.error = String(e);
       this.running = false;
       this.syncStatus();
+    } finally {
+      this.inFlight = false;
+      // Coalescing, and the whole of it: rather than remember what arrived
+      // mid-flight, look at the world again. Whatever is there now is newer
+      // than anything that could have been queued, and the comparison in
+      // `onFrame` drops it if the world has not actually moved since.
+      //
+      // A match or a pause lands here too, and `onFrame`'s own gate is what
+      // stops either being followed by one more submission.
+      this.onFrame();
     }
   }
 

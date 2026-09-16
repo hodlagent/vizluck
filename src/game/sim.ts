@@ -39,12 +39,6 @@ export const TUNING = {
   /** Seconds after the last hit before `hpSpeed` kicks in (design §5.2). */
   regenDelay: 3,
 
-  hashpowerMax: 100,
-  /** Per second. Idling in a corner bleeds the scan rate back down. */
-  hashpowerDecay: 3,
-  keyRateMin: 2,
-  keyRateMax: 20,
-
   /**
    * Longest step the sim will take. A paused tab, a dragged window or a slow
    * frame must not teleport monsters through the player on resume.
@@ -113,8 +107,6 @@ export interface MonsterArchetype {
   attackRange: number;
   /** `m_range` — the perception radius. */
   senseRange: number;
-  /** Hashpower granted on kill (design §8.1). */
-  drop: number;
   xp: number;
 }
 
@@ -127,7 +119,6 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     attackSpeed: 0.8,
     attackRange: 22,
     senseRange: 140,
-    drop: 1,
     xp: 10,
   },
   hunter: {
@@ -137,7 +128,6 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     attackSpeed: 1.2,
     attackRange: 26,
     senseRange: 260,
-    drop: 2,
     xp: 20,
   },
   brute: {
@@ -148,7 +138,6 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     attackRange: 34,
     // Short sight, huge damage: walking around this circle is the core tactic.
     senseRange: 110,
-    drop: 4,
     xp: 40,
   },
 };
@@ -202,12 +191,6 @@ export function rollDrops(rng: () => number): ItemKind[] {
   return out;
 }
 
-/** Key sampling rate for a hashpower value, in keys/s (design §8.1). */
-export function keyRateFor(hashpower: number): number {
-  const frac = Math.max(0, Math.min(1, hashpower / TUNING.hashpowerMax));
-  return TUNING.keyRateMin + (TUNING.keyRateMax - TUNING.keyRateMin) * frac;
-}
-
 // ── State ───────────────────────────────────────────────────────────────────
 
 export interface SimState {
@@ -227,13 +210,16 @@ export interface SimState {
   kills: number;
   level: number;
   xp: number;
-  hashpower: number;
   /** False once `hp` hits 0; the run is over and `step` becomes a no-op. */
   alive: boolean;
 
   /**
-   * Simulation steps so far. Feeds `V[0]`, which is what guarantees the key
-   * still moves when the player stands still in an empty corner.
+   * Simulation steps so far — a plain step counter, and a probe for "did the
+   * sim actually advance?".
+   *
+   * It used to feed `V[0]`, forcing the key to move even in an empty corner.
+   * That byte is gone: the key is now a pure function of the world, so a world
+   * standing still is *supposed* to stop producing keys.
    */
   tick: number;
   /** Seconds until the player may swing again. */
@@ -356,7 +342,6 @@ export function createSim(opts: SimOptions = {}): SimState {
     kills: 0,
     level: 1,
     xp: 0,
-    hashpower: 0,
     alive: true,
     tick: 0,
     attackCooldown: 0,
@@ -531,7 +516,6 @@ function killMonster(s: SimState, m: MonsterStats): void {
 
   const arch = MONSTER_ARCHETYPES[m.kind];
   s.kills++;
-  s.hashpower = Math.min(TUNING.hashpowerMax, s.hashpower + arch.drop);
   s.xp += arch.xp;
   while (s.xp >= xpForNext(s.level)) {
     s.xp -= xpForNext(s.level);
@@ -642,8 +626,6 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
     p.hp = Math.min(p.maxHp, p.hp + p.hpSpeed * dt);
   }
 
-  s.hashpower = Math.max(0, s.hashpower - TUNING.hashpowerDecay * dt);
-
   // Player → monster auto-attack (design §5.1). The cooldown only resets on a
   // swing, so an idle player is always ready for the next thing that walks in.
   s.attackCooldown -= dt;
@@ -717,7 +699,6 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
 /** A frozen-enough view for the key map. See `GameSnapshot`'s doc comment. */
 export function snapshot(s: SimState): GameSnapshot {
   return {
-    tick: s.tick,
     width: s.width,
     height: s.height,
     player: { ...s.player },
@@ -725,6 +706,6 @@ export function snapshot(s: SimState): GameSnapshot {
     region: s.configs[regionIndexAt(s, s.player.posX, s.player.posY)],
     kills: s.kills,
     level: s.level,
-    hashpower: s.hashpower,
+    xp: s.xp,
   };
 }

@@ -357,6 +357,17 @@ export class GameScene extends Phaser.Scene {
   /** Sim frozen, engine still painting. See `setPaused()`. */
   private paused = false;
 
+  /**
+   * Sink `GameState` installs to sample a key from the world, called at the
+   * end of every `update()` (design §9.4).
+   *
+   * A callback the consumer sets, rather than an event the scene emits, because
+   * the consumer needs the *live* snapshot and reading it is the scene's job.
+   * Null until `GameState` attaches it at READY — and the scene stays runnable
+   * with nobody listening, which is what keeps the key clock out of here.
+   */
+  onFrame: (() => void) | null = null;
+
   constructor() {
     super(SCENE_KEY);
   }
@@ -1352,8 +1363,11 @@ export class GameScene extends Phaser.Scene {
         color,
         width: 2,
       });
+      // The xp the kill paid, read from the archetype the sim actually used —
+      // `arch.xp` is the rule, so the floater cannot disagree with the level bar
+      // (design §8.2). The old drop table that used to sit beside it is gone.
       this.spawnFloater(
-        `+${MONSTER_ARCHETYPES[track.kind].drop}`,
+        `+${MONSTER_ARCHETYPES[track.kind].xp}`,
         track.x,
         track.y - MONSTER_RADIUS[track.kind] - 4,
         p.accent,
@@ -1395,7 +1409,7 @@ export class GameScene extends Phaser.Scene {
       if (track.life > dt) {
         // Walked over: loud, and fired off the *player*, because the reward is
         // theirs and the potion is already gone from the floor. Distinct from
-        // the `+N` hashpower floater above, which stays where the kill happened.
+        // the `+N` xp floater above, which stays where the kill happened.
         this.bursts.push({
           x: player.posX,
           y: player.posY,
@@ -1523,7 +1537,6 @@ export class GameScene extends Phaser.Scene {
       // Frozen along with every other number here while the run is paused —
       // that is the 4 Hz feed's contract, not an oversight.
       pickups: sim?.pickups ?? { heal: 0, power: 0, agility: 0, vitality: 0 },
-      hashpower: sim?.hashpower ?? 0,
     };
     this.game.events.emit(GAME_STATS, stats);
   }
@@ -1557,5 +1570,11 @@ export class GameScene extends Phaser.Scene {
     this.stepEffects(dt);
     this.fitCamera();
     this.drawFrame();
+
+    // Last, and unconditionally: the sink decides for itself whether this frame
+    // produced a world it has not already submitted. Calling it from inside the
+    // step branch instead would put the "is the run live?" question in two
+    // places — and the sink is where the answer already lives.
+    this.onFrame?.();
   }
 }

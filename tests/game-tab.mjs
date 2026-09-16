@@ -4,13 +4,13 @@
  *
  * Same approach as `hex-tab.mjs`: drive the *real* frontend in a browser and
  * stub only the Tauri IPC bridge, so the runes state, the templates, the Phaser
- * scene and the key loop are all exercised for real. Each assertion describes
+ * scene and the key sampler are all exercised for real. Each assertion describes
  * observable behaviour, not implementation.
  *
  * The one thing this file deliberately does not do is kill the player: that
  * takes minutes of wall-clock and belongs in `game-sim.mjs`, where the pure
  * simulation is driven deterministically. Here we cover the wiring around it —
- * requirement 1's gating and pause protocol, the key tick, and the match
+ * requirement 1's gating and pause protocol, the key sampler, and the match
  * freeze.
  *
  * Usage:
@@ -120,7 +120,7 @@ async function run() {
             return puzzles;
           case "derive_group":
             // Counted here rather than in the HUD so the assertions can tell a
-            // stopped key loop from a stopped *stats feed* — a paused Phaser
+            // stopped sampler from a stopped *stats feed* — a paused Phaser
             // freezes the HUD too, which would otherwise mask a running loop.
             window.__KEYS_SEEN__ += args.private_keys.length;
             return args.private_keys.map(info);
@@ -140,7 +140,7 @@ async function run() {
   await page.waitForSelector("#grid .cell", { timeout: 10000 });
   // The Hex tab runs one `derive_group` of its own on init, and the stub's
   // counter is shared. Wait for that round to land, then zero it, so the
-  // counts below measure the Game tab's key loop and nothing else.
+  // counts below measure the Game tab's key sampler and nothing else.
   await page.waitForSelector("#info .addr-info", { timeout: 10000 });
   await page.evaluate(() => {
     window.__KEYS_SEEN__ = 0;
@@ -165,7 +165,7 @@ async function run() {
   assert((await page.locator("#game-hint").count()) === 0, "hint gone once a puzzle is chosen");
   assert((await keys()) === 0, "no keys sampled before ▶");
 
-  console.log("\n[3] ▶ starts the run and the key tick");
+  console.log("\n[3] ▶ starts the run and the key sampler");
   await page.locator("#btn-run").click();
   await page.waitForTimeout(150);
   assert((await runLabel()).trim() === "⏸", "button flipped to ⏸");
@@ -218,7 +218,7 @@ async function run() {
   assert((await keys()) < before + 8, "no meaningful sampling while away", `${before} -> ${await keys()}`);
   const afterReturn = await keys();
   await page.waitForTimeout(800);
-  assert((await keys()) === afterReturn, "key loop stayed stopped after returning");
+  assert((await keys()) === afterReturn, "the sampler stayed stopped after returning");
   await page.locator("#btn-run").click();
   await page.waitForFunction((n) => window.__KEYS_SEEN__ > n, afterReturn, { timeout: 5000 });
   assert((await keys()) > afterReturn, "manual ▶ resumes the search");
@@ -236,7 +236,7 @@ async function run() {
   assert(await page.locator("#game-addr.match").isVisible(), "address is badged as the target");
   const atMatch = await keys();
   await page.waitForTimeout(1200);
-  assert((await keys()) === atMatch, "key loop stopped by the match", `${atMatch} -> ${await keys()}`);
+  assert((await keys()) === atMatch, "the sampler stopped by the match", `${atMatch} -> ${await keys()}`);
 
   console.log("\n[7] Console errors");
   const bad1 = errors.filter((e) => /missing #|Cannot read|is not a function|TypeError/i.test(e));

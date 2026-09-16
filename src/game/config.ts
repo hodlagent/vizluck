@@ -42,7 +42,6 @@ export interface GameStats {
   kills: number;
   /** Potions picked up this run, per kind (design §8.3) — the HUD's tally. */
   pickups: Record<ItemKind, number>;
-  hashpower: number;
 }
 
 /**

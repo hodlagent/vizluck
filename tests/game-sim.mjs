@@ -247,7 +247,7 @@ async function run() {
       sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
       check(s.monsters.length === before - 1, "the player's auto-attack kills a weakened monster");
       check(s.kills === 1, "the kill is counted");
-      check(s.hashpower > 0, "the kill paid hashpower", s.hashpower);
+      check(s.xp > 0, "the kill paid experience", s.xp);
       check(s.regions[home].pending.length === 1, "a respawn was queued in the monster's home region");
 
       // Just short of the delay: still dead.
@@ -617,17 +617,24 @@ async function run() {
     {
       const s = fresh();
       s.monsters.length = 0;
-      // Byte j=1 is owned by `player.dir`, which has only 8 possible values. A
+      // Byte j=0 is owned by `player.dir`, which has only 8 possible values. A
       // direct mapping would pin that byte to 8 of 256 values and waste 97% of
       // its range; the diffuse term is what buys the coverage back.
+      //
+      // `V` is a pure function of the live world now (design §3.4), so there is
+      // no tick counter to nudge and novelty has to come from state the player
+      // really moves. Two coprime periods, because one quantised byte is only
+      // 256 states and this samples 400 times.
       check(s.player.dir === 0, "the player starts facing east", s.player.dir);
       const seen = new Set();
+      let dirByte = "";
+      const step = s.width / 256;
       for (let i = 0; i < 400; i++) {
-        s.tick = i;
-        const { baseBytes } = keymap.gameBaseBytes(sim.snapshot(s), puzzleA);
-        seen.add(baseBytes[1]);
+        s.player.posX = (i % 256) * step;
+        s.player.hp = 100 - (i % 101);
+        dirByte = keymap.gameBaseBytes(sim.snapshot(s), puzzleA).baseBytes[0];
+        seen.add(dirByte);
       }
-      const dirByte = keymap.gameBaseBytes(sim.snapshot(s), puzzleA).baseBytes[1];
       check(
         seen.size > 120,
         "a low-cardinality field still spreads across its byte",

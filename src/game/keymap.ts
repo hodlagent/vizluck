@@ -8,36 +8,14 @@
 
 import { puzzleKeyHex, randomTopByte } from "../hex/range";
 import type { PuzzleInfo } from "../hex/types";
+import { xpForNext } from "./sim";
 import type { GameSnapshot, MonsterStats } from "./types";
 
 /** How many of the nearest monsters feed the key. See design §3.4. */
 export const MONSTER_WINDOW = 8;
 
-/** 16 header bytes + the monster window. See design §3.4 for the layout. */
-export const VECTOR_LEN = 16 + MONSTER_WINDOW * 6;
-
-/**
- * Divisors that map an unbounded-ish stat onto 0..255. Chosen so a normal
- * run's values spread across most of the byte instead of pinning to one end.
- */
-const SCALE = {
-  attackPower: 64,
-  moveSpeed: 320,
-  attackSpeed: 4,
-  attackRange: 200,
-  hpSpeed: 8,
-  level: 32,
-  hashpower: 100,
-  kills: 512,
-  targetCount: 16,
-  respawn: 8,
-  /** Distances are squared-up to this before quantising. */
-  dist: 1200,
-} as const;
-
-/** Labels for `V[0..15]`, in order. */
+/** Labels for the header bytes, in order. */
 const HEADER_LABELS = [
-  "tick",
   "player.dir",
   "player.posX",
   "player.posY",
@@ -48,7 +26,7 @@ const HEADER_LABELS = [
   "player.attackRange",
   "player.hpSpeed",
   "level",
-  "hashpower",
+  "xp",
   "region.index",
   "region.count",
   "region.respawn",
@@ -57,6 +35,37 @@ const HEADER_LABELS = [
 
 /** Labels for the 6 bytes each monster contributes. */
 const MONSTER_FIELDS = ["dir", "x", "y", "hp", "dist", "aggro"] as const;
+
+/**
+ * The header plus the monster window. See design §3.4 for the layout.
+ *
+ * Deliberately *not* a round number any more: the old `V[0]` tick counter was
+ * removed when the key became a pure function of the live world, so `V` is now
+ * `15 + 8 × 6 = 63`. Deriving the length from the label list keeps the two from
+ * drifting apart.
+ */
+export const VECTOR_LEN = HEADER_LABELS.length + MONSTER_WINDOW * MONSTER_FIELDS.length;
+
+/**
+ * Divisors that map an unbounded-ish stat onto 0..255. Chosen so a normal
+ * run's values spread across most of the byte instead of pinning to one end.
+ *
+ * `xp` is absent on purpose: it is unbounded across levels, so it is normalised
+ * against `xpForNext(level)` instead — see `buildStateVector`.
+ */
+const SCALE = {
+  attackPower: 64,
+  moveSpeed: 320,
+  attackSpeed: 4,
+  attackRange: 200,
+  hpSpeed: 8,
+  level: 32,
+  kills: 512,
+  targetCount: 16,
+  respawn: 8,
+  /** Distances are squared-up to this before quantising. */
+  dist: 1200,
+} as const;
 
 /** Which state field owns free byte `j`. Shown in the HUD (design §10.2). */
 export function ownerLabel(j: number): string {
@@ -90,32 +99,39 @@ function nearestMonsters(snap: GameSnapshot, n: number): MonsterStats[] {
  * Fixed length is load-bearing: monsters die constantly, and a variable-length
  * vector would shift every byte's owner the moment one did, making the HUD's
  * ownership display flicker. Empty monster slots stay 0.
+ *
+ * **`V` is a pure function of the world, and that is the whole contract.** There
+ * is no tick counter and no clock: if nothing in the world has changed, `V` is
+ * byte-identical, and the caller is expected to notice and derive nothing. See
+ * `gameBaseBytes`.
  */
 export function buildStateVector(snap: GameSnapshot): Uint8Array {
   const V = new Uint8Array(VECTOR_LEN);
   const p = snap.player;
 
-  V[0] = snap.tick & 0xff;
-  V[1] = p.dir;
-  V[2] = quant(p.posX, snap.width);
-  V[3] = quant(p.posY, snap.height);
-  V[4] = quant(p.hp, p.maxHp);
-  V[5] = quant(p.attackPower, SCALE.attackPower);
-  V[6] = quant(p.moveSpeed, SCALE.moveSpeed);
-  V[7] = quant(p.attackSpeed, SCALE.attackSpeed);
-  V[8] = quant(p.attackRange, SCALE.attackRange);
-  V[9] = quant(p.hpSpeed, SCALE.hpSpeed);
-  V[10] = quant(snap.level, SCALE.level);
-  V[11] = quant(snap.hashpower, SCALE.hashpower);
-  V[12] = snap.region.index;
-  V[13] = quant(snap.region.targetCount, SCALE.targetCount);
-  V[14] = quant(snap.region.respawnSeconds, SCALE.respawn);
-  V[15] = quant(snap.kills, SCALE.kills);
+  V[0] = p.dir;
+  V[1] = quant(p.posX, snap.width);
+  V[2] = quant(p.posY, snap.height);
+  V[3] = quant(p.hp, p.maxHp);
+  V[4] = quant(p.attackPower, SCALE.attackPower);
+  V[5] = quant(p.moveSpeed, SCALE.moveSpeed);
+  V[6] = quant(p.attackSpeed, SCALE.attackSpeed);
+  V[7] = quant(p.attackRange, SCALE.attackRange);
+  V[8] = quant(p.hpSpeed, SCALE.hpSpeed);
+  V[9] = quant(snap.level, SCALE.level);
+  // Normalised against what the *next* level costs, not a fixed divisor: `xp`
+  // rises to `100 × level` before resetting, so any constant would saturate.
+  // Same shape as `player.hp` above, which is normalised by `maxHp`.
+  V[10] = quant(snap.xp, xpForNext(snap.level));
+  V[11] = snap.region.index;
+  V[12] = quant(snap.region.targetCount, SCALE.targetCount);
+  V[13] = quant(snap.region.respawnSeconds, SCALE.respawn);
+  V[14] = quant(snap.kills, SCALE.kills);
 
   const near = nearestMonsters(snap, MONSTER_WINDOW);
   for (let i = 0; i < near.length; i++) {
     const m = near[i];
-    const o = 16 + i * 6;
+    const o = HEADER_LABELS.length + i * MONSTER_FIELDS.length;
     V[o] = m.dir;
     V[o + 1] = quant(m.posX, snap.width);
     V[o + 2] = quant(m.posY, snap.height);
@@ -177,6 +193,8 @@ export interface GameKeyBytes {
  * fields like `player.dir` (8 values) would waste 96% of their byte's range.
  */
 export function gameBaseBytes(snap: GameSnapshot, puzzle: PuzzleInfo): GameKeyBytes {
+  // Note: no clock, no counter. An unchanged world yields identical bytes, and
+  // the key clock relies on that to skip derivation entirely.
   const free = Math.max(0, puzzle.hex_bytes_len - 1);
   const V = buildStateVector(snap);
   const next = splitmix32(fold(V, puzzle.puzzle_number));
@@ -193,17 +211,28 @@ export function gameBaseBytes(snap: GameSnapshot, puzzle: PuzzleInfo): GameKeyBy
 }
 
 /**
- * The full 64-char private key for this instant of gameplay.
+ * The full 64-char private key for one set of free bytes.
  *
- * Byte layout, and the reason this is three lines: the game fills the free low
- * bytes exactly the way the Hex tab's grid does, so key construction stays on
- * `src/hex/range.ts`'s single code path (design §3.2).
+ * Split out from `gameKeyHex` because `randomTopByte` is a fresh CSPRNG draw on
+ * *every* call (`src/hex/range.ts`): two calls over an identical world still
+ * differ in the top byte. The key clock tells "the world changed" from "it did
+ * not" by comparing free bytes, so it has to build the key without rolling that
+ * byte first — compare the finished key hex instead and nothing would ever
+ * match, and a frozen world would go on submitting forever.
+ *
+ * Byte layout: the game fills the free low bytes exactly the way the Hex tab's
+ * grid does, so key construction stays on `src/hex/range.ts`'s single code path
+ * (design §3.2).
  */
+export function keyHexFromBase(puzzle: PuzzleInfo, base: GameKeyBytes): string {
+  return puzzleKeyHex(puzzle, randomTopByte(puzzle), base.baseBytes);
+}
+
+/** One-shot state → key, rolling a fresh top byte. */
 export function gameKeyHex(
   snap: GameSnapshot,
   puzzle: PuzzleInfo,
 ): GameKeyBytes & { keyHex: string } {
-  const { baseBytes, owners } = gameBaseBytes(snap, puzzle);
-  const topByte = randomTopByte(puzzle);
-  return { keyHex: puzzleKeyHex(puzzle, topByte, baseBytes), baseBytes, owners };
+  const base = gameBaseBytes(snap, puzzle);
+  return { ...base, keyHex: keyHexFromBase(puzzle, base) };
 }
