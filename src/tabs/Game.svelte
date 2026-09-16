@@ -2,7 +2,6 @@
   import { onMount } from "svelte";
   import MatchBanner from "../hex/MatchBanner.svelte";
   import { GameState } from "../game/state.svelte";
-  import type { ItemKind } from "../game/types";
 
   /** Whether this tab is the visible one — driven by `App.svelte`. */
   let { active = false }: { active?: boolean } = $props();
@@ -36,25 +35,6 @@
   }
 
   const hpFrac = $derived(state.maxHp > 0 ? state.hp / state.maxHp : 0);
-
-  /** What each potion does — the HUD is the only place the drop table is stated. */
-  const LOOT_LABEL: Record<ItemKind, string> = {
-    heal: "heal — restores 30% of max HP",
-    power: "power — attack power and attack speed +5%",
-    agility: "agility — move speed +5%",
-    vitality: "vitality — max HP +5%, does not heal",
-  };
-
-  /**
-   * The potion tally, in the same order as the canvas legend. One entry per kind
-   * even at zero, so the row does not reflow every time something is collected.
-   */
-  const loot = $derived(
-    (["heal", "power", "agility", "vitality"] as const).map((kind) => ({
-      kind,
-      count: state.pickups[kind],
-    })),
-  );
 
   /**
    * Every free byte, in key order — this strip is the Game tab's answer to the
@@ -91,7 +71,7 @@
 
 <!-- ── Top bar: one row — readout on the left, requirement 1's two controls
      pushed to the right edge ──────────────────────────────────────── -->
-<header class="topbar">
+<header class="topbar" data-status={state.status}>
   <div class="brand-row game-brand-row">
     <div class="game-brand">survive</div>
 
@@ -129,10 +109,6 @@
         >{info.address_match === true ? "✅" : "❌"}</span>
       </div>
     {/if}
-
-    <div id="game-status" class="game-status" title="Run state">
-      {state.status}
-    </div>
 
     <!-- Requirement 1's two controls, on the same row and pushed to the far
          edge — the left half stays a pure readout. -->
@@ -197,58 +173,6 @@
     <div id="game-error" class="error">{state.error}</div>
   {/if}
 
-  <!-- ── HUD: read-only, fed by the scene's 4 Hz stats event ─────────── -->
-  <div class="game-hud">
-    {#if state.puzzle}
-      <span>
-        puzzle <b>#{state.puzzle.puzzle_number}</b>
-        · {state.puzzle.hex_bytes_len} bytes
-      </span>
-    {/if}
-    <span>survived <b id="game-survival">{fmtTime(state.survival)}</b></span>
-    <span>best <b id="game-best">{fmtTime(state.bestSurvival)}</b></span>
-    <span>level <b id="game-level">{state.level}</b></span>
-    <span>xp <b id="game-xp">{state.xp}/{state.xpNext}</b></span>
-    <span>
-      <!-- `maxHp` is a product of 1.05s in the sim and carries float dust
-           (`1.5 * 1.05` is not `1.575`), so the ceiling is rounded for display
-           rather than rounded in the sim, where it would compound. -->
-      hp <b id="game-hp">{Math.ceil(state.hp)}/{Math.round(state.maxHp)}</b>
-      <span class="hp-bar" aria-hidden="true">
-        <span class="hp-fill" style="width: {Math.round(hpFrac * 100)}%"></span>
-      </span>
-    </span>
-    <span>kills <b id="game-kills">{state.kills}</b></span>
-    <span title="Walk within 5px of a potion to collect it">
-      drops
-      {#each loot as item (item.kind)}
-        <span class="loot-count">
-          <span class="loot-dot loot-{item.kind}" title={LOOT_LABEL[item.kind]}></span>
-          <b>{item.count}</b>
-        </span>
-      {/each}
-    </span>
-    <!-- One number, not a rate: the key advances when the world changes, so
-         "keys sampled" is the whole of what the run has cost. There is no
-         cadence to report, and printing one would invent a knob. -->
-    <span title="Every key this run has handed to the backend">keys <b id="game-keys">{state.keysScanned}</b></span>
-
-    <!-- Requirement 5's reveal, made visible (design §14.4). The canvas
-         deliberately does not paint the fog — the user asked for the robot's
-         knowledge to stay off the arena — so this is the only place the
-         difference between "seen" and "known" is observable. -->
-    {#if state.robot}
-      <span
-        id="game-intent"
-        class="hud-robot"
-        title="What the robot is doing, and how many monsters it has numbers for"
-      >
-        auto <b>{state.robotIntent ?? "…"}</b>
-        · known <b>{state.robotKnown}/{state.robotSeen}</b>
-      </span>
-    {/if}
-  </div>
-
   <!-- The bytes the gameplay is driving. This is the game's answer to the Hex
        tab's grid: same slot in the layout, different thing pushing it. -->
   {#if bytePairs.length > 0}
@@ -272,8 +196,56 @@
     {/key}
   {/if}
 
-  <div class="game-stage">
-    <div class="game-host" bind:this={host}></div>
+  <!-- The play area and its stat strip are one block: the stats are a caption
+       on the arena, so they take this block's tight gap rather than
+       `.game-main`'s 28px rhythm, which separates blocks. -->
+  <div class="game-arena">
+    <div class="game-stage">
+      <div class="game-host" bind:this={host}></div>
+    </div>
+
+    <!-- ── HUD: read-only, fed by the scene's 4 Hz stats event ─────────── -->
+    <div class="game-hud">
+      {#if state.puzzle}
+        <span>
+          puzzle <b>#{state.puzzle.puzzle_number}</b>
+          · {state.puzzle.hex_bytes_len} bytes
+        </span>
+      {/if}
+      <span>survived <b id="game-survival">{fmtTime(state.survival)}</b></span>
+      <span>best <b id="game-best">{fmtTime(state.bestSurvival)}</b></span>
+      <span>level <b id="game-level">{state.level}</b></span>
+      <span>xp <b id="game-xp">{state.xp}/{state.xpNext}</b></span>
+      <span>
+        <!-- `maxHp` is a product of 1.05s in the sim and carries float dust
+             (`1.5 * 1.05` is not `1.575`), so the ceiling is rounded for display
+             rather than rounded in the sim, where it would compound. -->
+        hp <b id="game-hp">{Math.ceil(state.hp)}/{Math.round(state.maxHp)}</b>
+        <span class="hp-bar" aria-hidden="true">
+          <span class="hp-fill" style="width: {Math.round(hpFrac * 100)}%"></span>
+        </span>
+      </span>
+      <span>kills <b id="game-kills">{state.kills}</b></span>
+      <!-- One number, not a rate: the key advances when the world changes, so
+           "keys sampled" is the whole of what the run has cost. There is no
+           cadence to report, and printing one would invent a knob. -->
+      <span title="Every key this run has handed to the backend">keys <b id="game-keys">{state.keysScanned}</b></span>
+
+      <!-- Requirement 5's reveal, made visible (design §14.4). The canvas
+           deliberately does not paint the fog — the user asked for the robot's
+           knowledge to stay off the arena — so this is the only place the
+           difference between "seen" and "known" is observable. -->
+      {#if state.robot}
+        <span
+          id="game-intent"
+          class="hud-robot"
+          title="What the robot is doing, and how many monsters it has numbers for"
+        >
+          auto <b>{state.robotIntent ?? "…"}</b>
+          · known <b>{state.robotKnown}/{state.robotSeen}</b>
+        </span>
+      {/if}
+    </div>
   </div>
 
   {#if !state.puzzle}

@@ -144,7 +144,13 @@ async function run() {
   const tab = (name) => page.locator(".tabbar .tab", { hasText: name });
   const keys = () => page.evaluate(() => window.__KEYS_SEEN__);
   const runLabel = () => page.locator("#btn-run").textContent();
-  const status = async () => (await page.locator("#game-status").textContent()).trim();
+  // The run state is no longer painted as a chip on the title row — the arena's
+  // own overlay says READY / PAUSED / GAME OVER where the player is looking. The
+  // state machine still drives the pause protocol, so the suite reads it off the
+  // header's `data-status` rather than losing the coverage. Only the Game tab's
+  // topbar carries the attribute, so the selector stays unambiguous.
+  const status = async () =>
+    ((await page.locator("header.topbar[data-status]").getAttribute("data-status")) ?? "").trim();
 
   await page.goto(BASE_URL, { waitUntil: "networkidle" });
   await page.waitForSelector("#grid .cell", { timeout: 10000 });
@@ -188,9 +194,10 @@ async function run() {
   // feeds. A fresh run is `0/100`, and the pair is what the player watches.
   const xp = ((await page.locator("#game-xp").textContent()) ?? "").trim();
   assert(/^\d+\/\d+$/.test(xp), "xp renders as banked/next", xp);
-  // Requirement 3's legend: one dot per potion kind, so the colours on the
-  // canvas have somewhere to be explained.
-  assert((await page.locator(".game-hud .loot-dot").count()) === 4, "all four potions are in the HUD legend");
+  // The potion tally is gone from the HUD. Assert its absence rather than
+  // dropping the phase: a leftover `drops` row is the regression here.
+  assert((await page.locator(".game-hud .loot-dot").count()) === 0, "the HUD no longer tallies drops");
+  assert(!((await page.locator(".game-hud").textContent()) ?? "").includes("drops"), "no drops row on the HUD");
   assert((await page.locator("#game-bytes .gbyte").count()) === 8, "the 8 free bytes are on display (b=9)");
   // The key readout lives on the `survive` title row, not in a bottom panel.
   assert((await page.locator("#game-pk").count()) === 1, "the sampled key is on the title row");

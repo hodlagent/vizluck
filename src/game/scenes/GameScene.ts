@@ -187,8 +187,9 @@ interface Palette {
 /**
  * The four potion colours, read from `:root` like every other colour here.
  *
- * `styles.css` uses these same four variables for the HUD's potion legend, so
- * the dot next to "heal 3" cannot drift away from the thing on the canvas.
+ * These are the potions' only statement of identity: the HUD legend that used
+ * to explain them is gone, so the canvas glyph and its colour are the whole of
+ * what a player has to tell one drop from another.
  */
 const LOOT_FALLBACK: Record<ItemKind, string> = {
   heal: "#2ecc71",
