@@ -157,6 +157,49 @@ async function run() {
       check(true, "every spawn lands inside its own region");
     }
 
+    // ── §5.1 Movement is a *speed*, in all eight directions ────────────────
+    //
+    // The player used to move by `(dx, dy) × moveSpeed × dt` **without
+    // normalising**, while monsters walked along unit `DIR_VECTORS` — so a
+    // diagonal travelled √2 × moveSpeed (226.3 px/s against a stated 160) and
+    // holding two keys was free speed. That is the "移动的太快了，跟瞬移一样，
+    // 明显不符合它的 move speed" report. The robot's probe step depends on the
+    // fix too: it is `moveSpeed × PROBE_S` in every direction, so if a diagonal
+    // ever travels further again, `decide` starts weighing a step it cannot take.
+    {
+      const dt = 1 / 60;
+      const want = sim.TUNING.moveSpeed * dt;
+      const steps = [];
+      for (const dx of [-1, 0, 1]) {
+        for (const dy of [-1, 0, 1]) {
+          if (dx === 0 && dy === 0) continue;
+          const s = fresh();
+          // Nothing to bump into and nothing to be pushed by: the step is the
+          // only thing that moves the player.
+          s.monsters.length = 0;
+          const x0 = s.player.posX;
+          const y0 = s.player.posY;
+          sim.stepSim(s, { dx, dy }, dt);
+          steps.push({ dir: `${dx},${dy}`, d: Math.hypot(s.player.posX - x0, s.player.posY - y0) });
+        }
+      }
+      const off = steps.filter((s) => Math.abs(s.d - want) >= 1e-9);
+      check(
+        off.length === 0,
+        "all eight directions move exactly moveSpeed × dt",
+        off.length
+          ? off.map((s) => `${s.dir}: ${s.d.toFixed(4)}`).join(" ")
+          : `${want.toFixed(4)}px per step`,
+      );
+      // Pinned to the literal, so retuning `moveSpeed` has to come here and say
+      // so rather than sliding through.
+      check(
+        Math.abs(steps.find((s) => s.dir === "1,0").d - 160 * dt) < 1e-9,
+        "and moveSpeed is the 160 the tuning table advertises",
+        `${(steps.find((s) => s.dir === "1,0").d / dt).toFixed(1)} px/s`,
+      );
+    }
+
     // ── §6.2 The leash ─────────────────────────────────────────────────────
     {
       const s = fresh();

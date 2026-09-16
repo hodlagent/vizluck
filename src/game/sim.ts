@@ -598,8 +598,15 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
   const fromY = p.posY;
   if (input.dx !== 0 || input.dy !== 0) {
     p.dir = dirFromVector(input.dx, input.dy);
-    p.posX = clamp(p.posX + input.dx * p.moveSpeed * dt, 0, s.width);
-    p.posY = clamp(p.posY + input.dy * p.moveSpeed * dt, 0, s.height);
+    // Normalised, so `moveSpeed` is a *speed* in every direction rather than
+    // only along the axes. Without this a diagonal moved `√2 × moveSpeed` —
+    // measured at 226.3 px/s against a stated 160 — because the two components
+    // were scaled independently. Monsters already move along unit `DIR_VECTORS`,
+    // so this also puts the player on the same footing as everything else in the
+    // arena, and the displacement now matches `p.dir` exactly.
+    const len = Math.hypot(input.dx, input.dy);
+    p.posX = clamp(p.posX + (input.dx / len) * p.moveSpeed * dt, 0, s.width);
+    p.posY = clamp(p.posY + (input.dy / len) * p.moveSpeed * dt, 0, s.height);
   }
 
   // ── Potions on the floor (design §8.3) ───────────────────────────────────
