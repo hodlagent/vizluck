@@ -40,6 +40,7 @@ import {
   type GameStats,
 } from "../config";
 import {
+  bombLanding,
   buildRegions,
   createSim,
   MONSTER_ARCHETYPES,
@@ -57,6 +58,7 @@ import {
   type ItemKind,
   type MonsterKind,
   type MoveInput,
+  type ProjectileKind,
   type RegionConfig,
 } from "../types";
 import {
@@ -94,7 +96,17 @@ const PLAYER_RADIUS = TUNING.playerRadius;
  * and makes the rest of the map quiet.
  */
 const SENSE_RING_MARGIN = 60;
-const MONSTER_RADIUS: Record<MonsterKind, number> = { wanderer: 6, hunter: 7, brute: 11 };
+
+/**
+ * A monster's body radius, read out of the sim's archetype table.
+ *
+ * This table used to live here, as a `Record<MonsterKind, number>`. It moved
+ * into `MONSTER_ARCHETYPES` when shots arrived (design §15): the sim hit-tests
+ * a bullet against this same number, so a second copy in the renderer would be
+ * a second opinion about how big a target is — and §10.3's whole point is that
+ * the drawn radius and the judged radius are one decision, made once.
+ */
+const monsterRadius = (kind: MonsterKind): number => MONSTER_ARCHETYPES[kind].radius;
 
 /**
  * A potion's visual radius, deliberately *the* `TUNING.pickupRadius` — the
@@ -113,6 +125,15 @@ const PLAYER_RING_SPACING = 13;
 
 /** Trail length, in samples. Twelve at 60fps is about a fifth of a second. */
 const TRAIL_MAX = 12;
+/**
+ * A bullet's tracer length, in px — drawn *behind* the shot, never ahead of it.
+ *
+ * At 520px/s and 60fps a player's bullet moves 8.7px per frame, so a 7px tail
+ * is about one frame of its own travel: the tracer spans the gap it just
+ * crossed, which is what makes a 2.5px head findable without drawing it any
+ * bigger than it is judged.
+ */
+const TRACER = 7;
 /** Seconds of white flash on a monster that just took a hit. */
 const HIT_FLASH_S = 0.14;
 /** Seconds the swing arc stays on screen. */
@@ -321,7 +342,36 @@ interface Tracked {
   kind: MonsterKind;
   hp: number;
   flash: number;
+  /**
+   * The monster's `attackCooldown` the last time it was seen. Like the player's,
+   * it only ever jumps *up*, and only when the monster shoots — so the jump is
+   * the whole of the "something just left that monster" signal, with nothing
+   * added to the sim for it.
+   */
+  cooldown: number;
   /** Frame marker, so a monster that vanished can be found without a Set. */
+  stamp: number;
+}
+
+/**
+ * Per-shot bookkeeping, on exactly the terms `TrackedItem` is on.
+ *
+ * A shot leaves `sim.projectiles` for one of two reasons — it hit something, or
+ * it ran out of range — and, exactly like a potion's `life`, the last value the
+ * renderer saw already distinguishes them, so no distance test is needed and
+ * none is used.
+ */
+interface TrackedShot {
+  /** Where it was last seen. A shot that hit never gets drawn where it landed. */
+  x: number;
+  y: number;
+  kind: ProjectileKind;
+  /** Whose shot it was, which is what picks the effect's colour. */
+  fromPlayer: boolean;
+  /** `range` on the previous frame — see the sweep in `observe()`. */
+  range: number;
+  /** Px per second. Constant for a bullet; only ever a record for a bomb. */
+  speed: number;
   stamp: number;
 }
 
@@ -357,6 +407,7 @@ export class GameScene extends Phaser.Scene {
   private trail: { x: number; y: number }[] = [];
   private tracked = new Map<number, Tracked>();
   private trackedItems = new Map<number, TrackedItem>();
+  private trackedShots = new Map<number, TrackedShot>();
   private stamp = 0;
   /** Seconds left on the player's swing arc, and the direction it went out in. */
   private swing = 0;
@@ -997,11 +1048,20 @@ export class GameScene extends Phaser.Scene {
     //    never the other way round.
     this.drawItems(g, sim);
 
-    // 7. Monsters.
+    // 7. Shots in flight (design §15). Between the decals and the bodies, so
+    //    the reticle a bomb casts is ground furniture while the bomb itself is
+    //    a thing in the arena — and so a shot is occluded by whatever it is
+    //    about to reach rather than the other way round. It costs nothing to
+    //    get that order wrong for the *hit* case either way: a shot that hits
+    //    is spliced the same step it lands, so it is never drawn inside the
+    //    body it just damaged.
+    this.drawShots(g, sim);
+
+    // 8. Monsters.
     for (const m of sim.monsters) {
       const color = p.monster[m.kind];
       const rim = p.monsterRim[m.kind];
-      const r = MONSTER_RADIUS[m.kind];
+      const r = monsterRadius(m.kind);
       const [vx, vy] = DIR_VECTORS[m.dir];
       const track = this.tracked.get(m.id);
       const flash = track ? track.flash : 0;
@@ -1055,7 +1115,7 @@ export class GameScene extends Phaser.Scene {
       this.drawHpBar(g, m.posX, m.posY - r - 9, m.hp / m.maxHp, color);
     }
 
-    // 8. Player — or its husk. Death has to change the *body*, not just dim the
+    // 9. Player — or its husk. Death has to change the *body*, not just dim the
     //    frame: a corpse still glowing green under a GAME OVER card reads as a
     //    rendering bug, and it is the last thing the run leaves on screen.
     if (!sim.alive) {
@@ -1112,7 +1172,7 @@ export class GameScene extends Phaser.Scene {
       );
     }
 
-    // 9. The swing, when there is one: a fan of dots out along the facing.
+    // 10. The swing, when there is one: a fan of dots out along the facing.
     if (this.swing > 0) {
       const f = this.swing / SWING_S;
       const base = (this.swingDir * Math.PI) / 4;
@@ -1124,7 +1184,7 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // 10. Sparks and shock rings, above everything they came from.
+    // 11. Sparks and shock rings, above everything they came from.
     for (const s of this.sparks) {
       g.fillStyle(s.color, Math.max(0, s.life / s.max));
       g.fillPoint(s.x, s.y, s.size);
@@ -1223,6 +1283,97 @@ export class GameScene extends Phaser.Scene {
       // washes the same way the husk does.
       g.lineStyle(1, p.itemRim[it.kind], 0.85 * alpha);
       g.strokeCircle(it.posX, it.posY, ITEM_RADIUS + 3);
+    }
+  }
+
+  /**
+   * Everything in the air, drawn from `sim.projectiles` (design §15).
+   *
+   * Two silhouettes, following the rule the monsters and the potions already
+   * follow — shape before colour, because colour alone stops working the moment
+   * two things overlap. A bullet is a *tracer*: a short tail laid behind the
+   * shot so the 2.5px head it is judged by is findable. A bomb is a cased disc
+   * plus a reticle on the ground where it will land.
+   *
+   * Colour carries the *side*, not the archetype: every hostile shot is red and
+   * every player shot is green. The question a shot in flight has to answer is
+   * "is that mine", and it has to answer it in the fraction of a second it is
+   * on screen — that is worth more than restating which monster threw it, which
+   * the body it came from already says.
+   */
+  private drawShots(g: Phaser.GameObjects.Graphics, sim: SimState): void {
+    const p = this.palette;
+    const t = this.clock;
+
+    for (const b of sim.projectiles) {
+      const color = b.fromPlayer ? p.green : p.red;
+      const speed = Math.hypot(b.vx, b.vy);
+      // A shot with no velocity is one `fire()` gave up on aiming (a target
+      // standing exactly on the muzzle). It still exists and still expires, so
+      // it is drawn — pointed somewhere rather than dividing by zero.
+      const ux = speed > 0 ? b.vx / speed : 1;
+      const uy = speed > 0 ? b.vy / speed : 0;
+
+      if (b.kind === "bomb") {
+        // Where it is going — the same `bombLanding` the robot reads, so the
+        // reticle on the screen and the circle the policy avoids are one point
+        // and cannot drift apart.
+        const { x: lx, y: ly } = bombLanding(b);
+        const pulse = 0.5 + 0.5 * Math.sin(t * 9);
+
+        // The reticle, at exactly `blast` across — the circle the sim tests
+        // against. The player's own body is *not* added to it, on the same
+        // terms as a potion on the floor: what is drawn is the object, and the
+        // rule is two bodies touching. A warning that lied about its own size
+        // would be worse than no warning at all.
+        g.fillStyle(color, 0.1 + 0.06 * pulse);
+        g.fillCircle(lx, ly, b.blast);
+        g.lineStyle(1.5, color, 0.45 + 0.3 * pulse);
+        g.strokeCircle(lx, ly, b.blast);
+        // A hairline inside it, so the reticle reads as a reticle at a glance
+        // instead of as one more aggro ring.
+        g.lineStyle(1, color, 0.18);
+        g.strokeCircle(lx, ly, b.blast - 4);
+        // The thread from the bomb to the ground it is aimed at. Without it the
+        // reticle is a circle that merely happens to share a screen with a red
+        // dot; with it, the dot is *aiming* at the circle, which is the whole
+        // read the fuse buys.
+        g.lineStyle(1, color, 0.22);
+        g.beginPath();
+        g.moveTo(b.posX, b.posY);
+        g.lineTo(lx, ly);
+        g.strokePath();
+
+        // The casing: a dark rim so it stays a thing over its own reticle, a
+        // lit core, and an off-centre highlight to say it is a solid object and
+        // not a flat marker.
+        g.fillStyle(0x140a0a, 1);
+        g.fillCircle(b.posX, b.posY, 4.5);
+        g.fillStyle(color, 1);
+        g.fillCircle(b.posX, b.posY, 3);
+        g.fillStyle(shade(color, 0.72), 1);
+        g.fillCircle(b.posX - ux * 0.9 - uy * 0.9, b.posY - uy * 0.9 + ux * 0.9, 1.3);
+        continue;
+      }
+
+      // A bullet dims as it spends its range, so a shot about to fizzle reads
+      // as spent *before* it does rather than vanishing at full brightness.
+      const spent = Math.max(0, Math.min(1, b.range / 30));
+      const alpha = 0.35 + 0.65 * spent;
+
+      g.lineStyle(2.5, color, 0.5 * alpha);
+      g.beginPath();
+      g.moveTo(b.posX - ux * (TRACER + 3), b.posY - uy * (TRACER + 3));
+      g.lineTo(b.posX, b.posY);
+      g.strokePath();
+      // The head, at `bulletRadius` — the radius the sim hit-tests with, and
+      // the leading end of the tracer, so the thing that is judged is the thing
+      // that is drawn as the tip. The rim around it is glow, on the same terms
+      // as a monster's halo, not a second opinion about its size.
+      g.fillStyle(0xffffff, 0.85 * alpha);
+      g.fillCircle(b.posX, b.posY, TUNING.bulletRadius);
+      g.lineStyle(1.5, color, 0.85 * alpha);
+      g.strokeCircle(b.posX, b.posY, TUNING.bulletRadius + 1.5);
     }
   }
 
@@ -1344,8 +1495,10 @@ export class GameScene extends Phaser.Scene {
     this.tracked.clear();
     // Not optional: `createSim` restarts `nextId` at 1, so a surviving entry
     // from the previous run collides with a brand-new item's id and throws a
-    // phantom pickup effect onto the first frames of the next run.
+    // phantom pickup effect onto the first frames of the next run. Shots draw
+    // their ids from the same counter and need the same clearing.
     this.trackedItems.clear();
+    this.trackedShots.clear();
     this.swing = 0;
     this.hurt = 0;
     this.announceLife = 0;
@@ -1398,6 +1551,13 @@ export class GameScene extends Phaser.Scene {
     if (sim.attackCooldown > before.cooldown) {
       this.swing = SWING_S;
       this.swingDir = player.dir;
+      // …and a puff at the muzzle, which is new: the attack now puts something
+      // in the air (design §15), so "I attacked" is no longer the whole of what
+      // just happened. The arc still says the swing happened — the arc is aimed
+      // by `player.dir` and the shot by the line to its target, and the two can
+      // disagree, which is honest: the player swings where they face and the
+      // auto-attack reaches out to whatever it found.
+      this.spray(player.posX, player.posY, p.green, 4, 110);
     }
 
     if (sim.level > before.level) {
@@ -1422,7 +1582,15 @@ export class GameScene extends Phaser.Scene {
     for (const m of sim.monsters) {
       let track = this.tracked.get(m.id);
       if (!track) {
-        track = { x: m.posX, y: m.posY, kind: m.kind, hp: m.hp, flash: 0, stamp: this.stamp };
+        track = {
+          x: m.posX,
+          y: m.posY,
+          kind: m.kind,
+          hp: m.hp,
+          flash: 0,
+          cooldown: m.attackCooldown,
+          stamp: this.stamp,
+        };
         this.tracked.set(m.id, track);
         continue;
       }
@@ -1430,10 +1598,20 @@ export class GameScene extends Phaser.Scene {
         track.flash = HIT_FLASH_S;
         this.spray(m.posX, m.posY, p.monsterRim[m.kind], 3, 60);
       }
+      // The monster's own shot leaving it, read the same way the player's is:
+      // `attackCooldown` is reset to `1 / attackSpeed` when it fires and only
+      // ever counts down otherwise, so a jump up is a shot and nothing else is.
+      // Colour is the body's rather than the shot's — this puff is about *that
+      // monster* acting, which is a different question from which side the shot
+      // in the air belongs to.
+      if (m.attackCooldown > track.cooldown) {
+        this.spray(m.posX, m.posY, p.monster[m.kind], 3, 70);
+      }
       track.x = m.posX;
       track.y = m.posY;
       track.kind = m.kind;
       track.hp = m.hp;
+      track.cooldown = m.attackCooldown;
       track.stamp = this.stamp;
     }
 
@@ -1445,8 +1623,8 @@ export class GameScene extends Phaser.Scene {
       this.bursts.push({
         x: track.x,
         y: track.y,
-        r: MONSTER_RADIUS[track.kind],
-        maxR: MONSTER_RADIUS[track.kind] + 22,
+        r: monsterRadius(track.kind),
+        maxR: monsterRadius(track.kind) + 22,
         life: 0.3,
         max: 0.3,
         color,
@@ -1458,7 +1636,7 @@ export class GameScene extends Phaser.Scene {
       this.spawnFloater(
         `+${MONSTER_ARCHETYPES[track.kind].xp}`,
         track.x,
-        track.y - MONSTER_RADIUS[track.kind] - 4,
+        track.y - monsterRadius(track.kind) - 4,
         p.accent,
       );
     }
@@ -1520,6 +1698,79 @@ export class GameScene extends Phaser.Scene {
         // Timed out: quiet, and where it lay. It is a missed opportunity, not
         // an event — a burst here would read as a pickup.
         this.spray(track.x, track.y, color, 4, 28);
+      }
+    }
+
+    // Shots: the third sweep, on this frame's stamp. Same discriminator trick
+    // as the potions, one level down: a bullet is removed for running out of
+    // range only on the step whose *previous* range was already within one step
+    // of zero (the sim spends range before it tests it), so a shot that
+    // vanished carrying more than `speed * dt` was removed by a hit.
+    //
+    // This is sound but not complete — a hit inside the bullet's last step is
+    // indistinguishable from a fizzle and gets the quiet puff. That case needs
+    // no compensating lie, because the victim is being flashed and sprayed by
+    // the monster sweep above in the very same frame: the hit is announced
+    // exactly, by the thing that was hit, at the moment it was hit.
+    for (const b of sim.projectiles) {
+      const shot = this.trackedShots.get(b.id);
+      if (!shot) {
+        this.trackedShots.set(b.id, {
+          x: b.posX,
+          y: b.posY,
+          kind: b.kind,
+          fromPlayer: b.fromPlayer,
+          range: b.range,
+          speed: Math.hypot(b.vx, b.vy),
+          stamp: this.stamp,
+        });
+        continue;
+      }
+      shot.x = b.posX;
+      shot.y = b.posY;
+      shot.range = b.range;
+      shot.stamp = this.stamp;
+    }
+
+    for (const [id, shot] of this.trackedShots) {
+      if (shot.stamp === this.stamp) continue;
+      this.trackedShots.delete(id);
+      const color = shot.fromPlayer ? p.green : p.red;
+
+      if (shot.kind === "bomb") {
+        // A bomb is never spent — it leaves the list by going off, and that is
+        // the only way it leaves. So this branch is unconditional, and the ring
+        // is `blast` across: the circle the reticle promised and the circle the
+        // sim tested are one number, published twice.
+        this.bursts.push({
+          x: shot.x,
+          y: shot.y,
+          r: TUNING.bulletRadius,
+          maxR: TUNING.bombBlast,
+          life: 0.3,
+          max: 0.3,
+          color,
+          width: 3,
+        });
+        this.spray(shot.x, shot.y, color, 12, 150);
+      } else if (shot.range > shot.speed * dt) {
+        this.spray(shot.x, shot.y, color, 5, 90);
+        this.bursts.push({
+          x: shot.x,
+          y: shot.y,
+          r: TUNING.bulletRadius,
+          maxR: TUNING.bulletRadius + 12,
+          life: 0.16,
+          max: 0.16,
+          color,
+          width: 1.5,
+        });
+      } else {
+        // Spent, and quiet on purpose: 110px of flight is a real cost and the
+        // shot dying at the end of it is a non-event. The loud version here
+        // would claim a hit that never happened, which is the one thing a
+        // combat readout must not do.
+        this.spray(shot.x, shot.y, color, 3, 30);
       }
     }
   }

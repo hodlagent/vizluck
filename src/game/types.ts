@@ -120,6 +120,53 @@ export interface ItemStats {
   life: number;
 }
 
+// ── Projectiles (design §15) ────────────────────────────────────────────────
+
+/**
+ * The two shapes of shot. Which one a monster throws follows its archetype
+ * (design §15), reusing §6's "one archetype, one silhouette" language: the
+ * wanderer and the hunter fire bullets, the brute lobs a bomb.
+ */
+export type ProjectileKind = "bullet" | "bomb";
+
+/**
+ * A shot in flight. Damage is carried to the impact, not applied at the muzzle
+ * (design §15) — so "the target walked away" is a real outcome, and the shot's
+ * own travel time is the second dodge window §7 talks about.
+ *
+ * Deliberately **absent from `GameSnapshot`**, for the same reason potions are
+ * (`ItemStats` above): a shot is not key material. It reaches the key only
+ * indirectly, by moving the player and monster stats `V` already carries — and
+ * `V`'s fixed length is load-bearing, so a projectile window would shift every
+ * byte's owner and make the HUD's ownership readout jump on every shot fired.
+ */
+export interface ProjectileStats {
+  id: number;
+  kind: ProjectileKind;
+  /** Fired by the player (hits monsters) or at the player (hits the player). */
+  fromPlayer: boolean;
+  /**
+   * Velocity in px/s, as a true float vector rather than one of the 8 `Dir`s.
+   *
+   * The auto-attack aims at a *monster*, and the line to it is almost never one
+   * of the 8 compass directions. Rounding to `Dir` would turn "fire at the
+   * nearest monster" into "fire at the nearest direction", which at 55px is a
+   * miss by up to 21px — wider than a monster's body.
+   */
+  vx: number;
+  vy: number;
+  posX: number;
+  posY: number;
+  /** Damage carried to the impact, or to the blast for a bomb. */
+  damage: number;
+  /** Px left to travel before the shot expires. `<= 0` means it fizzled. */
+  range: number;
+  /** Seconds of flight left on a bomb's fuse; unused by bullets (0). */
+  fuse: number;
+  /** Blast radius in px. 0 for a bullet — the field a `kind` switch reads. */
+  blast: number;
+}
+
 // ── Scene (design §4, requirement 4) ────────────────────────────────────────
 
 /** Where a region sits in the 3x3 grid; drives its difficulty tier. */

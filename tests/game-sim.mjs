@@ -248,6 +248,10 @@ async function run() {
       const s = fresh();
       s.monsters.length = 0;
       s.player.hp = 5;
+      // Regen off, so the only thing moving `hp` in this block is the brute —
+      // otherwise `sinceDamage` past the delay drips 0.05/step back in and the
+      // "damage has not landed yet" assertion below could not be exact.
+      s.sinceDamage = 0;
       s.player.posX = s.configs[0].x + 40;
       s.player.posY = s.configs[0].y + 40;
       const brute = {
@@ -258,8 +262,21 @@ async function run() {
       };
       s.monsters.push(brute);
 
+      // The wound no longer happens on contact (design §15): the brute's swing
+      // throws a bomb, and the damage arrives when that lands. This is the case
+      // that used to be a one-step kill.
       sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
-      check(s.alive === false, "hp reaching 0 ends the run");
+      check(s.alive === true, "a brute's swing no longer wounds on contact");
+      check(s.projectiles.length === 1, "it throws a bomb instead", s.projectiles.length);
+      check(s.projectiles[0]?.kind === "bomb", "and the brute's shot is the bomb one");
+      check(s.player.hp === 5, "so the damage has not landed yet", s.player.hp);
+
+      let steps = 1;
+      while (s.alive && steps < 40) {
+        sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+        steps++;
+      }
+      check(s.alive === false, "hp reaching 0 ends the run", `${steps} steps to land`);
       check(s.player.hp === 0, "hp floors at 0 rather than going negative", s.player.hp);
 
       const frozenAt = s.time;
@@ -268,6 +285,7 @@ async function run() {
       check(s.time === frozenAt, "the survival clock is frozen after death", s.time);
       check(s.tick === frozenTick, "the sim stops stepping after death");
       check(s.kills === 0, "a dead player kills nothing");
+      check(s.projectiles.length === 0, "and nothing is left in the air", s.projectiles.length);
     }
 
     // ── Respawn (§4, "n 秒后刷新") ─────────────────────────────────────────
@@ -354,58 +372,77 @@ async function run() {
       );
 
       // ...and it reaches a spawn that happens *after* the minute, not before.
-      {
-        const home = 4;
-        const cfg = fresh().configs[home];
-        const early = fresh();
-        const m0 = solo(early, "hunter", home, () => {});
-        m0.hp = 1;
-        m0.posX = early.player.posX;
-        m0.posY = early.player.posY;
-        early.attackCooldown = 0;
-        sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
-
-        const s = fresh();
-        const m = solo(s, "hunter", home, () => {});
-        m.hp = 1;
-        m.posX = s.player.posX;
-        m.posY = s.player.posY;
+      //
+      // Both puppets here are killed at point-blank, and the blank is set up by
+      // putting the **player** on the monster rather than the monster on the
+      // player. Two things make that the only arrangement that works now: a
+      // monster outside its home region is snapped back inside it by the wander
+      // clamp, and a shot is tested *after* the monsters have moved this step
+      // (design §15). So parking the monster on the player's spawn point while
+      // it claims region 4 moved it ~330px away in the very step being measured,
+      // and the shot missed. That was invisible for as long as the attack was
+      // hit-scan and resolved before the monster loop ever ran. The player is
+      // not leashed and can stand wherever a check needs them to.
+      const home = 4;
+      const cfg = fresh().configs[home];
+      const at = (s) => {
+        const m = solo(s, "hunter", home, (mm) => {
+          mm.posX = cfg.x + cfg.w / 2;
+          mm.posY = cfg.y + cfg.h / 2;
+          mm.hp = 1;
+        });
+        s.player.posX = m.posX;
+        s.player.posY = m.posY;
         s.attackCooldown = 0;
-        s.time = sim.TUNING.monsterHpEvery; // one minute already survived
-        sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
-        check(s.kills === 1, "the puppet dies in both arms of the HP check");
+        return m;
+      };
 
-        let t = 0;
-        while (t < cfg.respawnSeconds + 0.3) {
-          sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
-          sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
-          t += 0.05;
-        }
-        // Both respawns happened after minute 1 for `s` and minute 0 for
-        // `early`, so the pair isolates the multiplier from the archetype.
-        check(
-          near(early.monsters[0]?.maxHp ?? 0, 35, 1e-9),
-          "a monster spawned in the first minute has the archetype's raw hp",
-          early.monsters[0]?.maxHp,
-        );
-        check(
-          near(s.monsters[0]?.maxHp ?? 0, 35 * 1.05, 1e-6),
-          "a monster spawned after a minute has ×1.05 hp",
-          s.monsters[0]?.maxHp,
-        );
-        check(
-          s.monsters[0]?.hp === s.monsters[0]?.maxHp,
-          "it spawns at full health, not merely with a bigger ceiling",
-        );
+      const early = fresh();
+      at(early);
+      sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
+
+      const s = fresh();
+      at(s);
+      s.time = sim.TUNING.monsterHpEvery; // one minute already survived
+      sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+      check(s.kills === 1, "the puppet dies in both arms of the HP check", s.kills);
+
+      let t = 0;
+      while (t < cfg.respawnSeconds + 0.3) {
+        sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
+        sim.stepSim(early, { dx: 0, dy: 0 }, 0.05);
+        t += 0.05;
       }
+      // Both respawns happened after minute 1 for `s` and minute 0 for
+      // `early`, so the pair isolates the multiplier from the archetype.
+      check(
+        near(early.monsters[0]?.maxHp ?? 0, 35, 1e-9),
+        "a monster spawned in the first minute has the archetype's raw hp",
+        early.monsters[0]?.maxHp,
+      );
+      check(
+        near(s.monsters[0]?.maxHp ?? 0, 35 * 1.05, 1e-6),
+        "a monster spawned after a minute has ×1.05 hp",
+        s.monsters[0]?.maxHp,
+      );
+      check(
+        s.monsters[0]?.hp === s.monsters[0]?.maxHp,
+        "it spawns at full health, not merely with a bigger ceiling",
+      );
 
       // Level-up: the ceiling moves, the current hp does not (design §8.2).
       {
         const s = bare();
-        const m = solo(s, "hunter", 4, () => {});
-        m.hp = 1;
-        m.posX = s.player.posX;
-        m.posY = s.player.posY;
+        const cfg = s.configs[4];
+        const m = solo(s, "hunter", 4, (mm) => {
+          mm.posX = cfg.x + cfg.w / 2;
+          mm.posY = cfg.y + cfg.h / 2;
+          mm.hp = 1;
+        });
+        // The player comes to the monster, for the leash reason above — and
+        // stands *on* it, so the shot is fired at zero range and still lands.
+        s.player.posX = m.posX;
+        s.player.posY = m.posY;
         s.attackCooldown = 0;
         s.xp = 95; // hunter pays 20, so this crosses the 100-point bar
         s.player.hp = 50;
@@ -623,6 +660,304 @@ async function run() {
           "potions on the floor do not touch the state vector",
           `${withItems.join(",")} vs ${without.join(",")}`,
         );
+      }
+    }
+
+    // ── §15 Shots in flight ────────────────────────────────────────────────
+    //
+    // Combat stopped being hit-scan: damage rides the projectile and lands when
+    // it lands, so these checks are about *when* a wound arrives and what makes
+    // it never arrive at all — which is the whole reason the mechanic exists.
+    //
+    // Every check below puts the **player** where it wants the fight, never
+    // drags a monster out of its home region (the wander clamp snaps it back
+    // mid-step) and never assumes a shot resolves on the step it was fired.
+    {
+      const near = (a, b, eps = 1e-9) => Math.abs(a - b) <= eps;
+      const T = sim.TUNING;
+
+      /**
+       * The player at region 4's centre, one puppet `dist` px east of them.
+       * `tune` adjusts the puppet before the first step.
+       */
+      const arena = (kind, dist, tune) => {
+        const s = fresh();
+        const cfg = s.configs[4];
+        s.player.posX = cfg.x + cfg.w / 2;
+        s.player.posY = cfg.y + cfg.h / 2;
+        // No regen, for the same reason `bare()` suppresses it: an "hp is
+        // unchanged" assertion would otherwise fail on a drip tick.
+        s.sinceDamage = 0;
+        const m = solo(s, kind, 4, (mm) => {
+          mm.posX = s.player.posX + dist;
+          mm.posY = s.player.posY;
+          if (tune) tune(mm);
+        });
+        return { s, m };
+      };
+      const step = (s, input = { dx: 0, dy: 0 }, dt = 0.05) => sim.stepSim(s, input, dt);
+
+      // The swing is no longer the wound. A shot leaves the muzzle and the
+      // damage shows up where it stops, not on the step the player swung.
+      {
+        const { s, m } = arena("hunter", 40, (mm) => { mm.hp = 100; mm.maxHp = 100; });
+        s.attackCooldown = 0;
+        step(s);
+
+        check(s.projectiles.length === 1, "a swing puts a shot in the air", s.projectiles.length);
+        const shot = s.projectiles[0];
+        check(shot.kind === "bullet" && shot.fromPlayer, "the player's shot is a friendly bullet");
+        check(
+          near(Math.hypot(shot.vx, shot.vy), T.bulletSpeed),
+          "and it travels at bulletSpeed",
+          Math.hypot(shot.vx, shot.vy),
+        );
+        check(m.hp === 100, "the damage has not landed yet", m.hp);
+        check(s.kills === 0, "nothing dies at the muzzle");
+
+        // 40px away, 26px per step: the second step is the one that crosses.
+        step(s);
+        check(s.projectiles.length === 0, "the next step lands it", s.projectiles.length);
+        check(near(m.hp, 100 - s.player.attackPower), "for exactly the attack power", m.hp);
+        check(s.kills === 0, "without killing it");
+      }
+
+      // A shot is aimed at where the target *stood*, so walking out of the line
+      // is a real dodge — §7's second dodge window, made of geometry rather
+      // than of a dice roll. The bullet then spends its range on nothing.
+      {
+        const { s, m } = arena("hunter", 40, (mm) => { mm.hp = 100; mm.maxHp = 100; });
+        s.attackCooldown = 0;
+        step(s);
+        check(s.projectiles.length === 1, "a shot is in the air");
+        // Still inside region 4 and still inside sense range — just no longer
+        // on the bullet's line.
+        m.posY = s.player.posY - 70;
+
+        let lastRange = null;
+        for (let i = 0; i < 12 && s.projectiles.length > 0; i++) {
+          lastRange = s.projectiles[0].range;
+          step(s);
+        }
+        check(s.projectiles.length === 0, "the shot is gone", s.projectiles.length);
+        check(m.hp === 100, "and the target it was aimed at is untouched", m.hp);
+        // It died of range, not of impact. That distinction is exactly what the
+        // scene reads to tell a hit from a fizzle: a shot that vanished with
+        // range still on the clock was stopped by something.
+        check(
+          lastRange !== null && lastRange <= T.bulletSpeed * 0.05,
+          "it fizzled on range rather than on impact",
+          lastRange,
+        );
+      }
+
+      // Two bodies touching is the test (§8.4), taken along the step rather than
+      // at its ends: at `maxDt` the player's bullet covers 26px, wide enough to
+      // fit a whole monster between two frames. 12px is outside the 9.5px reach
+      // at *both* ends of the step and dead on the line between them, so a test
+      // that only sampled the endpoints would miss what this one hits.
+      {
+        const { s, m } = arena("hunter", 12, (mm) => { mm.hp = 100; mm.maxHp = 100; });
+        s.attackCooldown = 0;
+        step(s);
+        check(s.projectiles.length === 0, "a shot crosses a body rather than through it");
+        check(near(m.hp, 100 - s.player.attackPower), "and hits it between the endpoints", m.hp);
+      }
+
+      // The brute lobs instead of wounding: `attackPower` arrives 0.4s later, on
+      // the spot the player was standing on, and only inside `bombBlast`.
+      {
+        const { s } = arena("brute", 16, (mm) => { mm.attackCooldown = 0; mm.attackPower = 18; });
+        step(s);
+
+        check(s.projectiles.length === 1, "a brute's swing puts something in the air");
+        const bomb = s.projectiles[0];
+        check(bomb.kind === "bomb", "and what it throws is a bomb", bomb.kind);
+        // Barely lit, not untouched: the phase that flies it runs in the same
+        // step that created it, so a bomb read straight after the throw has
+        // already spent one `dt` of fuse.
+        check(
+          bomb.fuse >= T.bombFuse - T.maxDt && bomb.fuse <= T.bombFuse,
+          "with a fuse that has only just been lit",
+          bomb.fuse,
+        );
+        check(near(bomb.blast, T.bombBlast), "and a blast radius", bomb.blast);
+        check(s.player.hp === T.hp, "no damage at the throw", s.player.hp);
+
+        let hurtInFlight = false;
+        let flight = 0;
+        while (s.projectiles.length > 0 && flight < 40) {
+          flight++;
+          step(s);
+          if (s.projectiles.length > 0 && s.player.hp !== T.hp) hurtInFlight = true;
+        }
+        check(!hurtInFlight, "nothing wounds on the way");
+        // The fuse is spent a step at a time and survives on floating-point
+        // dust — `0.4 - 8 × 0.05` is 7e-18, not 0 — so the last step of the
+        // flight is a whole step longer than the nominal fuse. That is why the
+        // window is "at least the fuse, at most the fuse plus two steps" rather
+        // than an equality.
+        check(flight * 0.05 >= T.bombFuse, "it lands no earlier than the fuse", flight * 0.05);
+        check(flight * 0.05 < T.bombFuse + 2 * 0.05, "and no more than a step late", flight * 0.05);
+        check(near(s.player.hp, T.hp - 18), "standing in the circle takes all 18", T.hp - s.player.hp);
+      }
+
+      // ...and that 0.4s is what makes the circle escapable, which is the whole
+      // of §15's claim about bombs being dodgeable. This is the check that
+      // catches the fuse being too short: at 0.3s the same run escaped by 40px
+      // against a 41px threshold and was hit anyway.
+      {
+        const { s } = arena("brute", 16, (mm) => { mm.attackCooldown = 0; mm.attackPower = 18; });
+        step(s);
+        check(s.player.hp === T.hp, "the throw is in the air");
+        // Running west, away from the brute and off the landing point.
+        for (let i = 0; i < 40 && s.projectiles.length > 0; i++) step(s, { dx: -1, dy: 0 });
+        check(s.projectiles.length === 0, "the bomb still lands", s.projectiles.length);
+        check(s.player.hp === T.hp, "but a player who runs is clear of it", s.player.hp);
+      }
+
+      // No friendly fire (design §15): the blast is the player's problem alone.
+      // §6's AI and the robot's risk model both assume monsters only ever hurt
+      // the player, and a blast that thinned the crowd would be a balance change
+      // nothing else knows about.
+      {
+        const { s, m } = arena("brute", 16, (mm) => { mm.attackCooldown = 0; mm.attackPower = 18; });
+        // A second body standing on the landing point, built from the first so
+        // every field it needs is present without a second literal to keep in
+        // sync. Parked like a puppet: no walking, no shooting, plenty of hp.
+        const bystander = {
+          ...m, id: 998, kind: "hunter", attackCooldown: 1e9,
+          posX: s.player.posX, posY: s.player.posY, hp: 100, maxHp: 100,
+        };
+        s.monsters.push(bystander);
+        s.attackCooldown = 1e9; // the player's own fire is not under test
+
+        step(s);
+        for (let i = 0; i < 40 && s.projectiles.length > 0; i++) step(s);
+        check(near(s.player.hp, T.hp - 18), "the blast catches the player", T.hp - s.player.hp);
+        check(bystander.hp === 100, "but not the monster standing in it", bystander.hp);
+      }
+
+      // Shots are not key material either: `V` is fixed-length, so a bullet in
+      // flight must not shift a single byte's owner — the potion block's
+      // assertion, made again for the newest thing on the field.
+      {
+        const { s } = arena("hunter", 40, (mm) => { mm.hp = 1e9; mm.maxHp = 1e9; });
+        s.attackCooldown = 0;
+        step(s);
+        check(s.projectiles.length === 1, "there is a shot in the air to test with");
+        const withShots = keymap.buildStateVector(sim.snapshot(s));
+        s.projectiles.length = 0;
+        const without = keymap.buildStateVector(sim.snapshot(s));
+        check(
+          withShots.length === without.length && withShots.every((b, j) => b === without[j]),
+          "a shot in flight does not touch the state vector",
+          `${withShots.join(",")} vs ${without.join(",")}`,
+        );
+      }
+
+      // A run that ends mid-flight freezes the shot with it (§9.3). The hunter's
+      // bullet gets there first — at 40px the flight is ~0.14s against the bomb's
+      // 0.4s fuse — so the bomb is still airborne when the run stops, and
+      // `stepSim`'s `alive` guard is what keeps it there. (`solo`'s puppet comes
+      // with a 20px reach, so the hunter's has to be widened to fire at 40.)
+      {
+        const { s, m } = arena("hunter", 40, (mm) => {
+          mm.attackCooldown = 0;
+          mm.attackPower = 8;
+          mm.attackRange = 60;
+          mm.hp = 100; mm.maxHp = 100;
+        });
+        const brute = {
+          ...m, id: 998, kind: "brute", attackPower: 18,
+          posX: s.player.posX - 16, posY: s.player.posY,
+        };
+        s.monsters.push(brute);
+        s.player.hp = 8;
+        s.attackCooldown = 1e9;
+
+        let frames = 0;
+        while (s.alive && frames < 40) {
+          step(s);
+          frames++;
+        }
+        check(!s.alive, "the hunter's bullet finishes a wounded player", s.player.hp);
+        check(
+          s.projectiles.some((b) => b.kind === "bomb"),
+          "with the brute's bomb still in the air",
+          s.projectiles.map((b) => b.kind).join(","),
+        );
+
+        const time = s.time;
+        const tick = s.tick;
+        const shots = s.projectiles.length;
+        for (let i = 0; i < 10; i++) step(s);
+        check(s.time === time && s.tick === tick, "and a dead run steps no further");
+        check(s.projectiles.length === shots, "frozen mid-flight rather than cleaned up", s.projectiles.length);
+      }
+
+      // Everything above leans on seeded runs being reproducible, and the shot
+      // path is the newest thing that could quietly spend a draw: aiming is
+      // deterministic (the target's position at the muzzle), so it must spend
+      // none. A draw that always returned 0.5 would still leave a trace, so the
+      // two arms are compared by draw *count*, not by outcome.
+      {
+        /** Runs a parked puppet for a second and counts the referee's draws. */
+        const draws = (shooting) => {
+          let n = 0;
+          const s = sim.createSim({ rng: () => (n++, 0.5) });
+          s.monsters.length = 0;
+          const cfg = s.configs[4];
+          s.player.posX = cfg.x + cfg.w / 2;
+          s.player.posY = cfg.y + cfg.h / 2;
+          s.sinceDamage = 0;
+          const m = solo(s, "wanderer", 4, (mm) => {
+            mm.posX = s.player.posX + 30;
+            mm.posY = s.player.posY;
+            mm.hp = 1e9;
+            mm.maxHp = 1e9;
+          });
+          s.attackCooldown = shooting ? 0 : 1e9;
+          for (let i = 0; i < 60; i++) step(s, { dx: 0, dy: 0 }, 1 / 60);
+          return { n, hurt: 1e9 - m.hp };
+        };
+        const shooting = draws(true);
+        const quiet = draws(false);
+        check(shooting.hurt > 0, "the shooting arm really does land hits", shooting.hurt);
+        check(quiet.hurt === 0, "and the quiet arm lands none", quiet.hurt);
+        check(
+          shooting.n === quiet.n,
+          "firing spends no randomness at all",
+          `${shooting.n} vs ${quiet.n}`,
+        );
+      }
+
+      // Same seed, same shots: ids, kinds and positions frame by frame, over a
+      // run long enough to kill, drop potions and respawn — the rng consumers
+      // that run alongside the shot path.
+      {
+        const run = (seed) => {
+          const s = sim.createSim({ rng: rngFrom(seed) });
+          const cfg = s.configs[4];
+          s.player.posX = cfg.x + cfg.w / 2;
+          s.player.posY = cfg.y + cfg.h / 2;
+          const frames = [];
+          for (let i = 0; i < 600; i++) {
+            step(s, { dx: 0, dy: 0 }, 1 / 60);
+            frames.push(
+              s.projectiles
+                .map((b) => `${b.id}/${b.kind}/${b.posX.toFixed(4)}/${b.posY.toFixed(4)}`)
+                .join(" "),
+            );
+          }
+          return { trace: frames.join("|"), shots: frames.filter((f) => f !== "").length };
+        };
+        const a = run(7);
+        const b = run(7);
+        const c = run(8);
+        check(a.shots > 0, "a seeded run gets shot at", a.shots);
+        check(a.trace === b.trace, "and replays shot for shot");
+        check(a.trace !== c.trace, "while a different seed does not");
       }
     }
 

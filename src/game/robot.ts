@@ -15,7 +15,7 @@
 // deliberately public in `sim.ts`; the enforcement lives here, in what this
 // module is willing to look at.
 
-import { regionIndexAtPoint, type SimState } from "./sim";
+import { bombLanding, regionIndexAtPoint, TUNING, type SimState } from "./sim";
 import type {
   Dir,
   ItemKind,
@@ -61,6 +61,44 @@ export interface PerceivedMonster {
 }
 
 /**
+ * Ground that is about to hurt, with nothing standing on it (design §15).
+ *
+ * Today that means exactly one thing — where a thrown bomb will land — and it
+ * is deliberately *not* a `Threat`. A `Threat` is a monster: something that can
+ * be farmed, fled from, chased, and counted as revealed or not. A bomb is none
+ * of those, and folding the two together would put it in the farming pool, where
+ * the robot would walk to a bomb in order to attack it.
+ *
+ * Modelled as a plain static patch, because that is what the canvas shows: a
+ * reticle on the ground for as long as the bomb is in the air, and nothing about
+ * *when* it goes off. Nothing is lost by leaving the fuse out — the patch exists
+ * for exactly the window in which it is dangerous, and the robot reading it as
+ * "do not stand here, now" is precisely what a human does with the same picture.
+ *
+ * **Bullets are deliberately not hazards**, and the asymmetry is the point of
+ * this interface rather than a gap in it. A 280px/s shot crosses a hunter's 26px
+ * reach in 0.09s, which is under human reaction time, so a robot that dodged
+ * them would be playing from information no player has and would be pretending
+ * to a skill nobody watching could reproduce. Ignoring them is the honest model
+ * — and it is also why the *bomb* is the slow shot in the first place: a
+ * constant fuse is a constant warning, and only a slow attacker needs one.
+ */
+export interface Hazard {
+  x: number;
+  y: number;
+  /**
+   * How close the player's *centre* may come before the blast lands on them:
+   * `blast` plus the player's own body, which is the exact test `sim.ts`
+   * applies — the same "two bodies touching" rule potions are collected under
+   * (§8.4). Wider than the painted reticle by the player's radius, and it has to
+   * be: the reticle is the explosion, and the robot is not a point.
+   */
+  reach: number;
+  /** What it deals to whoever is still standing there when it lands. */
+  damage: number;
+}
+
+/**
  * One frame of what the robot knows.
  *
  * Holds no clock and no previous frame: requirement 5's reveal is *not*
@@ -75,6 +113,8 @@ export interface RobotView {
   monsters: PerceivedMonster[];
   /** Potion kind, position and remaining life. The flicker is a tell (§10.3). */
   items: ItemStats[];
+  /** Bombs in the air, as the ground they are about to hit (design §15). */
+  hazards: Hazard[];
 }
 
 /** What the robot decided to do, for the HUD and for the tests. */
@@ -119,6 +159,20 @@ export function perceive(sim: SimState): RobotView {
     // Items are copied for the same reason the player is: the view must not
     // alias live sim state, or a caller could reach back through it.
     items: sim.items.map((it) => ({ ...it })),
+    // Bombs become the ground they are aimed at, and bullets are left out
+    // entirely — see `BOMB_WEIGHT` for why that asymmetry is the honest one.
+    //
+    // The composition of `reach` is where the one new import in this file comes
+    // from. `TUNING.playerRadius` is the robot's *own body*, and this module
+    // knows its own stats by definition; the fog this file enforces is about
+    // *monsters*, whose numbers live in `MONSTER_ARCHETYPES` and are still not
+    // imported here or reachable from anything the view carries.
+    hazards: sim.projectiles
+      .filter((b) => b.kind === "bomb")
+      .map((b) => {
+        const at = bombLanding(b);
+        return { x: at.x, y: at.y, reach: b.blast + TUNING.playerRadius, damage: b.damage };
+      }),
   };
 }
 
@@ -199,6 +253,40 @@ export const ROBOT = {
   PROX: 1,
 
   /**
+   * What a bomb's damage is worth in the risk field, per point of it.
+   *
+   * 1 means "a bomb reads as its own damage", which is the honest unit: the
+   * field's scale is `dps × CHASE × proximity`, and a bomb's damage is the one
+   * number the canvas does not show but the *effect* does — it is thrown by a
+   * brute the robot can see, at a reticle it can see, and paying the full hit is
+   * what stepping into that reticle actually costs. With a brute's 18 that is 54
+   * at the edge of the circle and 108 dead centre, against 28.8 for a hunter at
+   * the edge of its reach.
+   *
+   * **In the pure case this number is inert, and that is the clamp's doing, not
+   * an oversight.** Every candidate delta is clamped to `RISK_CAP`, so anything
+   * over ~4 per unit of proximity saturates: 1 and 20 produce byte-identical
+   * decisions for a robot standing in a bomb with nothing else around, and the
+   * robot leaves the circle either way. Where it stops being inert is the case
+   * that matters — an escape route that runs into something else. Step out of
+   * the blast into a hunter's reach and the raw delta is `28.8 − 54`, still a
+   * reward; at 0.2 it would be `28.8 − 10.8`, a penalty, and the robot would
+   * stand in the bomb rather than take the hunter. So the knob is live exactly
+   * where the field has to arbitrate, and flat where it does not.
+   *
+   * **Measured, and it turns out to be inert at fleet scale too.** Over the
+   * 96-seed sweep (design §14.5), 0 / 1 / 20 are the same run: median 6.49x,
+   * mean 6.57x, worst 3.56x and 96/96 reaching the cap in all three arms, with
+   * kills 23020 / 23002 / 23096, idle frames 55.7 / 55.9 / 56.0% and escapes
+   * 66 / 66 / 67%. So bombs are **not** the anti-idleness tool §14.6 hoped for
+   * — that defect is the region-border step, and no hazard term touches it.
+   * The term earns its place as correctness rather than as a fix: a human can
+   * read the reticle and step out, so a robot that ignored it would be playing
+   * a different, blinder game than the one the canvas is showing.
+   */
+  BOMB_WEIGHT: 1,
+
+  /**
    * The goal-directive weight per intent.
    *
    * **Every one of these is below `RISK_CAP` 12, and that is a live tension
@@ -207,10 +295,18 @@ export const ROBOT = {
    * of them, so "risk steers, never vetoes" (this file's own words, and the
    * comment on `RISK_CAP`) is not actually true of any rung here. `flee` used to
    * be the exception at 14; it is not any more, because 6 measured better on
-   * every survival axis (over 96 seeds: mean 6.97x against 6.61x, min 3.59x
-   * against 0.10x, 96/96 runs reaching the cap against 89/96). The one place
+   * every survival axis (over 96 seeds: mean 6.57x against 6.36x, median 6.49x
+   * against 6.44x, worst 3.56x against 0.09x, 96/96 runs reaching the cap
+   * against 93/96). The one place
    * that genuinely needs to clear the cap now says so explicitly, in
    * `KITE_CONTACT_WEIGHT`.
+   *
+   * The margin is thinner than it was recorded at (the flee-14 arm used to lose
+   * 7 seeds to the cap, now it loses 3, and its median is within 0.05x of 6's)
+   * — but the tail is what this knob is for, and the 0.09x worst seed is a
+   * robot that dies almost immediately while standing still, which no median
+   * hides. Re-measured after the ballistics change (§15); both arms on the same
+   * 96 seeds.
    */
   GOAL: { flee: 6, heal: 9, loot: 6, kite: 6, roam: 6 } as const,
 
@@ -244,16 +340,22 @@ export const ROBOT = {
    * was scored against monsters that could not touch it yet: goal 5.53 against
    * risk 8.17 at `GOAL.kite` 6, and 15.5 against 8.17 here.
    *
-   * Measured over 96 seeds, sweeping the weight: 6 and 10 leave the escape rate
-   * at 27-34%; **12 is a phase change to 81%**, because that is where the goal
-   * credit first matches a saturated risk delta; 14 reaches 85% but costs more
-   * early deaths. 12 is the cheapest weight that clears the cap, which is the
-   * point — the number is not tuned, it is `RISK_CAP` and has to be.
+   * Measured over 96 seeds, sweeping the weight on the ballistics build (§15):
+   * 6 → 44%, 10 → 37%, **12 → 66%**, 14 → 69%. The shape is the one claimed — a
+   * step between 10 and 12, where the goal credit first matches a saturated risk
+   * delta — but the step is to 66%, not to the 81% recorded here before the
+   * `KITE_BAND` fix moved the contact-frame count (§14.2), and **14 no longer
+   * costs anything measurable**: every arm reaches the cap on 96/96 seeds with
+   * worst case 3.56x. So 12 is kept as the *cheapest* weight that clears the cap
+   * rather than as a strictly better one. The 12-to-14 gap (66% against 69%) is
+   * small enough that moving would need an argument of its own, and this change
+   * did not make one. The number is still not tuned — it is `RISK_CAP`, and the
+   * step exists because that is where a saturation stops being one.
    *
    * Deliberately **not** `GOAL.flee`. They were the same knob for one revision
    * and should not be: at `GOAL.flee` 6 the survival tail is markedly better
-   * (min 3.59x, 96/96 runs reaching the 10-minute cap) than at 14 (min 0.10x,
-   * 89/96), while the escape rate wants a weight of at least 12. The two
+   * (worst 3.56x, 96/96 runs reaching the 10-minute cap) than at 14 (worst
+   * 0.09x, 93/96), while the escape rate wants a weight of at least 12. The two
    * requirements pull in opposite directions and are now separate.
    */
   KITE_CONTACT_WEIGHT: 12,
@@ -284,19 +386,30 @@ export const ROBOT = {
    * idle stretches posted zero kills, nearly all of them parked at the same spot
    * just inside a border.
    *
-   * **What the bound does and does not buy, measured.** It trims the dead time
-   * (idle frames 0.55 → 0.48 of a run, long stretches 348 → 274 over 24 seeds)
-   * and the robot plays visibly more for it: 23345 → 11738 kills per 48 seeds,
-   * level 6.5 → 7.0. It does **not** remove the stalemate — the longest dead
-   * stretch is still ~72s — because at 12 the clamped risk still outweighs a
-   * goal weight of 6, so the veto survives in weakened form. It is a bound, not
-   * a cure; see §14.6 for the limitation itself, which is a genuine open item and
-   * not something this constant fixes. It also costs the survival tail: the
-   * 10-minute cap is reached by 95/96 seeds rather than 96/96, worst case 1.78×
-   * idle, median unchanged at ~7×.
+   * **What the bound buys, re-measured on the ballistics build (§15), 96 seeds.**
+   * Against an effectively absent bound (1000): survival is *identical* — median
+   * 6.49x, mean 6.57x, worst 3.56x, 96/96 seeds reaching the 10-minute cap in
+   * both arms — and so are kills (23002 against 22992, 0.04% apart) and idle
+   * frames (55.9% against 54.7%). The one axis this constant clearly owns is the
+   * **escape rate: 66% against 37%.** Of the frames where a monster is inside its
+   * own reach, the capped robot opens the gap two times in three; the uncapped
+   * one, whose risk term saturates and vetoes every candidate, mostly does not.
+   * That is the user's own report ("怪物冲到player面前了，player没有跑"), and it is a
+   * better reason for this constant than anything recorded here before.
    *
-   * Raising it to 20 makes it inert (identical statistics to omitting it), so 12
-   * is deliberately the value that still does something.
+   * A set of figures recorded at this spot earlier no longer reproduces and is
+   * withdrawn: a large kill swing (23345 → 11738 per 48 seeds), a trimmed idle
+   * share (0.55 → 0.48 of frames), and a survival cost (cap 95/96 against 96/96,
+   * worst case 1.78x). None of the four survives measurement now — the tail cost
+   * in particular is gone entirely, both arms reaching the cap on 96/96 seeds
+   * **with the same worst seed**. What the bound does *not* do is remove the
+   * stalemate: §14.6 is still open, and at 12 the clamped risk still outweighs
+   * `GOAL.flee` 6.
+   *
+   * Raising it to 20 makes it inert (identical statistics to omitting it), and
+   * that re-verified too — 35% escape against the uncapped 37%, kills and idle
+   * within a percent of each other — so 12 is deliberately the value that still
+   * does something.
    */
   RISK_CAP: 12,
 
@@ -505,6 +618,14 @@ const CANDIDATES: readonly MoveInput[] = [
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
+/**
+ * The empty hazard set, for the queries that are about monsters only.
+ *
+ * Only one call site uses it (`hereRisk`), and it exists so that the exclusion
+ * reads as a decision with a name rather than as an argument somebody forgot.
+ */
+const NO_HAZARDS: readonly Hazard[] = [];
+
 /** Unit vector from `a` to `b`, or null when the two points coincide. */
 function unitTo(ax: number, ay: number, bx: number, by: number): [number, number] | null {
   const dx = bx - ax;
@@ -669,10 +790,22 @@ function pickTarget(
  * `FALLOFF` is below 1 on purpose: a linear ramp makes 50px from a brute look
  * almost free (0.29 × dps) when it is one step from hitting, so the curve holds
  * its value and drops late instead.
+ *
+ * Hazards (design §15) are summed alongside the monsters but obey neither of
+ * those rules, because neither is true of them. There is no leash: a bomb is
+ * already in the air and will go off wherever it lands, so crossing a region
+ * border is no shelter from it — the leash exists because a monster cannot
+ * follow you (§6.2), and an explosion is not following anything. And there is no
+ * falloff *past* the edge: a blast is a hard boundary, not a gradient of
+ * likelihood, so the sum stops dead at `reach` instead of trailing off to
+ * `senseRange`. Inside it the same proximity curve applies, since "dead centre
+ * is worse than the rim" is as true of a circle of ground as of a monster's
+ * reach.
  */
 function riskAt(
   view: RobotView,
   threats: readonly Threat[],
+  hazards: readonly Hazard[],
   x: number,
   y: number,
   exclude: number | null = null,
@@ -694,6 +827,11 @@ function riskAt(
       proximity = span <= 0 ? 1 : Math.pow((t.m.senseRange - d) / span, ROBOT.FALLOFF);
     }
     risk += t.dps * ROBOT.CHASE * proximity;
+  }
+  for (const h of hazards) {
+    const d = Math.hypot(h.x - x, h.y - y);
+    if (d > h.reach) continue;
+    risk += h.damage * ROBOT.BOMB_WEIGHT * ROBOT.CHASE * (1 + (ROBOT.PROX * (h.reach - d)) / h.reach);
   }
   return risk;
 }
@@ -718,7 +856,16 @@ export function decide(
   const hpFrac = p.maxHp > 0 ? p.hp / p.maxHp : 0;
 
   const threats = view.monsters.map((m) => asThreat(m, px, py));
-  const hereRisk = riskAt(view, threats, px, py);
+  // **Monsters only, and that exclusion is deliberate.** This is the number the
+  // *commitments* below are made on — panic, the retreat latch, whether a potion
+  // is worth walking to — and those are judgments about whether to stay in the
+  // fight, not about where to put a foot. A bomb is a 0.3s event that the ground
+  // under the robot is about to have; if it counted here it would read as
+  // `PANIC` (108 against a threshold of 44), trigger a committed retreat, and
+  // send the robot running for another region because a brute threw something.
+  // Stepping out of the circle is the whole correct response, and that is what
+  // the candidate deltas below do with it.
+  const hereRisk = riskAt(view, threats, NO_HAZARDS, px, py);
 
   // ── Potions ──────────────────────────────────────────────────────────────
   // Scored by what they do, discounted by how far the walk is, and skipped
@@ -971,7 +1118,18 @@ export function decide(
     (intent === "kite" || intent === "roam") && target !== null && target.dist > p.attackRange
       ? target.m.id
       : null;
-  const hereForScore = ignoring === null ? hereRisk : riskAt(view, threats, px, py, ignoring);
+  const hereForScore =
+    ignoring === null
+      ? riskAt(view, threats, view.hazards, px, py)
+      : riskAt(view, threats, view.hazards, px, py, ignoring);
+  // Hazards *are* in this baseline, unlike in the `hereRisk` above, and both
+  // halves of that are deliberate. The delta is measured against where the robot
+  // is standing, so a bomb underfoot has to be in the baseline for stepping out
+  // of the circle to register as the gain it is: with the baseline monster-only,
+  // leaving a bomb would be priced as pure monster gradient and could tie with
+  // simply standing in it — and ties fall to idle. In the baseline, standing
+  // still scores 0 and every step out of the circle scores a clamped reward, so
+  // "move" wins the frame the reticle appears.
   // A ring that has already been breached is a retreat, not a farm, and it has
   // to be priced like one — at `KITE_CONTACT_WEIGHT`, which is `RISK_CAP` and
   // therefore the cheapest bid that can outvote a saturated risk delta. Nothing
@@ -1062,8 +1220,8 @@ export function decide(
     const base =
       !toward || destRegion === hereRegion
         ? hereForScore
-        : Math.max(hereForScore, riskAt(view, threats, px, py, ignoring, destRegion));
-    const delta = riskAt(view, threats, nx, ny, ignoring) - base;
+        : Math.max(hereForScore, riskAt(view, threats, view.hazards, px, py, ignoring, destRegion));
+    const delta = riskAt(view, threats, view.hazards, nx, ny, ignoring) - base;
     const risk = clamp(delta, -ROBOT.RISK_CAP, ROBOT.RISK_CAP);
 
     // Standing near a wall is bad on its own account: it removes the directions

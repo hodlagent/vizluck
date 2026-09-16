@@ -18,6 +18,8 @@ import {
   type MonsterStats,
   type MoveInput,
   type PlayerStats,
+  type ProjectileKind,
+  type ProjectileStats,
   type RegionConfig,
   type RegionRuntime,
 } from "./types";
@@ -84,6 +86,77 @@ export const TUNING = {
   /** Seconds of blinking before `itemLifetime` runs out. */
   itemFlicker: 10,
 
+  /**
+   * Projectiles (design §15). Every attack carries its damage to the impact
+   * instead of applying it at the muzzle, so these constants are what make
+   * "dodge the shot" a real move rather than decoration — §7's claim that
+   * dodging is spatial rests on them being beatable by `moveSpeed`.
+   */
+  /**
+   * The player's shot, and a monster's — deliberately **not** the same speed.
+   *
+   * The player's attack is automatic (§5.1): they cannot aim, so they cannot
+   * compensate for a miss, and a shot that drifts wide is pure loss. A monster's
+   * shot missing is the opposite — it is the player's own dodge paying off. So
+   * the asymmetry is the point rather than an oversight: 520 crosses the whole
+   * 55px `attackRange` in 0.106s, and 280 gives a wanderer's 22px shot 0.079s of
+   * flight, in which a player sprinting *perpendicular* at `moveSpeed` covers
+   * 12.6px against the 11.5px two-body threshold. Dodgeable — but only by
+   * committing to it: at a random angle the lateral component is only ~8px, so
+   * moving is not by itself enough.
+   */
+  bulletSpeed: 520,
+  monsterBulletSpeed: 280,
+  /**
+   * Px a bullet may travel before it fizzles — 2× the player's `attackRange`,
+   * and 3.2× the brute's, so a target fleeing directly away is still caught
+   * while a stray shot still dies well inside the region it was fired in rather
+   * than crossing the arena to hit a stranger.
+   */
+  bulletRange: 110,
+  /**
+   * A bullet's radius in px — its body, **and the radius it is drawn at**, on
+   * the same terms as `pickupRadius`. Hitting is two bodies touching (§8.4's
+   * rule), so the threshold against a target is this plus the target's radius:
+   * 11.5px against the player.
+   */
+  bulletRadius: 2.5,
+  /**
+   * Seconds a bomb is in the air. The bomb lands on the spot the player stood on
+   * when it was thrown, exactly this long later, so its speed is derived from
+   * the distance rather than fixed: what stays constant is the *warning*.
+   *
+   * **The escape rule, stated once so these constants can be checked against
+   * it.** A player standing in the landing circle has to cover
+   * `bombBlast + playerRadius` to be clear of it, and one who breaks into a run
+   * the moment the bomb leaves the brute's hand covers `moveSpeed × bombFuse`.
+   * Those two numbers are the whole balance of the mechanic, and the margin
+   * between them has to be worth more than a single step: `dt` is clamped to
+   * `maxDt`, so at 20fps a step is `moveSpeed × maxDt` = 8px of travel. A margin
+   * under 8px means hesitating for one frame is fatal and the "dodge window" is
+   * only open to someone who was already running — which is not a dodge.
+   *
+   * `160 × 0.4` = 64px against `32 + 9` = 41px leaves 23px, ~3 steps of grace at
+   * the slowest timestep and ~0.14s at 60fps. 0.3s left only 7px, and was
+   * measured to be undodgeable at `maxDt` for anyone who reacted a step late.
+   * Why the brute's shot is the *slow* one is in §15: a constant fuse is a
+   * constant warning, and only a slow attacker needs one.
+   */
+  bombFuse: 0.4,
+  /**
+   * Blast radius in px, measured from the landing point — and the radius of the
+   * reticle drawn on the ground there, since a warning circle that lied about
+   * its own size would be worse than no warning at all.
+   */
+  bombBlast: 32,
+  /**
+   * Hard cap on shots in flight. Purely defensive — every archetype's flight is
+   * shorter than its own attack interval, so each monster has at most one shot
+   * in the air, and nothing in the current balance comes near this — it just
+   * stops a future change from growing the array without bound.
+   */
+  maxProjectiles: 128,
+
   /** Wander behaviour for monsters that have not sensed the player. */
   wanderSpeedScale: 0.45,
   wanderMinSeconds: 1,
@@ -108,6 +181,17 @@ export interface MonsterArchetype {
   /** `m_range` — the perception radius. */
   senseRange: number;
   xp: number;
+  /**
+   * Body radius in px — and the radius `GameScene` draws this kind at.
+   *
+   * Owned here rather than in the renderer because the projectile hit test needs
+   * it, and §10.3's rule is that the drawn radius *is* the judged radius. A
+   * radius the sim cannot see is a radius the two are free to disagree about,
+   * which is exactly the drift §8.4 records being bitten by.
+   */
+  radius: number;
+  /** Which shot this kind fires (design §15). See `MONSTER_ARCHETYPES`. */
+  projectile: ProjectileKind;
 }
 
 /** Per-kind stats (design §6). */
@@ -120,6 +204,8 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     attackRange: 22,
     senseRange: 140,
     xp: 10,
+    radius: 6,
+    projectile: "bullet",
   },
   hunter: {
     hp: 35,
@@ -129,6 +215,8 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     attackRange: 26,
     senseRange: 260,
     xp: 20,
+    radius: 7,
+    projectile: "bullet",
   },
   brute: {
     hp: 90,
@@ -139,6 +227,11 @@ export const MONSTER_ARCHETYPES: Record<MonsterKind, MonsterArchetype> = {
     // Short sight, huge damage: walking around this circle is the core tactic.
     senseRange: 110,
     xp: 40,
+    radius: 11,
+    // Slow and heavy, so its shot is the arcing one: a bomb that lands where the
+    // player *was* is the slow attacker's answer to a target who keeps moving,
+    // and the reticle it paints is what makes that answer fair (design §15).
+    projectile: "bomb",
   },
 };
 
@@ -200,6 +293,13 @@ export interface SimState {
   monsters: MonsterStats[];
   /** Potions on the floor, waiting to be walked over (design §8.3). */
   items: ItemStats[];
+  /**
+   * Shots in flight — bullets and bombs alike, told apart by `kind` (design §15).
+   *
+   * Not key material and so not in `GameSnapshot`: a shot moves the world only
+   * by landing on it, through stats `V` already carries.
+   */
+  projectiles: ProjectileStats[];
   /** How many of each potion has been picked up this run — HUD only. */
   pickups: Record<ItemKind, number>;
   configs: RegionConfig[];
@@ -335,6 +435,7 @@ export function createSim(opts: SimOptions = {}): SimState {
     },
     monsters: [],
     items: [],
+    projectiles: [],
     pickups: { heal: 0, power: 0, agility: 0, vitality: 0 },
     configs,
     regions: configs.map((config): RegionRuntime => ({ config, pending: [] })),
@@ -395,6 +496,31 @@ function countInRegion(s: SimState, region: number): number {
 }
 
 /**
+ * Distance from `(px, py)` to the segment `(ax, ay)`–`(bx, by)`.
+ *
+ * A body that did not move this step degenerates its segment to the point it is
+ * standing on, which this handles rather than dividing by zero.
+ *
+ * Shared by collection and by projectile hits, because both are the same
+ * question — "did this path reach that body?" — and both would be wrong the same
+ * way without it. See `pickedUp` for the bug that put it here.
+ */
+function segDistToPoint(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 > 0 ? clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1) : 0;
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
+
+/**
  * Did the player's path this step pass close enough to `it` to collect it?
  *
  * Two bodies **touching**, not the player's centre landing inside the potion:
@@ -415,13 +541,8 @@ function countInRegion(s: SimState, region: number): number {
  * potion and leave it lying there.
  */
 function pickedUp(it: ItemStats, fromX: number, fromY: number, toX: number, toY: number): boolean {
-  const dx = toX - fromX;
-  const dy = toY - fromY;
-  const len2 = dx * dx + dy * dy;
-  // Standing still degenerates the segment to the point they are standing on.
-  const t = len2 > 0 ? clamp(((it.posX - fromX) * dx + (it.posY - fromY) * dy) / len2, 0, 1) : 0;
   const reach = TUNING.playerRadius + TUNING.pickupRadius;
-  return Math.hypot(it.posX - (fromX + dx * t), it.posY - (fromY + dy * t)) <= reach;
+  return segDistToPoint(it.posX, it.posY, fromX, fromY, toX, toY) <= reach;
 }
 
 function nearestMonster(s: SimState, x: number, y: number, maxDist: number): MonsterStats | null {
@@ -440,6 +561,51 @@ function nearestMonster(s: SimState, x: number, y: number, maxDist: number): Mon
   return best;
 }
 
+/**
+ * The monster a shot's path passed through this step, if any.
+ *
+ * Swept rather than sampled, for the reason `pickedUp` is: a bullet covers
+ * `bulletSpeed × maxDt` = 26px in a single step, which is wider than every
+ * monster's body, so testing only where the shot *ended up* would let it pass
+ * clean through a monster between two frames. The margin is real rather than
+ * theoretical — a target 12px away is missed by an endpoint test and hit by
+ * this one, and that is a distance a monster chasing into the player's face
+ * reaches routinely.
+ *
+ * A monster's own shot cannot tunnel the same way: `monsterBulletSpeed × maxDt`
+ * is 14px against the player's 11.5px two-body threshold, so no step is wide
+ * enough for the player's body to fit between its endpoints. The sweep on that
+ * side is symmetry, not a fix.
+ *
+ * The first body along the path wins, not the nearest to where the shot
+ * stopped — a shot stops where it hits, so the earliest crossing is the one it
+ * would have reached first. `id` breaks ties so the choice is stable.
+ */
+function monsterOnSegment(
+  s: SimState,
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+): MonsterStats | null {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const len2 = dx * dx + dy * dy;
+  let best: MonsterStats | null = null;
+  let bestT = Infinity;
+
+  for (const m of s.monsters) {
+    const reach = MONSTER_ARCHETYPES[m.kind].radius + TUNING.bulletRadius;
+    const t = len2 > 0 ? clamp(((m.posX - fromX) * dx + (m.posY - fromY) * dy) / len2, 0, 1) : 0;
+    if (Math.hypot(m.posX - (fromX + dx * t), m.posY - (fromY + dy * t)) > reach) continue;
+    if (best === null || t < bestT || (t === bestT && m.id < best.id)) {
+      best = m;
+      bestT = t;
+    }
+  }
+  return best;
+}
+
 // ── Mutations ───────────────────────────────────────────────────────────────
 
 function damagePlayer(s: SimState, amount: number): void {
@@ -449,6 +615,90 @@ function damagePlayer(s: SimState, amount: number): void {
     s.player.hp = 0;
     s.alive = false;
   }
+}
+
+/**
+ * Launch a shot from `(fromX, fromY)` at where `(atX, atY)` is *right now*
+ * (design §15).
+ *
+ * No lead and no homing, deliberately. The rule the design settled on is that a
+ * target who moves out of the way is missed, so aiming has to be a fixed guess
+ * made at the muzzle rather than a promise the shot keeps — a homing shot would
+ * quietly restore the guaranteed hit that hit-scan used to give, and there would
+ * be nothing left to dodge. Aiming *is* continuous (a float vector, not one of
+ * the 8 `Dir`s): the line to the nearest monster is almost never a compass
+ * direction, and rounding it would turn a 55px shot into a miss by up to 21px.
+ *
+ * Consumes **no** rng. That is load-bearing: the seeded runs in `tests/` depend
+ * on the stream advancing by exactly as much as it did before shots existed, so
+ * a shot may not draw for spread, jitter or anything else. Any randomness a
+ * reader wants here belongs in the renderer, which is where all the existing
+ * particle jitter already lives.
+ */
+function fire(
+  s: SimState,
+  fromPlayer: boolean,
+  kind: ProjectileKind,
+  fromX: number,
+  fromY: number,
+  atX: number,
+  atY: number,
+  damage: number,
+): void {
+  if (s.projectiles.length >= TUNING.maxProjectiles) return;
+
+  const dx = atX - fromX;
+  const dy = atY - fromY;
+  const len = Math.hypot(dx, dy);
+  // A target standing exactly on the muzzle gives no direction to aim along.
+  // Fire due east rather than dividing by zero: the shot still exists, still
+  // travels and still expires, so nothing downstream has to special-case it.
+  const ux = len > 0 ? dx / len : 1;
+  const uy = len > 0 ? dy / len : 0;
+
+  const bomb = kind === "bomb";
+  // A bomb owes the player a *constant warning*: it lands on the spot they stood
+  // on when it was thrown, exactly `bombFuse` later, so its speed has to follow
+  // the distance. A bullet flies at a fixed speed instead and simply expires if
+  // it never catches anything — at the shooter's own speed, which is not the
+  // same for the two sides (see `TUNING.bulletSpeed`).
+  const speed = bomb
+    ? len > 0
+      ? len / TUNING.bombFuse
+      : 0
+    : fromPlayer
+      ? TUNING.bulletSpeed
+      : TUNING.monsterBulletSpeed;
+
+  s.projectiles.push({
+    id: s.nextId++,
+    kind,
+    fromPlayer,
+    posX: fromX,
+    posY: fromY,
+    vx: ux * speed,
+    vy: uy * speed,
+    damage,
+    // A bullet expires on distance; a bomb expires on its fuse, and its `range`
+    // is only a record of how far it was thrown.
+    range: bomb ? len : TUNING.bulletRange,
+    fuse: bomb ? TUNING.bombFuse : 0,
+    blast: bomb ? TUNING.bombBlast : 0,
+  });
+}
+
+/**
+ * Where a bomb is going to land: the point the reticle is drawn on, the point
+ * the robot treats as dangerous, and the point the blast is finally tested from
+ * (design §15). One function because those three have to be the same point.
+ *
+ * A pure identity rather than a stored field. `fire` derives a bomb's speed as
+ * `distance / bombFuse`, so `pos + v × fuse` is the aim point at *any* moment of
+ * the flight, whatever the fuse was set to — the bomb converges on it, which is
+ * also why a bomb thrown at a running player still lands where they *were*.
+ */
+export function bombLanding(b: ProjectileStats): { x: number; y: number } {
+  return { x: b.posX + b.vx * b.fuse, y: b.posY + b.vy * b.fuse };
 }
 
 /**
@@ -651,15 +901,19 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
   if (s.attackCooldown <= 0) {
     const target = nearestMonster(s, p.posX, p.posY, p.attackRange);
     if (target) {
-      target.hp -= p.attackPower;
+      // Aimed at where the target stands *now*, so the shot can be walked out of
+      // — that is §7's second dodge window made real (design §15). The cooldown
+      // still paces the swing; what the swing *lands* is no longer guaranteed
+      // the instant it is thrown.
+      fire(s, true, "bullet", p.posX, p.posY, target.posX, target.posY, p.attackPower);
       s.attackCooldown = 1 / p.attackSpeed;
-      if (target.hp <= 0) killMonster(s, target);
     }
   }
 
   // ── Monsters ─────────────────────────────────────────────────────────────
-  // Nothing in this loop removes a monster (only the player's attack above
-  // does, and it runs first), so iterating `s.monsters` directly is safe.
+  // Nothing in this loop removes a monster — the only thing that does now is a
+  // player's bullet, and that runs in the projectile phase below — so iterating
+  // `s.monsters` directly is safe.
   for (const m of s.monsters) {
     const home = s.configs[m.region];
     const dx = p.posX - m.posX;
@@ -690,10 +944,78 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
       m.posY = clamp(m.posY + vy * m.moveSpeed * dt, home.y + pad, home.y + home.h - pad);
     }
     if (dist <= m.attackRange && m.attackCooldown <= 0) {
-      damagePlayer(s, m.attackPower);
+      // Which shot this is, is an archetype property (design §15): the wanderer
+      // and the hunter fire, the brute lobs. The cooldown now paces the *throw*
+      // rather than the wound — the damage arrives with the projectile, in the
+      // phase below, which is also why this loop can no longer end the run and
+      // no longer has to guard for it.
+      fire(
+        s,
+        false,
+        MONSTER_ARCHETYPES[m.kind].projectile,
+        m.posX,
+        m.posY,
+        p.posX,
+        p.posY,
+        m.attackPower,
+      );
       m.attackCooldown = 1 / m.attackSpeed;
-      if (!s.alive) return; // dead mid-loop: stop simulating this step
     }
+  }
+
+  // ── Projectiles (design §15) ─────────────────────────────────────────────
+  // After the shooters have had their turn, so a shot thrown this step also
+  // travels this step; before the respawns, which stay last as they always have.
+  //
+  // Reverse index, because the loop splices. Killing a monster splices
+  // `s.monsters` from inside a loop over `s.projectiles`, which is safe — the
+  // monster loop above has already finished, so nothing else is walking it.
+  for (let i = s.projectiles.length - 1; i >= 0; i--) {
+    const b = s.projectiles[i];
+    const fromX = b.posX;
+    const fromY = b.posY;
+    b.posX += b.vx * dt;
+    b.posY += b.vy * dt;
+
+    if (b.kind === "bomb") {
+      // A bomb is on a fuse, not a distance: it detonates on its landing point,
+      // and `range` is only a record of how far that was.
+      b.fuse -= dt;
+      if (b.fuse > 0) continue;
+      s.projectiles.splice(i, 1);
+      // Where the player is when it goes off is what counts — the reticle on the
+      // ground says exactly this circle, and the step is 8px against a 32px
+      // blast, so there is no room for the swept test the bullet needs.
+      if (Math.hypot(p.posX - b.posX, p.posY - b.posY) <= b.blast + TUNING.playerRadius) {
+        damagePlayer(s, b.damage);
+        if (!s.alive) return; // dead mid-loop: stop simulating this step
+      }
+      continue;
+    }
+
+    b.range -= Math.hypot(b.vx, b.vy) * dt;
+
+    if (b.fromPlayer) {
+      const hit = monsterOnSegment(s, fromX, fromY, b.posX, b.posY);
+      if (hit) {
+        s.projectiles.splice(i, 1);
+        hit.hp -= b.damage;
+        if (hit.hp <= 0) killMonster(s, hit);
+        continue;
+      }
+    } else if (
+      segDistToPoint(p.posX, p.posY, fromX, fromY, b.posX, b.posY) <=
+      TUNING.playerRadius + TUNING.bulletRadius
+    ) {
+      // The shot reached the player's body — two discs touching, the same rule
+      // collection uses (§8.4), which is what keeps "drawn radius" and "judged
+      // radius" the same line on both sides of the arena.
+      s.projectiles.splice(i, 1);
+      damagePlayer(s, b.damage);
+      if (!s.alive) return;
+    }
+
+    if (b.range <= 0) s.projectiles.splice(i, 1);
   }
 
   // ── Respawns ─────────────────────────────────────────────────────────────
