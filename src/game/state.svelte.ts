@@ -156,7 +156,11 @@ export class GameState {
   private lastBase = "";
   /** True while a `derive_group` call is outstanding. */
   private inFlight = false;
-  /** `performance.now()` at the last repaint of the key readout. */
+  /**
+   * `performance.now()` at the last repaint of the key readout. 0 means "nothing
+   * painted yet", which is the initial value *and* what every run boundary
+   * resets it to, so a run's first key can never be throttled out of the panel.
+   */
   private lastPaint = 0;
 
   // Arrow-function fields so `off()` can be handed the identical reference.
@@ -261,6 +265,7 @@ export class GameState {
     // that is gone.
     this.generation++;
     this.lastBase = "";
+    this.lastPaint = 0;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.host = null;
@@ -303,6 +308,9 @@ export class GameState {
     this.running = false;
     this.generation++;
     this.lastBase = "";
+    // Grouped with `lastBase` because it is the same kind of state: both
+    // describe one run, and either left stale would act on the next one.
+    this.lastPaint = 0;
 
     // Changing the puzzle invalidates the run: a new byte layout means the
     // arena's history no longer maps to anything.
@@ -347,6 +355,7 @@ export class GameState {
     // A new run is a new world, and its first state has to be submitted even if
     // it happens to hash the same way the last run's did.
     this.lastBase = "";
+    this.lastPaint = 0;
     scene.startRun();
     this.hasRun = true;
     this.alive = true;
@@ -510,6 +519,13 @@ export class GameState {
 
       if (info.address_match === true) this.handleMatch(info);
     } catch (e) {
+      // A *failing* call is invalidated by a run boundary exactly as a
+      // successful one is, and this guard is the whole of that: without it a
+      // rejection from the previous run writes `error` on top of the run that
+      // replaced it. That is not a cosmetic mistake — `error` is the first thing
+      // `computeStatus()` reads, so the new run would come up frozen on a
+      // failure it never had, with the ▶ button inert behind it.
+      if (gen !== this.generation) return;
       this.error = String(e);
       this.running = false;
       this.syncStatus();

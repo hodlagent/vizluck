@@ -103,6 +103,10 @@ async function run() {
   await page.addInitScript((puzzles) => {
     window.__MATCH_MODE__ = false;
     window.__KEYS_SEEN__ = 0;
+    // ms to hold the next `derive_group` open before rejecting it, or 0 for
+    // none. The delay is the point: it puts a *failing* call in flight across a
+    // run boundary, which is the only way to reach that ordering.
+    window.__FAIL_NEXT__ = 0;
     window.__TAURI_INTERNALS__ = {
       invoke: async (cmd, args = {}) => {
         const info = (k) => ({
@@ -118,12 +122,18 @@ async function run() {
         switch (cmd) {
           case "get_puzzles":
             return puzzles;
-          case "derive_group":
+          case "derive_group": {
             // Counted here rather than in the HUD so the assertions can tell a
             // stopped sampler from a stopped *stats feed* — a paused Phaser
             // freezes the HUD too, which would otherwise mask a running loop.
             window.__KEYS_SEEN__ += args.private_keys.length;
-            return args.private_keys.map(info);
+            const holdMs = window.__FAIL_NEXT__;
+            if (!holdMs) return args.private_keys.map(info);
+            window.__FAIL_NEXT__ = 0; // one shot
+            return new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("stub: derive_group failed")), holdMs),
+            );
+          }
           default:
             throw new Error("unstubbed command: " + cmd);
         }
@@ -223,7 +233,29 @@ async function run() {
   await page.waitForFunction((n) => window.__KEYS_SEEN__ > n, afterReturn, { timeout: 5000 });
   assert((await keys()) > afterReturn, "manual ▶ resumes the search");
 
-  console.log("\n[6] A match freezes the run and celebrates");
+  console.log("\n[6] A stale failure cannot kill the run that replaced it");
+  // A rejection that outlives the run that caused it. `generation` has to guard
+  // the failure path as well as the success one: otherwise a dead run's error
+  // lands on the live run, and since `error` is the first thing `computeStatus()`
+  // reads, the new run comes up frozen behind an inert ▶.
+  await page.evaluate(() => {
+    window.__FAIL_NEXT__ = 400; // hold the next call open, then reject it
+  });
+  // Let the sampler pick the trap up (at most one frame), then cross a run
+  // boundary — selection *and* restart — while the call is still in flight.
+  await page.waitForTimeout(60);
+  await page.locator("#puzzle-select").selectOption("72");
+  await page.locator("#btn-run").click();
+  await page.waitForTimeout(900); // outlive the rejection
+  assert((await page.locator("#game-error").count()) === 0, "the previous run's failure was dropped, not surfaced");
+  assert((await status()) === "running", "the new run is untouched by it", await status());
+  // Compared after a fixed wait rather than awaited on, so a regression reports
+  // all three failures and lets the phases below them run.
+  const afterFail = await keys();
+  await page.waitForTimeout(700);
+  assert((await keys()) > afterFail, "and the sampler is still running", `${afterFail} -> ${await keys()}`);
+
+  console.log("\n[7] A match freezes the run and celebrates");
   await page.evaluate(() => {
     window.__MATCH_MODE__ = true;
   });
@@ -238,7 +270,7 @@ async function run() {
   await page.waitForTimeout(1200);
   assert((await keys()) === atMatch, "the sampler stopped by the match", `${atMatch} -> ${await keys()}`);
 
-  console.log("\n[7] Console errors");
+  console.log("\n[8] Console errors");
   const bad1 = errors.filter((e) => /missing #|Cannot read|is not a function|TypeError/i.test(e));
   assert(bad1.length === 0, "no missing-#id / TypeError", bad1.join(" | "));
   if (errors.length) console.log("  (console: " + JSON.stringify(errors.slice(0, 4)) + ")");
