@@ -255,7 +255,74 @@ async function run() {
   await page.waitForTimeout(700);
   assert((await keys()) > afterFail, "and the sampler is still running", `${afterFail} -> ${await keys()}`);
 
-  console.log("\n[7] A match freezes the run and celebrates");
+  console.log("\n[7] Robot mode (design §14)");
+  // Manual is the default, and the pair reads as one either/or control rather
+  // than two independent buttons.
+  assert(
+    (await page.locator("#btn-mode-manual").getAttribute("aria-pressed")) === "true",
+    "manual is the active mode by default",
+  );
+  assert(
+    (await page.locator("#btn-mode-robot").getAttribute("aria-pressed")) === "false",
+    "robot is not active by default",
+  );
+  assert((await page.locator("#game-intent").count()) === 0, "no robot readout while manual");
+
+  // Give the running manual run something to lose, so the reset below is
+  // observable rather than a run that never started.
+  await page.locator("#puzzle-select").selectOption("71");
+  await page.locator("#btn-run").click();
+  await page.waitForTimeout(1200);
+  assert(
+    (await page.locator("#game-survival").textContent()) !== "00:00.0",
+    "the manual run has clock on it before the switch",
+    await page.locator("#game-survival").textContent(),
+  );
+
+  // Requirement 3: switching modes resets the arena, the player, the level and
+  // the run's statistics — and lands in READY rather than carrying on.
+  await page.locator("#btn-mode-robot").click();
+  await page.waitForTimeout(250);
+  assert((await page.locator("#game-survival").textContent()) === "00:00.0", "switching to robot resets the clock");
+  assert((await page.locator("#game-level").textContent()) === "1", "level is back to 1");
+  assert((await page.locator("#game-kills").textContent()) === "0", "kills are back to 0");
+  assert((await page.locator("#game-keys").textContent()) === "0", "keys are back to 0");
+  assert((await runLabel()) === "▶", "the run is stopped, not carried over", await runLabel());
+  assert((await status()) === "ready", "and it waits in READY for a deliberate ▶", await status());
+  assert(
+    (await page.locator("#btn-mode-robot").getAttribute("aria-pressed")) === "true",
+    "robot is now the active mode",
+  );
+
+  // Requirement 3 + 4 + 5 together: it plays the game on its own. Nothing below
+  // sends a single key event — that is the whole assertion.
+  await page.locator("#btn-run").click();
+  await page.waitForFunction(
+    () => Number(document.querySelector("#game-kills")?.textContent ?? 0) >= 1,
+    null,
+    { timeout: 30000 },
+  );
+  assert(true, "the robot scores a kill with no keyboard input at all");
+  const intentText = ((await page.locator("#game-intent").textContent()) ?? "").trim();
+  assert(/^auto\s+(flee|heal|loot|kite|roam)/.test(intentText), "the HUD names a valid intent", intentText);
+  assert(
+    /known\s+\d+\/\d+/.test(intentText),
+    "and reports requirement 5's reveal as a fraction",
+    intentText,
+  );
+
+  // ...and back. Requirement 3 applies in both directions.
+  await page.locator("#btn-mode-manual").click();
+  await page.waitForTimeout(250);
+  assert((await page.locator("#game-survival").textContent()) === "00:00.0", "switching back to manual resets too");
+  assert((await page.locator("#game-intent").count()) === 0, "and the robot readout disappears");
+
+  // Leave a live manual run behind: the match phase below needs a sampler that
+  // is actually running to trigger on.
+  if ((await runLabel()) !== "⏸") await page.locator("#btn-run").click();
+  await page.waitForTimeout(300);
+
+  console.log("\n[8] A match freezes the run and celebrates");
   await page.evaluate(() => {
     window.__MATCH_MODE__ = true;
   });
@@ -270,7 +337,7 @@ async function run() {
   await page.waitForTimeout(1200);
   assert((await keys()) === atMatch, "the sampler stopped by the match", `${atMatch} -> ${await keys()}`);
 
-  console.log("\n[8] Console errors");
+  console.log("\n[9] Console errors");
   const bad1 = errors.filter((e) => /missing #|Cannot read|is not a function|TypeError/i.test(e));
   assert(bad1.length === 0, "no missing-#id / TypeError", bad1.join(" | "));
   if (errors.length) console.log("  (console: " + JSON.stringify(errors.slice(0, 4)) + ")");

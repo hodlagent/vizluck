@@ -59,6 +59,14 @@ import {
   type MoveInput,
   type RegionConfig,
 } from "../types";
+import {
+  createRobotState,
+  decide as robotDecide,
+  perceive as robotPerceive,
+  revealedCount,
+  type RobotIntent,
+  type RobotState,
+} from "../robot";
 
 /** How often the scene hands fresh numbers to the HUD. */
 const STATS_INTERVAL_MS = 250;
@@ -358,6 +366,34 @@ export class GameScene extends Phaser.Scene {
   private paused = false;
 
   /**
+   * Auto-play (design §14). When set, `readInput()` is not consulted at all and
+   * the move comes from `robot.ts` instead — so the keyboard and the robot
+   * occupy the same slot and a robot run cannot be nudged by a stray keypress.
+   */
+  private robotMode = false;
+  /**
+   * The policy's memory, rebuilt whenever a run is created or the mode changes.
+   *
+   * Held here rather than in the robot module because it is per-run state: a new
+   * arena, or a switch back to manual and out again, must not inherit a stale
+   * "I was retreating" from the previous run.
+   */
+  private robotState: RobotState = createRobotState();
+  /** Last intent the robot chose, for the HUD readout (design §14.4). */
+  private robotIntent: RobotIntent | null = null;
+  /**
+   * Reveal tally from the last robot frame: how many monsters it has numbers
+   * for, out of how many it can see (requirement 5, design §14.4).
+   *
+   * Cached here rather than recomputed in `publishStats()` because that would
+   * mean a second `perceive()` per stats tick for a number that is only ever a
+   * readout — and the two would then be free to disagree about which frame they
+   * describe.
+   */
+  private robotKnown = 0;
+  private robotSeen = 0;
+
+  /**
    * Sink `GameState` installs to sample a key from the world, called at the
    * end of every `update()` (design §9.4).
    *
@@ -401,6 +437,11 @@ export class GameScene extends Phaser.Scene {
   /** Begin a fresh run. Also used to restart after a death. */
   startRun(): void {
     this.sim = createSim({ width: GAME_WIDTH, height: GAME_HEIGHT });
+    // A new arena means a new policy: the retreat latch and the last direction
+    // belong to the run that just ended, and carrying them over would have the
+    // robot open the next run still fleeing something that no longer exists.
+    this.robotState = createRobotState();
+    this.robotIntent = null;
     this.resetEffects();
     // Paint it now rather than waiting for the next `update()`: a run is
     // created while the engine is still paused (the READY state), and the
@@ -411,8 +452,35 @@ export class GameScene extends Phaser.Scene {
   /** Drop the current run and go back to the "no puzzle selected" state. */
   clearRun(): void {
     this.sim = null;
+    this.robotState = createRobotState();
+    this.robotIntent = null;
     this.resetEffects();
     this.layer.clear();
+  }
+
+  /**
+   * Turn auto-play on or off (design §14.3).
+   *
+   * Deliberately does *not* start or reset a run: `GameState.setMode()` owns the
+   * reset, and the scene owning it too would give the app two reset paths that
+   * could drift apart. All this does is decide where the next frame's input
+   * comes from — and repaint the READY hint, which otherwise keeps telling a
+   * robot run to press WASD.
+   */
+  setRobotMode(on: boolean): void {
+    if (on === this.robotMode) return;
+    this.robotMode = on;
+    this.robotState = createRobotState();
+    this.robotIntent = null;
+    // `setOverlay` early-returns on an unchanged kind, so the hint has to be
+    // repainted by hand or a READY arena keeps the old instruction.
+    const kind = this.overlayKind;
+    this.overlayKind = "none";
+    this.setOverlay(kind);
+  }
+
+  isRobotMode(): boolean {
+    return this.robotMode;
   }
 
   /**
@@ -491,7 +559,11 @@ export class GameScene extends Phaser.Scene {
     } else if (kind === "ready") {
       this.overlayTitle.setText("READY");
       this.overlaySub.setText("PRESS  ▶  TO OPEN THE ARENA");
-      this.overlayHint.setText("WASD / ARROWS TO MOVE   ·   ATTACKS ARE AUTOMATIC");
+      this.overlayHint.setText(
+        this.robotMode
+          ? "ROBOT MODE   ·   ATTACKS ARE AUTOMATIC   ·   NO INPUT NEEDED"
+          : "WASD / ARROWS TO MOVE   ·   ATTACKS ARE AUTOMATIC",
+      );
     } else if (kind === "paused") {
       this.overlayTitle.setText("PAUSED");
       this.overlaySub.setText("THE SEARCH IS STOPPED");
@@ -584,8 +656,24 @@ export class GameScene extends Phaser.Scene {
     };
   }
 
-  /** 8-way move intent for this frame, each component in {-1, 0, 1}. */
+  /**
+   * 8-way move intent for this frame, each component in {-1, 0, 1}.
+   *
+   * The one funnel both drivers pass through, which is the point: the robot is a
+   * drop-in for the keyboard rather than a second path into `stepSim`, so a
+   * robot run and a human run exercise identical sim code. The dispatch is above
+   * the cursor check on purpose — robot mode must not depend on a keyboard
+   * having been set up, and in the headless tests it often has not.
+   */
   private readInput(): MoveInput {
+    if (this.robotMode && this.sim) {
+      const view = robotPerceive(this.sim);
+      const d = robotDecide(view, this.robotState);
+      this.robotIntent = d.intent;
+      this.robotKnown = revealedCount(view);
+      this.robotSeen = view.monsters.length;
+      return d.input;
+    }
     if (!this.cursors || !this.wasd) return NO_INPUT;
     const { left, right, up, down } = this.cursors;
     const { W, A, S, D } = this.wasd;
@@ -1537,6 +1625,11 @@ export class GameScene extends Phaser.Scene {
       // Frozen along with every other number here while the run is paused —
       // that is the 4 Hz feed's contract, not an oversight.
       pickups: sim?.pickups ?? { heal: 0, power: 0, agility: 0, vitality: 0 },
+      // Both null/zero in manual mode, which is what tells the HUD to drop the
+      // readout entirely rather than print a stale intent from a robot run.
+      robotIntent: this.robotMode ? this.robotIntent : null,
+      robotKnown: this.robotMode ? this.robotKnown : 0,
+      robotSeen: this.robotMode ? this.robotSeen : 0,
     };
     this.game.events.emit(GAME_STATS, stats);
   }

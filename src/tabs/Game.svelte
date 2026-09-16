@@ -153,6 +153,34 @@
         {/each}
       </select>
 
+      <!-- Requirement 3: who plays. Two buttons rather than a checkbox because
+           the active mode has to be legible at a glance — a checkbox says what
+           you did, a segmented control says where you are. -->
+      <div class="seg" role="group" aria-label="Who plays">
+        <button
+          id="btn-mode-manual"
+          class="seg-btn"
+          class:seg-on={!state.robot}
+          title="Play it yourself: WASD / arrows"
+          disabled={state.matched}
+          aria-pressed={!state.robot}
+          onclick={() => state.setMode(false)}
+        >
+          👤 manual
+        </button>
+        <button
+          id="btn-mode-robot"
+          class="seg-btn"
+          class:seg-on={state.robot}
+          title="Let the robot play — it sees only what you see, plus a monster's numbers once you are inside its sense ring"
+          disabled={state.matched}
+          aria-pressed={state.robot}
+          onclick={() => state.setMode(true)}
+        >
+          🤖 robot
+        </button>
+      </div>
+
       <button
         id="btn-run"
         class="btn"
@@ -204,6 +232,21 @@
          "keys sampled" is the whole of what the run has cost. There is no
          cadence to report, and printing one would invent a knob. -->
     <span title="Every key this run has handed to the backend">keys <b id="game-keys">{state.keysScanned}</b></span>
+
+    <!-- Requirement 5's reveal, made visible (design §14.4). The canvas
+         deliberately does not paint the fog — the user asked for the robot's
+         knowledge to stay off the arena — so this is the only place the
+         difference between "seen" and "known" is observable. -->
+    {#if state.robot}
+      <span
+        id="game-intent"
+        class="hud-robot"
+        title="What the robot is doing, and how many monsters it has numbers for"
+      >
+        auto <b>{state.robotIntent ?? "…"}</b>
+        · known <b>{state.robotKnown}/{state.robotSeen}</b>
+      </span>
+    {/if}
   </div>
 
   <!-- The bytes the gameplay is driving. This is the game's answer to the Hex
@@ -235,8 +278,14 @@
 
   {#if !state.puzzle}
     <div id="game-hint" class="game-hint">
-      Pick a puzzle above to open the arena. WASD or the arrow keys to move;
-      attacks are automatic.
+      {#if state.robot}
+        Pick a puzzle above to open the arena. The robot plays it — no input
+        needed; it sees only what is on screen, plus a monster's numbers once
+        you are inside its sense ring.
+      {:else}
+        Pick a puzzle above to open the arena. WASD or the arrow keys to move;
+        attacks are automatic.
+      {/if}
     </div>
   {/if}
 

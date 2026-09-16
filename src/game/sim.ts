@@ -363,11 +363,23 @@ export function createSim(opts: SimOptions = {}): SimState {
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
+/**
+ * Region index containing `(x, y)`, given the arena size.
+ *
+ * Exported on its own because `robot.ts` asks the same question about positions
+ * the player is *not* standing on — every candidate step it weighs — and a
+ * second copy of this arithmetic is exactly the kind of thing that drifts out of
+ * sync with the walls it is supposed to describe.
+ */
+export function regionIndexAtPoint(width: number, height: number, x: number, y: number): number {
+  const col = clamp(Math.floor(x / (width / 3)), 0, 2);
+  const row = clamp(Math.floor(y / (height / 3)), 0, 2);
+  return row * 3 + col;
+}
+
 /** Region index containing `(x, y)`. */
 export function regionIndexAt(s: SimState, x: number, y: number): number {
-  const col = clamp(Math.floor(x / (s.width / 3)), 0, 2);
-  const row = clamp(Math.floor(y / (s.height / 3)), 0, 2);
-  return row * 3 + col;
+  return regionIndexAtPoint(s.width, s.height, x, y);
 }
 
 /** Is `(x, y)` inside `cfg`? Half-open, to match `regionIndexAt`'s flooring. */

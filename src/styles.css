@@ -175,6 +175,48 @@ body {
   cursor: not-allowed;
 }
 
+/* Manual ⇄ robot segmented control (design §10.1, §14.3).
+   Two buttons sharing one outline: the pair reads as a single either/or
+   setting, which a pair of independent buttons would not. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.seg-btn {
+  background: var(--bg-elev);
+  border: 0;
+  color: var(--text-dim);
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.seg-btn + .seg-btn {
+  border-left: 1px solid var(--border);
+}
+
+.seg-btn:hover:not(:disabled):not(.seg-on) {
+  color: var(--accent);
+}
+
+.seg-btn.seg-on {
+  background: var(--bg-card);
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.seg-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .error {
   margin-top: 12px;
   padding: 10px 14px;
@@ -606,6 +648,16 @@ body.auto-running .pblock:hover {
 
 .game-hud b {
   color: var(--text);
+}
+
+/* The robot's own readout (design §14.4). Accented so that "the robot is
+   driving" is visible from the HUD alone, without reading the word after it. */
+.game-hud .hud-robot {
+  color: var(--accent-dim);
+}
+
+.game-hud .hud-robot b {
+  color: var(--accent);
 }
 
 /* The potion legend: a coloured dot per kind, matching the canvas glyphs. The

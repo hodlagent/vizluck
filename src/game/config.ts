@@ -5,6 +5,7 @@
 // duplicated here.
 
 import Phaser from "phaser";
+import type { RobotIntent } from "./robot";
 import type { ItemKind } from "./types";
 
 /** Logical canvas size — matches the 16:9 stage in `styles.css`. */
@@ -42,6 +43,20 @@ export interface GameStats {
   kills: number;
   /** Potions picked up this run, per kind (design §8.3) — the HUD's tally. */
   pickups: Record<ItemKind, number>;
+  /**
+   * What the robot is currently doing, or null in manual mode (design §14.4).
+   *
+   * Carried on the stats feed rather than read from the scene on demand because
+   * the HUD is a reactive readout: it needs a value that changes, and the 4 Hz
+   * feed is already the established channel for "numbers the HUD prints".
+   */
+  robotIntent: RobotIntent | null;
+  /**
+   * How many monsters the robot currently has stats for, and how many it can see
+   * at all — requirement 5's reveal, reported as a fraction (design §14.4).
+   */
+  robotKnown: number;
+  robotSeen: number;
 }
 
 /**

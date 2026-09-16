@@ -29,6 +29,7 @@ import {
   type GameStats,
 } from "./config";
 import { gameBaseBytes, keyHexFromBase, type GameKeyBytes } from "./keymap";
+import type { RobotIntent } from "./robot";
 import { GameScene } from "./scenes/GameScene";
 import type { ItemKind } from "./types";
 
@@ -110,6 +111,15 @@ export class GameState {
    */
   keysScanned = $state(0);
 
+  // ── Auto-play (design §14) ───────────────────────────────────────────────
+  /** False = manual (WASD), true = the robot drives. */
+  robot = $state(false);
+  /** What the robot is doing right now, or null in manual mode (§14.4). */
+  robotIntent = $state<RobotIntent | null>(null);
+  /** Monsters it currently has stats for, out of how many it can see (§14.1). */
+  robotKnown = $state(0);
+  robotSeen = $state(0);
+
   // ── Key output ───────────────────────────────────────────────────────────
   /** Latest sampled key's full info, shown in the reused AddrInfoPanel. */
   info = $state<KeyInfo | null>(null);
@@ -174,6 +184,9 @@ export class GameState {
     this.maxHp = stats.maxHp;
     this.kills = stats.kills;
     this.pickups = stats.pickups;
+    this.robotIntent = stats.robotIntent;
+    this.robotKnown = stats.robotKnown;
+    this.robotSeen = stats.robotSeen;
     // Death lands here first (the feed is 4 Hz). `syncStatus()` reads it back
     // off the live scene and does the bookkeeping.
     this.syncStatus();
@@ -186,7 +199,13 @@ export class GameState {
     // scenes off this same READY event and subscribes first, so the scene
     // exists by the time this runs.
     const scene = this.scene();
-    if (scene) scene.onFrame = this.onFrame;
+    if (scene) {
+      scene.onFrame = this.onFrame;
+      // The mode control is not gated on READY, so a pick made while the engine
+      // was still booting would otherwise be lost — leaving the HUD announcing
+      // robot mode while the scene went on reading the keyboard.
+      scene.setRobotMode(this.robot);
+    }
 
     this.resize();
     // A tab switch can land before READY, so reconcile rather than assume.
@@ -336,6 +355,34 @@ export class GameState {
     this.syncStatus();
   }
 
+  /**
+   * Switch between manual and robot play (design §14.3, requirement 3).
+   *
+   * A mode switch is a different game, so it resets everything a run owns —
+   * arena, player, level, kills, keys — and lands in READY rather than running.
+   * Resetting rather than resuming is the point: the two modes are not
+   * interchangeable mid-run, and a robot taking over a half-played human run (or
+   * the reverse) would be scoring a game neither of them played.
+   *
+   * It goes through `restart()` rather than repeating the reset, so a mode
+   * switch and a post-death ▶ cannot drift apart. `bestSurvival` deliberately
+   * survives, exactly as it does across a death and restart.
+   */
+  setMode(on: boolean): void {
+    if (on === this.robot) return;
+    this.robot = on;
+    const scene = this.scene();
+    // Before the restart, so the arena built below is already the new mode's.
+    scene?.setRobotMode(on);
+
+    this.running = false;
+    if (this.puzzle && scene) this.restart();
+    this.robotIntent = null;
+    this.robotKnown = 0;
+    this.robotSeen = 0;
+    this.syncStatus();
+  }
+
   /** ▶ / ⏸. Also the restart button after a death. */
   toggle(): void {
     if (!this.canRun) return;
@@ -365,6 +412,14 @@ export class GameState {
     this.baseBytes = [];
     this.owners = [];
     this.error = "";
+    // A new run is level 1 with nothing killed, and saying so immediately keeps
+    // the HUD honest for the up-to-250ms before the next stats tick arrives —
+    // otherwise a fresh run briefly shows the level and kill count of the run
+    // that just ended, which is the one moment a user is most likely to look.
+    this.level = 1;
+    this.xp = 0;
+    this.kills = 0;
+    this.pickups = { heal: 0, power: 0, agility: 0, vitality: 0 };
   }
 
   async copyText(text: string, label: string): Promise<void> {
