@@ -15,7 +15,7 @@
 // deliberately public in `sim.ts`; the enforcement lives here, in what this
 // module is willing to look at.
 
-import { bombLanding, regionIndexAtPoint, TUNING, type SimState } from "./sim";
+import { bombLanding, TUNING, type SimState } from "./sim";
 import type {
   Dir,
   ItemKind,
@@ -52,8 +52,6 @@ export interface PerceivedMonster {
   dir: Dir;
   /** `m_range`. Public: it is the ring drawn around the monster. */
   senseRange: number;
-  /** Home region index — derivable from the grid painted on the floor. */
-  region: number;
   /** Public: the damage bar. */
   hpFrac: number;
   /** Non-null **exactly** while the player is inside `senseRange`. */
@@ -138,7 +136,6 @@ export function perceive(sim: SimState): RobotView {
       posY: m.posY,
       dir: m.dir,
       senseRange: m.senseRange,
-      region: m.region,
       hpFrac: m.maxHp > 0 ? m.hp / m.maxHp : 0,
       stats: near
         ? {
@@ -290,23 +287,26 @@ export const ROBOT = {
    * The goal-directive weight per intent.
    *
    * **Every one of these is below `RISK_CAP` 12, and that is a live tension
-   * rather than a design.** A saturated risk delta — which a region-border probe
-   * produces routinely, see `KITE_CONTACT_WEIGHT` — can therefore outvote any
-   * of them, so "risk steers, never vetoes" (this file's own words, and the
-   * comment on `RISK_CAP`) is not actually true of any rung here. `flee` used to
-   * be the exception at 14; it is not any more, because 6 measured better on
-   * every survival axis (over 96 seeds: mean 6.57x against 6.36x, median 6.49x
-   * against 6.44x, worst 3.56x against 0.09x, 96/96 runs reaching the cap
-   * against 93/96). The one place
-   * that genuinely needs to clear the cap now says so explicitly, in
-   * `KITE_CONTACT_WEIGHT`.
+   * rather than a design.** A saturated risk delta — which a crowded field
+   * produces routinely now that the leash is gone (§6.2) — can therefore
+   * outvote any of them, so "risk steers, never vetoes" (this file's own words,
+   * and the comment on `RISK_CAP`) is not actually true of any rung here. This
+   * tension *is* the dithering §14.6 records: the risk term swings ±12 against
+   * a goal credit of ~7, and `HYST` is what has to bridge the difference.
    *
-   * The margin is thinner than it was recorded at (the flee-14 arm used to lose
-   * 7 seeds to the cap, now it loses 3, and its median is within 0.05x of 6's)
-   * — but the tail is what this knob is for, and the 0.09x worst seed is a
-   * robot that dies almost immediately while standing still, which no median
-   * hides. Re-measured after the ballistics change (§15); both arms on the same
-   * 96 seeds.
+   * `flee` used to be the exception at 14, and 6 is what replaced it. That was
+   * measured in the leashed world; since the leash removal changed this whole
+   * table's operating point it was **re-measured here**, 96 seeds, flee = 6 /
+   * 8 / 10 / 14 → worst seed 1.25× / 0.96× / 0.71× / 1.06×. The medians are
+   * flat (2.48 / 2.49 / 2.48 / 2.12) and 8 actually kills more (258 against
+   * 175), so the decision is made on the tail alone: only 6 keeps *every* seed
+   * above standing still, and a 0.71× worst seed is a robot that dies sooner
+   * than not playing at all. The tail is what this knob is for.
+   *
+   * There is no longer any rung that deliberately clears the cap. The one that
+   * did — `KITE_CONTACT_WEIGHT` — was deleted: the latch's entry condition
+   * became the same `nearest.dist <= nearest.reach` test, which made the arm
+   * that read it unreachable (see the `weight` note in `decide`).
    */
   GOAL: { flee: 6, heal: 9, loot: 6, kite: 6, roam: 6 } as const,
 
@@ -325,40 +325,6 @@ export const ROBOT = {
    * fail — rather than letting the clamp plant the robot inside its reach.
    */
   STANDOFF_MARGIN: 4,
-  /**
-   * Weight of the ring goal once the target is inside its own `reach`.
-   *
-   * **This is the half of the fix for the user's "怪物冲到player面前了，
-   * player没有跑", and it has to be at least `RISK_CAP`.** The ring goal was
-   * never wrong — with `dotAway` 0.99 it points away about as well as a
-   * direction can — it simply lost the vote. Over a `PROBE_S` step of ~40px the
-   * risk term is dominated by a single discontinuity: `riskAt` honours the
-   * region leash, so a probe that crosses a border reports the risk of a
-   * *different region*, worth +55 in the measured frames and clamped to
-   * `RISK_CAP` 12. The robot stood 29px from a border with two 260-sense
-   * hunters just beyond it, so the one direction that would have opened the gap
-   * was scored against monsters that could not touch it yet: goal 5.53 against
-   * risk 8.17 at `GOAL.kite` 6, and 15.5 against 8.17 here.
-   *
-   * Measured over 96 seeds, sweeping the weight on the ballistics build (§15):
-   * 6 → 44%, 10 → 37%, **12 → 66%**, 14 → 69%. The shape is the one claimed — a
-   * step between 10 and 12, where the goal credit first matches a saturated risk
-   * delta — but the step is to 66%, not to the 81% recorded here before the
-   * `KITE_BAND` fix moved the contact-frame count (§14.2), and **14 no longer
-   * costs anything measurable**: every arm reaches the cap on 96/96 seeds with
-   * worst case 3.56x. So 12 is kept as the *cheapest* weight that clears the cap
-   * rather than as a strictly better one. The 12-to-14 gap (66% against 69%) is
-   * small enough that moving would need an argument of its own, and this change
-   * did not make one. The number is still not tuned — it is `RISK_CAP`, and the
-   * step exists because that is where a saturation stops being one.
-   *
-   * Deliberately **not** `GOAL.flee`. They were the same knob for one revision
-   * and should not be: at `GOAL.flee` 6 the survival tail is markedly better
-   * (worst 3.56x, 96/96 runs reaching the 10-minute cap) than at 14 (worst
-   * 0.09x, 93/96), while the escape rate wants a weight of at least 12. The two
-   * requirements pull in opposite directions and are now separate.
-   */
-  KITE_CONTACT_WEIGHT: 12,
   /**
    * How much of the kite goal is a tangential (orbiting) bias rather than a
    * radial correction. Without it the robot walks straight backwards until a
@@ -414,7 +380,7 @@ export const ROBOT = {
   RISK_CAP: 12,
 
   /**
-   * `PANIC` and `KITE_SAFE_RISK` are in the risk field's own units —
+   * `KITE_MAX_RISK` and `KITE_SAFE_RISK` are in the risk field's own units —
    * `dps × CHASE × proximity` — so they are **coupled to `CHASE`** and must be
    * re-tuned with it, not held fixed. The natural yardstick is one hunter at the
    * edge of its reach, which the default constants put at
@@ -422,26 +388,6 @@ export const ROBOT = {
    * distance.
    */
 
-  /**
-   * Risk at the current spot above which the robot abandons the fight entirely
-   * and runs for another region.
-   *
-   * This is the *emergency* exit, and it is deliberately high enough that an
-   * ordinary scrap never reaches it: 44 is above one hunter's reach-risk (28.8)
-   * and one brute's (32.4), and means "a brute is inside its reach and close",
-   * "two hunters", or worse. Contact below that is `kite`'s job, not `flee`'s.
-   *
-   * **It used to be 16, and that was the bug the user reported.** The trigger
-   * was `hereRisk > PANIC || hereRisk > KITE_MAX_RISK`, and since
-   * `KITE_MAX_RISK` was 9 the second clause silently swallowed the first — so
-   * *any* contact at all (one wanderer at its reach is 12) fired a full retreat
-   * to another region. Combined with a `flee` goal that pointed at a region
-   * centre, the robot walked *through* the monster hitting it to get there:
-   * measured over 24 seeds, it closed the gap on 50.3% of all frames where a
-   * monster was inside its own `attackRange`, and on 76.8% of those frames where
-   * the refuge happened to lie behind the attacker. See `FLEE_RADIAL`.
-   */
-  PANIC: 44,
   /**
    * Risk above which the robot will not detour for a potion.
    *
@@ -463,70 +409,159 @@ export const ROBOT = {
   /**
    * Risk below which a retreat is considered over.
    *
-   * The hysteresis gap against `PANIC`, and the reason a retreat is committed
-   * rather than re-litigated every frame. Measured: a hunter raises risk to 9.6
+   * The second of the latch's two exits; `FLEE_RELEASE_DIST` is the first and
+   * the one that fires in practice. Measured: a hunter raises risk to 9.6
    * inside its reach and drops it to 2.9 thirty pixels out, so a bang-bang
    * controller turns around every half second and never covers the ground to
-   * anywhere safer.
+   * anywhere safer — which is why a retreat is latched at all rather than
+   * re-decided each frame.
+   *
+   * **This used to be the *only* exit, and that was §14.6's absorbing latch.**
+   * `hereRisk` is a sum over every aware monster, so the exit contour sits at
+   * roughly "every aware monster at the edge of its sense range" — a radius
+   * that grows with the crowd, in an arena where five to seven monsters are
+   * aware at all times. See `FLEE_RELEASE_DIST`.
+   *
+   * What is left for it to do is the retreats contact cannot explain: a bomb
+   * field the robot has already stepped out of, or a latch left over from a
+   * fight that ended while it was running.
    */
   KITE_SAFE_RISK: 4.5,
   /**
    * Score bonus for repeating last frame's input, in the same units as the
    * goal weights.
    *
-   * **This damps the robot's twitch; it does not cure it, and it is worth being
-   * precise about which.** Every frame is judged over a `PROBE_S` step of ~40px
-   * while the robot actually advances ~2.8px, so it is forever committing to a
-   * long move, overshooting, and committing to the reverse. The sticky bonus
-   * removes the *cheap* reversals — the ones between two nearly-tied candidates
-   * — which cuts the reversal rate from 0.74 of moving frames to 0.61 and is
-   * worth a little survival and a lot of kills on its own.
+   * **This is the fix for the robot's vibration** — and it was found by
+   * disbelieving the previous reading of this same comment. Every frame is
+   * judged over a `PROBE_S` step of ~40px while the robot actually advances
+   * ~2.8px, so it is forever committing to a long move, overshooting, and
+   * committing to the reverse. What made that fatal rather than cosmetic is the
+   * *magnitude* relationship the previous version of this comment missed: with
+   * the region leash gone (§6.2) the risk field is high everywhere, so the risk
+   * term's ±`RISK_CAP` 12 swing outbids the goal term (`GOAL.flee` 6 ×
+   * |goal| 1.166 ≈ 7.0) on most candidates, and a saddle that moves every frame
+   * flips adjacent directions with it. At 1.5 — 12% of a risk swing — the bonus
+   * was far too small to hold a heading against that.
    *
-   * It does not remove the expensive ones. Where the risk field differs sharply
-   * between the two probed endpoints the reverse still wins by more than the
-   * bonus, and the robot will oscillate between two positions ~6px apart for up
-   * to ~13s of net-zero motion. Worse, raising this value *lengthens* those
-   * episodes (measured, the worst streak grows 747 → 1817 frames from 3 → 8)
-   * because a larger bonus locks the robot into the cycle more firmly, and past
-   * ~20 it stops moving entirely. So this is deliberately small — 1.5, the
-   * bottom of the useful band — and §14.6 records the cycle as an open defect
-   * that belongs to the probe/step ratio, not to this constant.
-   */
-  HYST: 1.5,
-  /**
-   * Weight of the *radial* half of a retreat — straight away from the nearest
-   * threat.
+   * Measured over 96 seeds, as the *total* commitment the robot feels: 3.5 (the
+   * shipped 1.5 plus the 2 that used to sit in `MOVE_MARGIN`) → 90 reversals/run
+   * and a longest unbroken straight run of 1.37s; **8 → 20 reversals/run,
+   * longest run 2.95s**. The escape mechanic needs ~3.9s unbroken to break a
+   * hunter's aggro, so at 3.5 the robot could not disengage at all — it was not
+   * retreating, it was vibrating in place, which is what the user saw and
+   * reported.
    *
-   * This is the primary escape component, and promoting it is the fix for the
-   * user's report. The old goal was the refuge region's centre and nothing else,
-   * so when the refuge lay behind the attacker the robot walked into it: the
-   * goal carried a weight of 14 against a risk delta clamped at `RISK_CAP` 12,
-   * and the 0.12 nudge meant to correct that was two orders of magnitude too
-   * small to matter.
-   */
-  FLEE_RADIAL: 1,
-  /**
-   * Weight of the *tangential* half of a retreat, oriented toward the refuge.
+   * The cost is real and measured: the escape rate in contact falls 66.1% →
+   * 46.0%, because a robot that holds a heading reacts less often to a monster
+   * that touches it. Survival and kills do not suffer (§14.6 carries both).
    *
-   * Same trick as the kite's orbit, for the same reason: it turns "run through
-   * the monster" into "curve around it". Without it a retreat pushed straight
-   * back is a retreat into whichever wall is behind the robot.
+   * Above this it over-commits: stability keeps improving (11 reversals at an
+   * effective 10) but there the worst seed falls to 0.92× — a run that dies
+   * *faster* than standing still. 8 is the knee, chosen for the worst case, not
+   * the mean.
+   *
+   * That "effective" is doing real work here, and is the reason this constant
+   * absorbed another one: it used to be 1.5, and a second constant
+   * (`MOVE_MARGIN`, an extra tie-breaking margin for the previous direction)
+   * sat on the same comparison. Both granted the previous direction a bonus in
+   * these same score units, so the robot only ever felt their sum. Measured: 6
+   * here with 2 there and 8 here with none produce *byte-identical* sweep
+   * output across 96 seeds and all eight reported statistics. The reading above
+   * is the sum, re-attributed to the one knob that was left.
+   *
+   * The pre-removal reading that "raising this *lengthens* the bad episodes"
+   * (worst net-zero streak 747 → 1817 frames from 3 → 8) was measured in the
+   * leashed world, where the field was low and the bad episodes were a
+   * different phenomenon. It does not reproduce here: longest straight run
+   * rises monotonically through 10.
    */
-  FLEE_ORBIT: 0.6,
+  HYST: 8,
   /**
-   * Charge per pixel for running to a refuge region, so the robot prefers a
-   * mediocre region next door to an empty one across the arena. Small: a full
-   * crossing costs less than one brute.
+   * How far the nearest threat must be before a retreat is considered over.
+   *
+   * The latch's exit, and the reason `flee` can end at all. The latch used to
+   * be absorbing: with `KITE_SAFE_RISK` 4.5 as the only exit, and `hereRisk` a
+   * *sum* over every aware monster, the exit contour sat at roughly "every
+   * aware monster at the edge of its sense range", which in the unleased world
+   * is nowhere. Measured then: 96 seeds produced **102 latch entries in
+   * total** — about one unbroken retreat per run, median span 15.7s, longest
+   * 49.1s, `flee` at 96.1% of all frames. It was not a rung any more, it was
+   * the mode.
+   *
+   * 60 is chosen against the ring, not against the monsters: the kite holds
+   * station at `attackRange − STANDOFF_MARGIN` = 51, which is *inside* 60, so
+   * an ordinary farm never trips the release and a retreat that has opened real
+   * distance always does. It also clears the widest `reach` (a brute's 34), so
+   * a released robot is outside everything's blows.
+   *
+   * 60 rather than 70 because of the worst seed, which is the binding case:
+   * over 48 seeds 70 gave a worst of 1.26× and 60 gave 1.41×, with kills 83 →
+   * 88 and the escape rate 48.3% → 49.0%. Small, and all three move the same
+   * way. With the release in place the latch is a real rung: 96 seeds now
+   * produce 294 entries (≈3 per run), median span 2.15s, and 98.7% of all
+   * `flee` frames sit in spans of at least 0.5s — so the chatter §14.2 warns
+   * about has not come back.
+   *
+   * `hereRisk < KITE_SAFE_RISK` is kept as a second exit rather than replaced:
+   * it is the only thing that can end a retreat from a threat that is not
+   * closing (a bomb field, a stale latch), and it costs nothing to keep both.
+   * The two are ORed — an earlier draft ANDed them, which made the positional
+   * exit dead code in exactly the crowd it exists for.
    */
-  REFUGE_DIST: 0.04,
+  FLEE_RELEASE_DIST: 60,
+  /**
+   * Deadband on the kite ring's radial error, in px.
+   *
+   * `err` saturates over `attackRange − desired` — **4px** as shipped — so
+   * within four pixels of the ring the radial term swings the full 0→1 while
+   * the orbit term holds at 0.6, which rotates the goal direction by ~59° in
+   * less than two frames of travel. Since both bodies move 2–2.8px/frame,
+   * `target.dist` crosses `desired` constantly and the rotation is continuous.
+   * Inside the deadband the radial term is zero and the orbit decides alone,
+   * which is a stable heading.
+   *
+   * Asymmetric on purpose, and the outer half is the one that matters: it must
+   * stay *below* `STANDOFF_MARGIN`, because the ring sits that many pixels
+   * inside our own attack range and a wider outer deadband would let the robot
+   * settle outside its own 55px reach — orbiting a monster it never hits. That
+   * failure has been measured here before; see the `desired` note.
+   *
+   * **Measured marginal, and recorded that way rather than as a win.** Over 96
+   * seeds, 6 against 0: reversals 20 → 26/run, latch entries 294 → 354, and
+   * *nothing else moves* — worst seed 1.25× both ways, escape rate 46.0% vs
+   * 46.1%, longest run 2.95s vs 2.94s. So it does move the two things it was
+   * built to move, by ~20%, and is otherwise free. It is no longer load-bearing
+   * for stability: `HYST` 8 does that job, and the reversal count would still
+   * be 26 without this.
+   */
+  KITE_ERR_DEADBAND: 6,
+  /** The outer half of the kite deadband — see `KITE_ERR_DEADBAND`. */
+  KITE_ERR_DEADBAND_OUT: 3,
+  /**
+   * How far off the locked route the robot may drift before the objective lock
+   * is thrown away and re-chosen.
+   *
+   * A *fraction* of the route, not a distance: the limit is `d × this`, where
+   * `d` is the length of the `origin → objective` line as it stood when the
+   * lock was taken. The user's rule, and the scaling is the point — a target
+   * 500px away tolerates a 167px lateral excursion, while a target 150px away
+   * does not, and one number covers both.
+   *
+   * It needs a floor, and the floor is the kite ring's own radius: at small `d`
+   * (the lock taken on something already underfoot) `d/3` falls below the
+   * radius of the circle the robot legitimately orbits on, and every frame of
+   * ordinary farming would re-lock. `objectiveLimit` supplies it.
+   */
+  OBJECTIVE_DEVIATION_FRAC: 1 / 3,
   /**
    * How close something must be for low hp alone to justify disengaging.
    *
    * Without this the robot flees on `hpFrac` alone, which is a real trap: hp
    * stays low until regen refills it, so a wounded robot whose nearest monster
-   * is a leashed stranger 240px away would flee forever, from nothing, instead
-   * of looting or regenerating. Roughly a hunter's sense range — inside it, a
-   * monster has noticed you; outside it, you are not in a fight.
+   * is a stranger 240px away that has not noticed it would flee forever, from
+   * nothing, instead of looting or regenerating. Roughly a hunter's sense
+   * range — inside it, a monster has noticed you; outside it, you are not in a
+   * fight.
    */
   DISENGAGE_RADIUS: 220,
 
@@ -572,20 +607,27 @@ function potionValue(kind: ItemKind, hpFrac: number): number {
 // ── The policy (design §14.2) ───────────────────────────────────────────────
 
 /**
- * The policy's one piece of memory: whether it is currently disengaging.
+ * The policy's memory: whether it is disengaging, and what it has committed to.
  *
- * This exists because a threshold on instantaneous risk is a bang-bang
- * controller, and a bang-bang controller cannot retreat. Measured: a single
- * hunter raises risk to 9.6 inside its reach and drops it to 2.9 thirty pixels
- * further out, so a robot that starts fleeing at one number and stops at the
- * other turns around every half second and never covers the couple of hundred
- * pixels to anywhere safer. It dies in the middle, oscillating.
+ * The retreat latch exists because a threshold on instantaneous risk is a
+ * bang-bang controller, and a bang-bang controller cannot retreat. Measured: a
+ * single hunter raises risk to 9.6 inside its reach and drops it to 2.9 thirty
+ * pixels further out, so a robot that starts fleeing at one number and stops at
+ * the other turns around every half second and never covers the couple of
+ * hundred pixels to anywhere safer. It dies in the middle, oscillating.
  *
  * Note what is *not* here: nothing about monsters. Requirement 5's reveal is
  * still recomputed from scratch every frame and never remembered — `perceive`
  * is pure and the view is the whole of what the robot knows about the world.
- * This is the policy remembering its own decision, which is a different thing,
- * and it is deliberately one boolean wide.
+ *
+ * **The objective lock is the one thing that looks like an exception and is
+ * not.** It stores a *world position* — `objectiveX/objectiveY` — chosen from
+ * the public view, which is a fact about the arena rather than about the
+ * robot's knowledge of it: §14.1's fog governs what the robot can perceive, and
+ * it perceived this. What the lock must never become is a memory of monsters;
+ * it is a point on the map, and every use of it re-reads the live view to find
+ * which monster is nearest it. A lock whose monsters have all died is dropped
+ * on the next frame, not remembered.
  */
 export interface RobotState {
   retreating: boolean;
@@ -597,10 +639,42 @@ export interface RobotState {
    */
   lastDx: number;
   lastDy: number;
+  /**
+   * Where the robot has committed to clearing: the centroid of the cluster it
+   * picked, frozen at the moment it picked it.
+   *
+   * Frozen on purpose. Re-deriving the centroid every frame would track the
+   * monsters as they mill about, which is most of what made the old argmax
+   * dither — the destination has to sit still for the walk toward it to be a
+   * walk rather than a twitch.
+   */
+  objectiveX: number;
+  objectiveY: number;
+  /**
+   * Where the robot was standing when it took the lock — the near end of the
+   * route, and the only thing the deviation test measures against.
+   *
+   * Without it "have I been pushed off course?" has no course to be off: the
+   * perpendicular distance from a *current* position to a line through that
+   * same position is zero by construction.
+   */
+  originX: number;
+  originY: number;
+  /** False when there is nothing to lock onto, or the lock was just dropped. */
+  locked: boolean;
 }
 
 export function createRobotState(): RobotState {
-  return { retreating: false, lastDx: 0, lastDy: 0 };
+  return {
+    retreating: false,
+    lastDx: 0,
+    lastDy: 0,
+    objectiveX: 0,
+    objectiveY: 0,
+    originX: 0,
+    originY: 0,
+    locked: false,
+  };
 }
 
 /** The nine inputs the robot chooses between, the idle one first. */
@@ -635,48 +709,53 @@ function unitTo(ax: number, ay: number, bx: number, by: number): [number, number
 }
 
 /**
- * The centre of the region worth running to.
+ * Where a retreat is measured *from*: the danger the robot is running out of.
  *
- * Disengaging cannot be left to the risk term, which is why this exists. Risk
- * is probed a quarter-second ahead — about 40px — and a region border worth
- * crossing is usually further than that, so from anywhere but the edge of a
- * region the risk gradient says nothing about the border at all. The earlier
- * revision steered by "run away from the crowd" instead, which is worse: it is
- * pure geometry with no idea that monsters are leashed (§6.2), so it fled a
- * losing fight in the centre straight into a fresh region's population.
+ * `flee`'s direction used to be `unitTo(nearest)`, and in a crowd the *identity*
+ * of the nearest monster is not a stable thing. Two monsters whose distances
+ * differ by ~30px cross each other at up to 280px/s of relative motion, so the
+ * argmin changes hands about ten times a second, and each swap reverses the
+ * escape vector by up to 180°. Measured: 187 reversals per 21s run — one every
+ * seven frames — and a longest unbroken straight run of 1.44s, against the
+ * ~3.9s of unbroken running that breaking a hunter's aggro requires. The robot
+ * was not fleeing, it was vibrating in place.
  *
- * What is left is the honest question — *which region is safest* — and it is
- * answerable from public information alone: the borders are painted on the
- * floor, and the monsters standing in each region are visible. Cost is that
- * region's population plus a charge for the run, so the robot prefers a nearby
- * mediocre region to a distant empty one.
+ * A weighted centroid has no identity to swap. Two monsters trading places move
+ * it a few pixels, continuously, and the escape direction that comes out of it
+ * is continuous with it — which is what lets a retreat actually cover ground.
  *
- * Un-revealed monsters are priced at the same conservative prior as everywhere
- * else; revealed ones at what they actually deal.
+ * Weighted by `dps`, the same currency as `riskAt` and `centroidOf`, so "where
+ * the danger is" stays one idea across the policy. Only threats inside
+ * `DISENGAGE_RADIUS` count: a centroid dragged by something across the arena
+ * would point the retreat at the middle of the map rather than away from the
+ * fight.
+ *
+ * Returns null when nothing is near enough, which the `flee` rung reads as
+ * "nothing local left to run from".
+ *
+ * Note what the release is *not* measured against. The centroid is the right
+ * source for a *direction* and the wrong one for a *distance*: when six
+ * monsters have the robot surrounded, their weighted centre is standing on top
+ * of it however far each individual one is, so a release gated on
+ * `dangerCentre().dist` is unreachable in exactly the crowd it exists for.
+ * Measured: `flee` stayed at 94% of frames with the exit written that way. The
+ * latch's exit is gated on the *nearest* threat instead — enter at its reach,
+ * leave at `FLEE_RELEASE_DIST`, one quantity, a real hysteresis pair.
  */
-function refugeRegion(
-  view: RobotView,
-  threats: readonly Threat[],
-  px: number,
-  py: number,
-): { cx: number; cy: number } | null {
-  const cw = view.width / 3;
-  const ch = view.height / 3;
-  const danger = new Array<number>(9).fill(0);
-  for (const t of threats) danger[t.m.region] += t.dps;
-
-  let best: { cx: number; cy: number } | null = null;
-  let bestCost = Infinity;
-  for (let r = 0; r < 9; r++) {
-    const cx = ((r % 3) + 0.5) * cw;
-    const cy = (Math.floor(r / 3) + 0.5) * ch;
-    const cost = danger[r] + ROBOT.REFUGE_DIST * Math.hypot(cx - px, cy - py);
-    if (cost < bestCost) {
-      bestCost = cost;
-      best = { cx, cy };
-    }
+function dangerCentre(threats: readonly Threat[]): { cx: number; cy: number } | null {
+  let w = 0;
+  let sx = 0;
+  let sy = 0;
+  for (const t of threats) {
+    if (t.dist > ROBOT.DISENGAGE_RADIUS) continue;
+    const weight = t.dps;
+    if (weight <= 0) continue;
+    w += weight;
+    sx += t.m.posX * weight;
+    sy += t.m.posY * weight;
   }
-  return best;
+  if (w <= 0) return null;
+  return { cx: sx / w, cy: sy / w };
 }
 
 /**
@@ -717,6 +796,22 @@ function asThreat(m: PerceivedMonster, px: number, py: number): Threat {
 }
 
 /**
+ * A committed knot of monsters: the one to fight, and where the knot *is*.
+ *
+ * Both halves come out of one pass so they cannot disagree about which knot
+ * they are talking about. `t` is the monster to walk at — a member, never the
+ * centre, because the standoff ring around a monster is the whole tactic and
+ * the centre of a cluster is the one place in it with no ring to stand on.
+ * `cx`/`cy` is the dps-weighted centroid, which is what the objective lock
+ * freezes and what the deviation test measures against.
+ */
+interface Objective {
+  t: Threat;
+  cx: number;
+  cy: number;
+}
+
+/**
  * Choose what to farm.
  *
  * The user's ask: "移动到某个/某群怪物附近……尝试去攻击最近的那个，或者附近聚集
@@ -724,30 +819,34 @@ function asThreat(m: PerceivedMonster, px: number, py: number): Threat {
  * score trades distance against company, and what it buys is a reason to walk
  * past a lone wanderer and set up on a knot of three.
  *
- * **Reachability comes first, and it is a filter rather than a weight.** A
- * monster whose home region is ours can chase us and we can reach it without
- * ever changing jurisdiction; one across a border cannot, and going to it means
- * paying the region step — which is precisely where the robot used to stall at
- * 56px against a 55px range, one pixel short of attacking, forever. So if there
- * is anything at all in our own region the pool is that, and only an empty
- * region sends us hunting abroad.
+ * **Every monster is reachable, so the pool is simply all of them.** The pool
+ * used to be filtered to the robot's own region, on the argument that a monster
+ * across a border could not chase and going to it meant paying the region step
+ * — which is precisely where the robot used to stall at 56px against a 55px
+ * range, one pixel short of attacking, forever. §6.2's leash is gone and with it
+ * the argument: reach is now nothing but distance, and distance is already the
+ * second half of this score. What is left of reachability is `CLUSTER_DIST`
+ * below, which makes a far-away cluster lose to a near one rather than banning
+ * it. A consequence worth naming: the target no longer jumps to the far side of
+ * the map the moment the last monster in our region dies — the pool never
+ * changed, so there is nothing to jump between.
  *
  * Within the pool: `pack` counts the monsters clustered around a candidate, and
  * distance is charged against it. Both numbers come from the public view — the
  * same positions a human reads off the canvas (§14.1).
+ *
+ * The centroid is computed for the winner alone, in a second O(n) pass rather
+ * than inside the O(n²) search. It does not change which monster is picked —
+ * `CLUSTER_WEIGHT` and `CLUSTER_DIST` still decide that — so what they now
+ * choose is *which knot to commit to*, and the monster that gets fought is
+ * whichever member of it is nearest.
  */
-function pickTarget(
-  view: RobotView,
-  threats: readonly Threat[],
-  hereRegion: number,
-): Threat | null {
+function pickTarget(view: RobotView, threats: readonly Threat[]): Objective | null {
   if (threats.length === 0) return null;
-  const home = threats.filter((t) => t.m.region === hereRegion);
-  const pool = home.length > 0 ? home : threats;
 
   let best: Threat | null = null;
   let bestScore = -Infinity;
-  for (const t of pool) {
+  for (const t of threats) {
     let pack = 0;
     for (const o of view.monsters) {
       if (o.id === t.m.id) continue;
@@ -759,25 +858,121 @@ function pickTarget(
       best = t;
     }
   }
+  if (best === null) return null;
+  return { t: best, ...centroidOf(threats, best) };
+}
+
+/**
+ * The dps-weighted centroid of `t` and everything within `CLUSTER_RADIUS` of it.
+ *
+ * Weighted by dps rather than counted, so a brute anchors the knot harder than
+ * the wanderers beside it — the same weighting `riskAt` and the retreat's
+ * reference use, which is what keeps "the dangerous part of that group" one
+ * idea across the three of them.
+ *
+ * Weight can be zero (an unrevealed monster carries `PRIOR_DPS`, which is not
+ * zero, but a caller could pass a threat with none), so the fallback is `t`
+ * itself rather than a division by zero.
+ */
+function centroidOf(
+  threats: readonly Threat[],
+  t: Threat,
+): { cx: number; cy: number } {
+  let w = 0;
+  let sx = 0;
+  let sy = 0;
+  for (const o of threats) {
+    if (Math.hypot(o.m.posX - t.m.posX, o.m.posY - t.m.posY) > ROBOT.CLUSTER_RADIUS) continue;
+    const weight = o.dps;
+    if (weight <= 0) continue;
+    w += weight;
+    sx += o.m.posX * weight;
+    sy += o.m.posY * weight;
+  }
+  if (w <= 0) return { cx: t.m.posX, cy: t.m.posY };
+  return { cx: sx / w, cy: sy / w };
+}
+
+/** The threat nearest a world point — the monster a lock is currently about. */
+function nearestToPoint(
+  threats: readonly Threat[],
+  x: number,
+  y: number,
+): Threat | null {
+  let best: Threat | null = null;
+  let bestD = Infinity;
+  for (const t of threats) {
+    const d = Math.hypot(t.m.posX - x, t.m.posY - y);
+    if (d < bestD) {
+      bestD = d;
+      best = t;
+    }
+  }
   return best;
+}
+
+/**
+ * How far off the locked route counts as "pushed away from it".
+ *
+ * `OBJECTIVE_DEVIATION_FRAC` of the route, floored at the radius of the circle
+ * the robot legitimately orbits on. The floor is the load-bearing half and it
+ * is why this is a function rather than a multiplication at the call site: the
+ * lock is taken on a knot, the knot is what the robot then kites around, and a
+ * limit smaller than that orbit radius would re-lock the objective every frame
+ * — a lock that is really a per-frame recompute wearing extra state.
+ */
+function objectiveLimit(route: number, ring: number): number {
+  return Math.max(route * ROBOT.OBJECTIVE_DEVIATION_FRAC, ring);
+}
+
+/**
+ * The radius the kite holds station at, standing off from a given `reach`.
+ *
+ * Shared by the kite rung and by `objectiveLimit`'s floor rather than written
+ * twice: the floor has to be *this* number, and two copies of a clamp with
+ * three arguments is exactly the kind of thing that drifts apart silently.
+ */
+function standoffRing(attackRange: number, reach: number): number {
+  return clamp(attackRange - ROBOT.STANDOFF_MARGIN, reach + ROBOT.BAND, attackRange - 2);
+}
+
+/**
+ * Distance from a point to the segment `a → b`, clamped at both ends.
+ *
+ * The clamping is what makes this the right measure rather than a nuisance.
+ * Distance to the *infinite* line would report zero for a robot shoved 400px
+ * back down the corridor it came along — the flee vector is roughly
+ * anti-parallel to the route, so that is the common case, not a corner one.
+ * Against the segment, being pushed past either end moves the nearest point to
+ * the endpoint and the distance grows, so a lost fight reads as a deviation
+ * from the plan whether the plan was lost sideways or head-on.
+ */
+function perpendicular(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-6) return Math.hypot(px - ax, py - ay);
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1);
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
 /**
  * Expected damage per second taken by standing at `(x, y)`.
  *
- * Summed over monsters, with two rules that carry the whole policy:
+ * Summed over every monster in the view that can see the point, by one rule:
  *
- * 1. **The leash term.** A monster contributes nothing to a position outside
- *    its *home* region, because it cannot follow the player across the border
- *    (§6.2). This is what makes "step over the line" a real move in the robot's
- *    repertoire rather than a coincidence — and it is public information: the
- *    borders are painted on the floor and the leash is plainly observable.
- *
- * 2. **The proximity curve.** `dps` is what a monster deals once it has you, but
- *    standing at the edge of its reach is not the same as standing at the edge
- *    of its notice: the closer it is, the less room there is to leave. So the
- *    field is `dps × CHASE × proximity`, where `proximity` is 1 at `reach`,
- *    falls to 0 at `senseRange`, and climbs inside `reach` as the gap closes.
+ * **The proximity curve.** `dps` is what a monster deals once it has you, but
+ * standing at the edge of its reach is not the same as standing at the edge of
+ * its notice: the closer it is, the less room there is to leave. So the field is
+ * `dps × CHASE × proximity`, where `proximity` is 1 at `reach`, falls to 0 at
+ * `senseRange`, and climbs inside `reach` as the gap closes.
  *
  * Why it is shaped this way, rather than the linear ramp it started as: the
  * ramp has to be *continuous* at `reach` and *monotone* in `d`. An earlier
@@ -791,32 +986,30 @@ function pickTarget(
  * almost free (0.29 × dps) when it is one step from hitting, so the curve holds
  * its value and drops late instead.
  *
- * Hazards (design §15) are summed alongside the monsters but obey neither of
- * those rules, because neither is true of them. There is no leash: a bomb is
- * already in the air and will go off wherever it lands, so crossing a region
- * border is no shelter from it — the leash exists because a monster cannot
- * follow you (§6.2), and an explosion is not following anything. And there is no
- * falloff *past* the edge: a blast is a hard boundary, not a gradient of
- * likelihood, so the sum stops dead at `reach` instead of trailing off to
- * `senseRange`. Inside it the same proximity curve applies, since "dead centre
- * is worse than the rim" is as true of a circle of ground as of a monster's
- * reach.
+ * Hazards (design §15) are summed alongside the monsters but break the curve at
+ * one end: a blast is a hard boundary rather than a gradient of likelihood, so
+ * the sum stops dead at `reach` instead of trailing off to `senseRange`. Inside
+ * it the same proximity curve applies, since "dead centre is worse than the rim"
+ * is as true of a circle of ground as of a monster's reach.
+ *
+ * **A monster used to contribute nothing outside its own region** (§6.2's
+ * leash), and that term is gone along with the leash itself: a monster that can
+ * cross the arena to reach you has to be priced everywhere it can reach. What
+ * this costs is the robot's cheapest escape — "step over the line and they stop"
+ * — and with it the region border's role as a step function in this field. That
+ * step was the root cause §14.6 recorded for the robot standing still; see the
+ * constant comments for what is left of that story once it is gone.
  */
 function riskAt(
-  view: RobotView,
   threats: readonly Threat[],
   hazards: readonly Hazard[],
   x: number,
   y: number,
   exclude: number | null = null,
-  regionOverride: number | null = null,
 ): number {
-  const region =
-    regionOverride ?? regionIndexAtPoint(view.width, view.height, x, y);
   let risk = 0;
   for (const t of threats) {
     if (t.m.id === exclude) continue;
-    if (t.m.region !== region) continue; // the leash
     const d = Math.hypot(t.m.posX - x, t.m.posY - y);
     if (d > t.m.senseRange) continue;
     let proximity: number;
@@ -857,15 +1050,15 @@ export function decide(
 
   const threats = view.monsters.map((m) => asThreat(m, px, py));
   // **Monsters only, and that exclusion is deliberate.** This is the number the
-  // *commitments* below are made on — panic, the retreat latch, whether a potion
-  // is worth walking to — and those are judgments about whether to stay in the
-  // fight, not about where to put a foot. A bomb is a 0.3s event that the ground
-  // under the robot is about to have; if it counted here it would read as
-  // `PANIC` (108 against a threshold of 44), trigger a committed retreat, and
-  // send the robot running for another region because a brute threw something.
-  // Stepping out of the circle is the whole correct response, and that is what
-  // the candidate deltas below do with it.
-  const hereRisk = riskAt(view, threats, NO_HAZARDS, px, py);
+  // *commitments* below are made on — the retreat latch's second exit, whether a
+  // potion is worth walking to — and those are judgments about whether to stay in
+  // the fight, not about where to put a foot. A bomb is a 0.3s event that the
+  // ground under the robot is about to have; if it counted here it would read as
+  // a full-blown emergency (108, against a hunter's 28.8) and release or hold a
+  // committed retreat because a brute threw something. Stepping out of the
+  // circle is the whole correct response, and that is what the candidate deltas
+  // below do with it.
+  const hereRisk = riskAt(threats, NO_HAZARDS, px, py);
 
   // ── Potions ──────────────────────────────────────────────────────────────
   // Scored by what they do, discounted by how far the walk is, and skipped
@@ -897,43 +1090,122 @@ export function decide(
   // `nearest` stays the true nearest and drives the safety gates below — a
   // disengage radius and a "is the medicine nearer than the danger" test are
   // questions about the closest threat, not about the one we chose to farm.
-  // `target` is what the kite and roam rungs actually walk toward.
-  const hereRegion = regionIndexAtPoint(view.width, view.height, px, py);
   let nearest: Threat | null = null;
   for (const t of threats) {
     if (nearest === null || t.dist < nearest.dist) nearest = t;
   }
-  const target = pickTarget(view, threats, hereRegion);
 
-  // Three ways to decide a fight is not worth having. `PANIC` is "this is
-  // overwhelming" — a brute on top of us, or a pack — and it is high enough that
-  // an ordinary scrap never reaches it, because contact below it is the kite
-  // rung's job. The other is low hp with something actually close: firing on
-  // `hpFrac` alone means fleeing leashed strangers across the arena that are not
-  // chasing and cannot reach.
+  // ── The objective lock (design §14.2) ────────────────────────────────────
+  // The user's strategy: pick a direction by where the monsters are, clear the
+  // monsters along it, and re-choose only when actually pushed off course.
   //
-  // Note what is *not* here any more: a threshold on everyday contact. The old
-  // trigger was `hereRisk > PANIC || hereRisk > KITE_MAX_RISK` with PANIC at 16
-  // and KITE_MAX_RISK at 9, so the second clause swallowed the first and any
-  // single monster in reach sent the robot running for another region — through
-  // the monster, since that was where the goal pointed. See `PANIC`.
+  // What this replaces is a per-frame argmax over cluster scores. The argmax
+  // was not the robot's main source of dithering — `flee` owns ~96% of frames
+  // and never reads it — but it is why the robot had no *destination*: the
+  // monster it walked at could change between two frames whose scores were
+  // within a hair, so "walk toward the biggest knot" was never a walk, only a
+  // twitch. Freezing the knot's centroid gives the walk something that sits
+  // still, and §14.6's 187 reversals per run have one fewer contributor.
+  const pick = pickTarget(view, threats);
+  let objective: Threat | null = null;
+  if (pick === null) {
+    // Nothing alive to walk at: there is no objective, and holding the last
+    // one would be remembering a monster.
+    state.locked = false;
+  } else {
+    let drop = !state.locked;
+    if (state.locked) {
+      const route = Math.hypot(
+        state.objectiveX - state.originX,
+        state.objectiveY - state.originY,
+      );
+      const limit = objectiveLimit(route, standoffRing(p.attackRange, pick.t.reach));
+      const dev = perpendicular(
+        px,
+        py,
+        state.originX,
+        state.originY,
+        state.objectiveX,
+        state.objectiveY,
+      );
+      // The knot is "cleared" when nothing is standing in it any more — but
+      // only tested on arrival. Monsters respawn in their home regions on a
+      // 2.5–6s clock (`respawnSeconds` decays to a 0.8s floor), so a dense
+      // area does not stay empty; and a window that happens to open *en route*
+      // would re-lock the robot to whatever is nearest it right now — a near
+      // knot — and walk it back. That is the flip-flop this lock exists to
+      // remove, at a lower frequency.
+      const arrived =
+        Math.hypot(px - state.objectiveX, py - state.objectiveY) <=
+        2 * ROBOT.CLUSTER_RADIUS;
+      const held = threats.some(
+        (t) =>
+          Math.hypot(t.m.posX - state.objectiveX, t.m.posY - state.objectiveY) <=
+          ROBOT.CLUSTER_RADIUS,
+      );
+      drop = dev > limit || (arrived && !held);
+    }
+    if (drop) {
+      state.objectiveX = pick.cx;
+      state.objectiveY = pick.cy;
+      state.originX = px;
+      state.originY = py;
+      state.locked = true;
+    }
+    // Under a lock the monster to fight is the member of the committed knot
+    // that is nearest the locked point — a member, never the centre, because
+    // the standoff ring is the whole tactic and the centre of a cluster is the
+    // one place in it with no ring to stand on.
+    objective = nearestToPoint(threats, state.objectiveX, state.objectiveY);
+  }
+  /** What the kite and roam rungs walk at. */
+  const target = objective ?? pick?.t ?? null;
+
+  // Where a retreat is measured from, and what it runs at. One value, shared by
+  // the flee goal — a release measured against a different danger than the
+  // direction was would let the robot decide it had escaped while still running
+  // straight at the thing.
+  const danger = dangerCentre(threats);
+
+  // ── The retreat latch ────────────────────────────────────────────────────
+  // Both ends are now *local*, and that is the repair §14.6 needed. The old
+  // enter test was `hereRisk > PANIC`, a threshold on a **sum** over every
+  // aware monster, so the contour it describes grows with the crowd: two
+  // hunters at equal distance can trip it from 141px, three from 217px, five
+  // from 248px. In an arena with five to seven monsters aware at all times the
+  // robot was inside that contour on essentially every frame, and the exit
+  // (`hereRisk < KITE_SAFE_RISK`) sat at the same crowd-dependent radius. The
+  // latch had no reachable exit: measured, 12 seeds produced 13 retreats — one
+  // per run — with a median span of 15.7s and `flee` at 99.8% of all frames.
+  //
+  // Contact is the honest trigger. It is what the game actually does to you,
+  // it is the same test the old ring-breach weight used, and it does not move
+  // when the crowd does. The exit is
+  // `FLEE_RELEASE_DIST`, which sits *outside* the ring at 51 by construction,
+  // so ordinary farming never trips it and a retreat that opened real distance
+  // always does. `hereRisk < KITE_SAFE_RISK` stays as a second exit, for the
+  // retreats contact cannot explain — a bomb field, a stale latch.
+  const threatened =
+    (nearest !== null && nearest.dist <= nearest.reach) ||
+    (hpFrac < ROBOT.FLEE_HP &&
+      nearest !== null &&
+      nearest.dist <= ROBOT.DISENGAGE_RADIUS);
+  if (threatened) state.retreating = true;
+  else if (
+    nearest === null ||
+    nearest.dist > ROBOT.FLEE_RELEASE_DIST ||
+    hereRisk < ROBOT.KITE_SAFE_RISK
+  ) {
+    state.retreating = false;
+  }
+  const inDanger = state.retreating;
+
   const toCentre = unitTo(px, py, view.width / 2, view.height / 2);
   const healDist = bestHeal
     ? Math.hypot(bestHeal.item.posX - px, bestHeal.item.posY - py)
     : Infinity;
-  const healIsNearerThanDanger = bestHeal !== null && (nearest === null || healDist < nearest.dist);
-  const threatened =
-    hereRisk > ROBOT.PANIC ||
-    (hpFrac < ROBOT.FLEE_HP &&
-      nearest !== null &&
-      nearest.dist <= ROBOT.DISENGAGE_RADIUS);
-
-  // Latch it. Entering is easy; leaving needs the risk to actually be gone, so
-  // the retreat is committed rather than re-litigated every frame. The gap
-  // between the two thresholds is the whole point — see `RobotState`.
-  if (threatened) state.retreating = true;
-  else if (hereRisk < ROBOT.KITE_SAFE_RISK) state.retreating = false;
-  const inDanger = state.retreating;
+  const healIsNearerThanDanger =
+    bestHeal !== null && (nearest === null || healDist < nearest.dist);
 
   // ── Intent, first match wins ─────────────────────────────────────────────
   //
@@ -956,39 +1228,30 @@ export function decide(
       goalY = u[1];
     }
   } else if (inDanger) {
-    // Disengaging: straight away from what is on us, curving toward the safest
-    // region. The radial half leads so the escape never routes through the
-    // attacker; the tangential half, oriented toward the refuge, is what stops
-    // a retreat from being a straight backpedal into the wall behind.
+    // Disengaging: straight away from where the danger *is*.
+    //
+    // This used to be a radial half away from `nearest` plus a tangential half
+    // curving toward the safest region. Both halves are gone. The tangential
+    // one went because it steered a cross-arena retreat, which is not what the
+    // user asked for ("flee 只做局部脱离") — and with the leash gone a "safest
+    // region" is not a refuge from anything that saw you, only a place with
+    // fewer bodies in it right now. The radial one's *source* went because
+    // `nearest` changes identity about ten times a second in a crowd and every
+    // swap reversed the escape by up to 180°: that was the vibration, and
+    // `dangerCentre` is the repair.
+    //
+    // What is left is a single unit vector away from a continuous point, which
+    // is the most stable heading this policy can produce and the only one that
+    // can hold long enough to break an aggro.
     intent = "flee";
-    const refuge = refugeRegion(view, threats, px, py);
-    if (nearest) {
-      const away = unitTo(nearest.m.posX, nearest.m.posY, px, py);
-      if (away) {
-        goalX = ROBOT.FLEE_RADIAL * away[0];
-        goalY = ROBOT.FLEE_RADIAL * away[1];
-        const toRef = refuge ? unitTo(px, py, refuge.cx, refuge.cy) : null;
-        if (toRef) {
-          // Perpendicular to the escape line, oriented by whichever side also
-          // leads to the refuge. Same construction as the kite's orbit.
-          const tx = -away[1];
-          const ty = away[0];
-          const s = tx * toRef[0] + ty * toRef[1] < 0 ? -1 : 1;
-          goalX += ROBOT.FLEE_ORBIT * s * tx;
-          goalY += ROBOT.FLEE_ORBIT * s * ty;
-        }
-      }
-    } else if (refuge) {
-      // Nothing on us but still latched (the hp clause, usually): just go.
-      const u = unitTo(px, py, refuge.cx, refuge.cy);
-      if (u) {
-        goalX = u[0];
-        goalY = u[1];
-      }
-    }
-    if (Math.hypot(goalX, goalY) < 1e-6 && toCentre) {
-      // Standing on top of it: fall back to the middle, which at least is not a
-      // corner.
+    const from = danger ? unitTo(danger.cx, danger.cy, px, py) : null;
+    if (from) {
+      goalX = from[0];
+      goalY = from[1];
+    } else if (toCentre) {
+      // Nothing on us but still latched (the hp clause, usually, or standing
+      // exactly on top of the danger): fall back to the middle, which at least
+      // is not a corner.
       goalX = toCentre[0];
       goalY = toCentre[1];
     }
@@ -1014,11 +1277,7 @@ export function decide(
     intent = "kite";
     const u = unitTo(px, py, target.m.posX, target.m.posY);
     if (u) {
-      const desired = clamp(
-        p.attackRange - ROBOT.STANDOFF_MARGIN,
-        target.reach + ROBOT.BAND,
-        p.attackRange - 2,
-      );
+      const desired = standoffRing(p.attackRange, target.reach);
       // Proportional, not a sign: at the ring the radial term vanishes and the
       // robot orbits instead of chattering between "in" and "out".
       //
@@ -1042,15 +1301,26 @@ export function decide(
       // outside our own reach, 4px as shipped — puts the radial term at full
       // strength for the whole approach and lets the ring, not the orbit,
       // decide when to stop. See the "with nothing in range" check.
+      //
+      // Both bands now carry a deadband, and that is a separate repair from the
+      // saturation above. `err` reaching full strength over 4px means that
+      // within four pixels of the ring the radial term swings the whole 0→1
+      // while the orbit holds at 0.6, which rotates the goal by ~59° in under
+      // two frames of travel — and since both bodies move 2–2.8px per frame,
+      // `target.dist` crosses `desired` constantly and the rotation is
+      // continuous. Inside the deadband the radial term is zero and the orbit
+      // decides alone, which is a heading that holds. See `KITE_ERR_DEADBAND`.
       const err =
         target.dist >= desired
           ? clamp(
-              (target.dist - desired) / Math.max(1, p.attackRange - desired),
+              (target.dist - desired - ROBOT.KITE_ERR_DEADBAND_OUT) /
+                Math.max(1, p.attackRange - desired),
               0,
               1,
             )
           : -clamp(
-              (desired - target.dist) / Math.max(1, desired - target.reach),
+              (desired - target.dist - ROBOT.KITE_ERR_DEADBAND) /
+                Math.max(1, desired - target.reach),
               0,
               1,
             );
@@ -1113,15 +1383,12 @@ export function decide(
   // the price of also walking through everyone else.
   //
   // Gated on being out of our own range: once the target is inside it we are
-  // farming, and `KITE_CONTACT_WEIGHT` below owns that case.
+  // farming, and the latch above has already taken the frame.
   const ignoring =
     (intent === "kite" || intent === "roam") && target !== null && target.dist > p.attackRange
       ? target.m.id
       : null;
-  const hereForScore =
-    ignoring === null
-      ? riskAt(view, threats, view.hazards, px, py)
-      : riskAt(view, threats, view.hazards, px, py, ignoring);
+  const hereForScore = riskAt(threats, view.hazards, px, py, ignoring);
   // Hazards *are* in this baseline, unlike in the `hereRisk` above, and both
   // halves of that are deliberate. The delta is measured against where the robot
   // is standing, so a bomb underfoot has to be in the baseline for stepping out
@@ -1130,21 +1397,25 @@ export function decide(
   // simply standing in it — and ties fall to idle. In the baseline, standing
   // still scores 0 and every step out of the circle scores a clamped reward, so
   // "move" wins the frame the reticle appears.
-  // A ring that has already been breached is a retreat, not a farm, and it has
-  // to be priced like one — at `KITE_CONTACT_WEIGHT`, which is `RISK_CAP` and
-  // therefore the cheapest bid that can outvote a saturated risk delta. Nothing
-  // else changes: the ring still converges on `desired`, so the robot backs off
-  // to just inside its own reach and stops there rather than leaving the region,
-  // which is the "慢慢远离怪物，但是又不能跑的太远" the user asked for. Gated on
-  // `reach` rather than on the ring, because `reach` is the moment blows start
-  // landing and the moment this has to be decisive. See the constant for the
-  // measurements.
-  const weight =
-    intent === "kite" && nearest !== null && nearest.dist <= nearest.reach
-      ? ROBOT.KITE_CONTACT_WEIGHT
-      : ROBOT.GOAL[intent];
+  // A ring that has already been breached *is* a retreat, and it is priced as
+  // one — but not here. This used to pay `ROBOT.KITE_CONTACT_WEIGHT` whenever
+  // `kite` ran with the target inside its own `reach`, and that arm is now
+  // **unreachable**: the latch above enters on exactly `nearest.dist <=
+  // nearest.reach`, so any frame that would satisfy this test has already been
+  // routed to `flee` before the ladder reaches `kite`. The two were the same
+  // predicate, and the latch got there first.
+  //
+  // Proven, not assumed: overriding the weight to 1000 — a value that would
+  // dominate every score if the branch ever ran — leaves the sweep output
+  // byte-identical. So the constant was deleted rather than re-tuned: the
+  // contact case belongs to `flee` now, and `flee` backs off radially until
+  // `FLEE_RELEASE_DIST` and then lets the ring converge on `desired` again,
+  // which is the "慢慢远离怪物，但是又不能跑的太远" the user asked for, arrived at
+  // from the other side.
+  const weight = ROBOT.GOAL[intent];
   let bestInput: MoveInput = CANDIDATES[0];
   let bestScore = -Infinity;
+  let standing: { input: MoveInput; total: number } | null = null;
 
   for (const c of CANDIDATES) {
     // The probe must be the *real* step this input would produce, which since
@@ -1180,48 +1451,21 @@ export function decide(
     // steers only: the delta is clamped so a cliff edge cannot veto motion
     // outright, which is what `RISK_CAP` documents at length.
     //
-    // **The baseline is the worse of the two worlds, and that is what lets the
-    // robot approach across a border at all.** `riskAt` honours the region leash
-    // (§6.2), so `hereRisk` and `riskAt(next)` are sums over *different sets* of
-    // monsters whenever the step crosses a border — the delta then prices "I
-    // changed region" as though it were "I moved toward danger". Measured on the
-    // stalled frames: 166863 of 166919 were blocked by risk, 96% of them crossed
-    // a border, and the crossing lit a median of 4 monsters that the leash had
-    // been hiding, taking the raw delta to ~23 and the clamped one to the cap.
+    // **The baseline is simply where the robot is standing.** It used to be the
+    // worse of two worlds: `riskAt` honoured the region leash (§6.2), so
+    // `hereRisk` and `riskAt(next)` were sums over *different sets* of monsters
+    // whenever the step crossed a border, and the delta priced "I changed region"
+    // as though it were "I moved toward danger". Measured on the stalled frames:
+    // 166863 of 166919 were blocked by risk, 96% of them crossed a border, and
+    // the crossing lit a median of 4 monsters the leash had been hiding, taking
+    // the raw delta to ~23 and the clamped one to the cap.
     //
-    // Taking `max` of the two worlds fixes it without weakening the field.
-    // Crossing into a *worse* region stops being a cliff, because the baseline
-    // rises to that region's own value — leaving only the genuine gradient
-    // within it. Crossing into a *better* one keeps its full reward, because the
-    // baseline stays at the worse world being left, so escaping a region that is
-    // hunting you is worth exactly what it was worth before. Both directions
-    // become "priced in whichever world is more dangerous", which is the
-    // conservative reading and the one that does not confuse a change of
-    // jurisdiction with a change of position.
-    const destRegion = regionIndexAtPoint(view.width, view.height, nx, ny);
-    // ...but only for the *deliberate approach*, never as a general licence to
-    // cross. Applied to every candidate it is catastrophic, and measurably so:
-    // the robot stops paying for jurisdiction changes anywhere, wanders into
-    // whichever region looks cheapest to enter, and gets surrounded — median
-    // survival 7.14x -> 4.68x, seeds reaching the cap 96/96 -> 50/96, worst seed
-    // 3.59x -> 0.33x, while kills *rose* 7169 -> 10734. Greedy and dead.
-    //
-    // Scoped to a step that closes on the committed target, it fixes exactly the
-    // defect and nothing else. What makes that safe rather than a loophole is
-    // that the target's endpoint is the ring, and the ring is outside the
-    // target's own reach by construction — so the approach has a stop condition
-    // the robot has already agreed to. Every *other* monster is still priced in
-    // full at the destination, border or no border, which is why this cannot
-    // walk it into a pack: the pack is not the target, so the pack still votes.
-    const toward =
-      ignoring !== null &&
-      target !== null &&
-      Math.hypot(target.m.posX - nx, target.m.posY - ny) < target.dist - 0.01;
-    const base =
-      !toward || destRegion === hereRegion
-        ? hereForScore
-        : Math.max(hereForScore, riskAt(view, threats, view.hazards, px, py, ignoring, destRegion));
-    const delta = riskAt(view, threats, view.hazards, nx, ny, ignoring) - base;
+    // With the leash gone there is only one world: both sums range over the same
+    // monsters, so the delta is a genuine spatial gradient and there is nothing
+    // left to reconcile. Crossing a border is now priced as the step it is —
+    // cheap if the ground beyond is empty, dear if it is not — and the stall that
+    // motivated the whole `max` construction has no mechanism left to happen.
+    const delta = riskAt(threats, view.hazards, nx, ny, ignoring) - hereForScore;
     const risk = clamp(delta, -ROBOT.RISK_CAP, ROBOT.RISK_CAP);
 
     // Standing near a wall is bad on its own account: it removes the directions
@@ -1253,10 +1497,49 @@ export function decide(
 
     // Strict `>` with `CANDIDATES` ordered idle-first: ties fall to the lowest
     // index, so a genuinely indifferent frame stands still instead of jittering.
-    if (score + sticky > bestScore) {
-      bestScore = score + sticky;
+    const total = score + sticky;
+    if (total > bestScore) {
+      bestScore = total;
       bestInput = c;
     }
+    // The standing direction's own score, for the commitment test below. Idle
+    // is not a standing direction — see `HYST`'s note on what letting it hold
+    // the bonus did.
+    if (moving && c.dx === state.lastDx && c.dy === state.lastDy) {
+      standing = { input: c, total };
+    }
+  }
+
+  // ── Commitment ───────────────────────────────────────────────────────────
+  // Keep the direction the robot is already walking unless something beats it
+  // outright. This is the fix for §14.6's reversals, and the `standing` capture
+  // above is what makes it collectable only by a *moving* repeat — idle is
+  // never the standing choice, so it must win on its own score like everything
+  // else (see `HYST`).
+  //
+  // The score is `goal − risk − wall`, and the two halves are mismatched: the
+  // goal term caps at `GOAL[intent]` × ~1.17 ≈ 7 while the risk term clamps at
+  // ±`RISK_CAP` = ±12. Risk therefore outbids the goal by 1.7×, and on a 40px
+  // probe through five to seven aware monsters the winner flips between two
+  // adjacent candidates whenever the risk field's local saddle moves — which,
+  // with the monsters walking, is most frames. `HYST` is what has to bridge
+  // that gap, and at 1.5 it was a twelfth of the risk swing: far too small.
+  //
+  // It has to be fixed, not just cosmetically, because the escape mechanic is
+  // not per-frame: breaking a hunter's aggro takes ~3.9s of unbroken running,
+  // so a robot that reverses every seven frames never accumulates it and the
+  // mechanic may as well not exist for it.
+  //
+  // This was once `MOVE_MARGIN`, a second constant applied right here. It was
+  // **the same bonus in the same units** — the previous direction winning ties
+  // by an extra margin is exactly what `sticky` already does — so the two were
+  // really one knob reading `HYST + MOVE_MARGIN`. Measured: `HYST` 6 with
+  // `MOVE_MARGIN` 2 and `HYST` 8 with none produce *byte-identical* sweep
+  // output over 96 seeds, on all eight reported statistics. Two knobs for one
+  // job is one knob too many, so `MOVE_MARGIN` is gone and `HYST` carries the
+  // whole commitment.
+  if (standing !== null && bestInput !== standing.input && standing.total >= bestScore) {
+    bestInput = standing.input;
   }
 
   state.lastDx = bestInput.dx;

@@ -110,8 +110,13 @@ export const TUNING = {
   /**
    * Px a bullet may travel before it fizzles — 2× the player's `attackRange`,
    * and 3.2× the brute's, so a target fleeing directly away is still caught
-   * while a stray shot still dies well inside the region it was fired in rather
-   * than crossing the arena to hit a stranger.
+   * while a stray shot dies close to where it was aimed instead of crossing the
+   * arena to hit a stranger.
+   *
+   * That second half used to be argued from the region: a shot died "inside the
+   * region it was fired in". Regions stopped bounding anything when the leash
+   * came out (§6.2), and the range does not depend on them — it is simply short
+   * against the 960px arena.
    */
   bulletRange: 110,
   /**
@@ -161,14 +166,14 @@ export const TUNING = {
   wanderSpeedScale: 0.45,
   wanderMinSeconds: 1,
   wanderMaxSeconds: 3.5,
-  /** Keeps wanderers off their region's edge. */
-  regionPad: 14,
   /**
-   * How close to its region's edge a *chasing* monster may get. Much smaller
-   * than `regionPad`: a monster that stopped short of the border could not
-   * reach a player standing just across it, which reads as a broken hitbox.
+   * Keeps wanderers off the arena's edge, so a drifting monster stays a body on
+   * screen rather than a sliver clipped by the wall.
+   *
+   * The one pad that is *not* applied is the chasing monster's — see the chase
+   * clamp in `stepSim`, which uses the same bounds as the player.
    */
-  chasePad: 2,
+  arenaPad: 14,
   spawnPad: 18,
 } as const;
 
@@ -342,9 +347,14 @@ export interface SimOptions {
 // ── Construction ────────────────────────────────────────────────────────────
 
 /**
- * The 3x3 region grid (design §4.1). The tiers are the whole point: corners are
- * safe and poor, the centre is rich and lethal, so "where do I stand" is a real
+ * The 3x3 region grid (design §4.1). It is a **spawn partition**: each region
+ * owns a target population, a respawn interval and an archetype mix, so the
+ * map's density and rhythm are spatially graded and "where do I stand" is a real
  * decision rather than a decoration.
+ *
+ * It is *not* a set of walls. Monsters are free to leave — the leash was removed
+ * deliberately (§6.2) — so a tier's numbers describe where its monsters are
+ * **born**, which over a long run is only loosely where they will be found.
  */
 export function buildRegions(width: number, height: number): RegionConfig[] {
   const cw = width / 3;
@@ -428,8 +438,9 @@ export function createSim(opts: SimOptions = {}): SimState {
       hp: TUNING.hp,
       maxHp: TUNING.hp,
       hpSpeed: TUNING.hpSpeed,
-      // Spawn in the middle of a corner region — the safe, poor tier, which is
-      // where a run should start (design §4.1).
+      // Spawn in the middle of a corner region — the thinnest, slowest-refilling
+      // tier, which is where a run should start (design §4.1). It is no longer a
+      // *safe* corner, only a quiet one: see §6.2.
       posX: configs[0].x + configs[0].w / 2,
       posY: configs[0].y + configs[0].h / 2,
     },
@@ -483,12 +494,17 @@ export function regionIndexAt(s: SimState, x: number, y: number): number {
   return regionIndexAtPoint(s.width, s.height, x, y);
 }
 
-/** Is `(x, y)` inside `cfg`? Half-open, to match `regionIndexAt`'s flooring. */
-function pointInRegion(cfg: RegionConfig, x: number, y: number): boolean {
-  return x >= cfg.x && x < cfg.x + cfg.w && y >= cfg.y && y < cfg.y + cfg.h;
-}
-
-/** Live monsters whose *home* is `region` — chasers elsewhere still count. */
+/**
+ * Live monsters whose *home* is `region`.
+ *
+ * It counts by **home**, not by where a monster is standing, and since the leash
+ * was removed (§6.2) those are no longer the same number: a region at its target
+ * count can have few or no monsters physically inside it. That is correct here,
+ * because the question this answers is the spawn budget's — "does this region
+ * still own its quota of living monsters?" — and not "how crowded does this
+ * region look?". A monster that wandered off and died elsewhere still respawns
+ * in its home region, so the ledger stays balanced either way.
+ */
 function countInRegion(s: SimState, region: number): number {
   let n = 0;
   for (const m of s.monsters) if (m.region === region) n++;
@@ -798,9 +814,15 @@ function killMonster(s: SimState, m: MonsterStats): void {
   });
 }
 
-/** Drift inside the home region, bouncing off its edges. */
+/**
+ * Drift across the arena, bouncing off its walls.
+ *
+ * It used to drift inside the monster's home region (§6.2's leash). Regions are
+ * a spawn partition and nothing else now, so the only bound left is the arena
+ * itself — and a monster that has lost the player wanders from wherever it lost
+ * them. There is deliberately no walk home: see §6.2 for what that costs.
+ */
 function wander(s: SimState, m: MonsterStats, dt: number): void {
-  const home = s.configs[m.region];
   m.wanderTimer -= dt;
   if (m.wanderTimer <= 0) {
     m.wanderTimer =
@@ -809,11 +831,11 @@ function wander(s: SimState, m: MonsterStats, dt: number): void {
   }
 
   const [vx, vy] = DIR_VECTORS[m.dir];
-  const pad = TUNING.regionPad;
-  const minX = home.x + pad;
-  const maxX = home.x + home.w - pad;
-  const minY = home.y + pad;
-  const maxY = home.y + home.h - pad;
+  const pad = TUNING.arenaPad;
+  const minX = pad;
+  const maxX = s.width - pad;
+  const minY = pad;
+  const maxY = s.height - pad;
 
   let nx = m.posX + vx * m.moveSpeed * TUNING.wanderSpeedScale * dt;
   let ny = m.posY + vy * m.moveSpeed * TUNING.wanderSpeedScale * dt;
@@ -915,19 +937,16 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
   // player's bullet, and that runs in the projectile phase below — so iterating
   // `s.monsters` directly is safe.
   for (const m of s.monsters) {
-    const home = s.configs[m.region];
     const dx = p.posX - m.posX;
     const dy = p.posY - m.posY;
     const dist = Math.hypot(dx, dy);
 
     m.attackCooldown -= dt;
-    // Two conditions, and the second is the load-bearing one: a monster fights
-    // only inside its *own* region. Without it the tiers are a lie — a hunter's
-    // 260px sense reaches from the adjacent edge region right into a corner, so
-    // the "safe" tier would be exactly as lethal as the centre, just later.
-    // Leashing also makes requirement 4's per-region independence real: the
-    // corner's population is decided by the corner.
-    m.attacking = dist <= m.senseRange && pointInRegion(home, p.posX, p.posY);
+    // One condition, and the region is deliberately not part of it. A monster
+    // fights whatever it can see, wherever it can see it — a hunter's 260px
+    // sense reaches from the edge region into the corner next door, so a corner
+    // is no longer a place a chaser cannot follow you into (§6.2).
+    m.attacking = dist <= m.senseRange;
 
     if (!m.attacking) {
       wander(s, m, dt);
@@ -936,12 +955,15 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
 
     m.dir = dirFromVector(dx, dy);
     const [vx, vy] = DIR_VECTORS[m.dir];
-    // Close in, but stop short of standing inside the player — and stay in the
-    // home region, so crossing a border is a real way to break aggro.
+    // Close in, but stop short of standing inside the player. The clamp is the
+    // **arena**, on exactly the player's own bounds — not a padded box, and not
+    // a region. A pad here would stop a chaser short of a player standing on the
+    // wall, which reads as a broken hitbox; the region version of this clamp is
+    // what used to make a border a way to break aggro (§6.2). Aggro now breaks
+    // only by outrunning `senseRange`.
     if (dist > m.attackRange * 0.7) {
-      const pad = TUNING.chasePad;
-      m.posX = clamp(m.posX + vx * m.moveSpeed * dt, home.x + pad, home.x + home.w - pad);
-      m.posY = clamp(m.posY + vy * m.moveSpeed * dt, home.y + pad, home.y + home.h - pad);
+      m.posX = clamp(m.posX + vx * m.moveSpeed * dt, 0, s.width);
+      m.posY = clamp(m.posY + vy * m.moveSpeed * dt, 0, s.height);
     }
     if (dist <= m.attackRange && m.attackCooldown <= 0) {
       // Which shot this is, is an archetype property (design §15): the wanderer

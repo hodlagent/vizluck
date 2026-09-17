@@ -11,8 +11,8 @@
  *
  * What lives here rather than in `game-tab.mjs`: everything that needs either
  * determinism (an injected rng) or wall-clock the UI test can't afford — dying,
- * respawn timing, the region leash, and the byte-distribution guarantee that
- * design §3.3 rests on.
+ * respawn timing, cross-region aggro (§6.2), and the byte-distribution
+ * guarantee that design §3.3 rests on.
  *
  * Usage:
  *   npm run test:e2e                 # starts a dev server if none is running
@@ -200,16 +200,35 @@ async function run() {
       );
     }
 
-    // ── §6.2 The leash ─────────────────────────────────────────────────────
+    // ── §6.2 Regions partition spawning, not movement ──────────────────────
+    //
+    // This block used to assert the opposite — that a monster never leaves its
+    // home region, that it cannot aggro a player elsewhere, and that "the
+    // corner tier really is a refuge". The leash was removed deliberately (the
+    // 3×3 is a spawn partition; it is not a wall), so the same setup now has to
+    // prove the inverse. It is worth keeping as the inverse rather than
+    // deleting, because these three facts are exactly what the removal changes
+    // and nothing else in the suite would notice them coming back.
     {
       const s = fresh();
-      // A hunter in the centre, with a sense range that would otherwise reach
-      // right across the arena — the exact case the leash exists for.
+      // A hunter in the centre, with a sense range that reaches right across
+      // the arena. Under the leash this was the case that motivated the rule:
+      // the monster could see the corner and still not come.
       const m = solo(s, "hunter", 4, (mm) => {
         mm.posX = s.configs[4].x + 2;
         mm.posY = s.configs[4].y + 2;
         mm.moveSpeed = 120;
         mm.senseRange = 4000;
+        // `solo` builds a puppet that deals nothing and never swings; without
+        // these three the "no refuge" check below would pass vacuously, which
+        // is what its predecessor did.
+        mm.attackPower = 8;
+        mm.attackSpeed = 1;
+        mm.attackCooldown = 0;
+        // ...and enough hp to survive the player's own auto-attack (§5.1),
+        // which starts landing the moment the hunter is inside 55px.
+        mm.hp = 1000;
+        mm.maxHp = 1000;
       });
       // Player parked in the corner region, far outside the hunter's region.
       s.player.posX = s.configs[0].x + s.configs[0].w / 2;
@@ -220,16 +239,16 @@ async function run() {
         sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
         if (!inRegion(m, s.configs[4])) leftRegion = true;
       }
-      check(!leftRegion, "a chasing monster never leaves its home region");
-      check(m.attacking === false, "a monster does not aggro a player outside its region");
+      check(m.attacking === true, "a monster aggros a player outside its home region");
+      check(leftRegion, "and chases it across the border");
       check(
-        s.player.hp === s.player.maxHp,
-        "the corner tier really is a refuge",
+        s.player.hp < s.player.maxHp,
+        "so the corner is no longer a refuge from something that saw you",
         `${s.player.hp}/${s.player.maxHp}`,
       );
     }
 
-    // ── §6.1 Aggro inside the region ───────────────────────────────────────
+    // ── §6.1 Aggro by sense range ──────────────────────────────────────────
     {
       const s = fresh();
       const m = solo(s, "hunter", 4, (mm) => {
@@ -240,7 +259,7 @@ async function run() {
       s.player.posX = s.configs[4].x + 10;
       s.player.posY = s.configs[4].y + 10;
       sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
-      check(m.attacking === true, "a monster aggros a player inside its own region");
+      check(m.attacking === true, "a monster aggros a player inside its sense range");
     }
 
     // ── Death freezes the run (§8) ─────────────────────────────────────────
@@ -375,14 +394,16 @@ async function run() {
       //
       // Both puppets here are killed at point-blank, and the blank is set up by
       // putting the **player** on the monster rather than the monster on the
-      // player. Two things make that the only arrangement that works now: a
-      // monster outside its home region is snapped back inside it by the wander
-      // clamp, and a shot is tested *after* the monsters have moved this step
-      // (design §15). So parking the monster on the player's spawn point while
-      // it claims region 4 moved it ~330px away in the very step being measured,
-      // and the shot missed. That was invisible for as long as the attack was
-      // hit-scan and resolved before the monster loop ever ran. The player is
-      // not leashed and can stand wherever a check needs them to.
+      // player — which a shot being tested *after* the monsters have moved this
+      // step (design §15) is what calls for: parking the monster on the player's
+      // spawn point while it claims region 4 used to move it ~330px away in the
+      // very step being measured, and the shot missed. That was invisible for as
+      // long as the attack was hit-scan and resolved before the monster loop ever
+      // ran. The leash's own contribution to this — the wander clamp snapping a
+      // monster back into its home region — is gone (regions partition spawning,
+      // §6.2), but the arrangement stays: the player can stand wherever a check
+      // needs them to, and the monster cannot.
+
       const home = 4;
       const cfg = fresh().configs[home];
       const at = (s) => {
@@ -439,7 +460,8 @@ async function run() {
           mm.posY = cfg.y + cfg.h / 2;
           mm.hp = 1;
         });
-        // The player comes to the monster, for the leash reason above — and
+        // The player comes to the monster — the puppet is frozen, so where the
+        // player stands is the only thing that decides the geometry — and
         // stands *on* it, so the shot is fired at zero range and still lands.
         s.player.posX = m.posX;
         s.player.posY = m.posY;
@@ -669,9 +691,10 @@ async function run() {
     // it lands, so these checks are about *when* a wound arrives and what makes
     // it never arrive at all — which is the whole reason the mechanic exists.
     //
-    // Every check below puts the **player** where it wants the fight, never
-    // drags a monster out of its home region (the wander clamp snaps it back
-    // mid-step) and never assumes a shot resolves on the step it was fired.
+    // Every check below puts the **player** where it wants the fight rather
+    // than moving a monster to meet it: the puppets here are frozen, so the
+    // arrangement is what decides the geometry. And no check assumes a shot
+    // resolves on the step it was fired.
     {
       const near = (a, b, eps = 1e-9) => Math.abs(a - b) <= eps;
       const T = sim.TUNING;
@@ -730,8 +753,8 @@ async function run() {
         s.attackCooldown = 0;
         step(s);
         check(s.projectiles.length === 1, "a shot is in the air");
-        // Still inside region 4 and still inside sense range — just no longer
-        // on the bullet's line.
+        // Still inside sense range, so it is still coming — just no longer on
+        // the bullet's line.
         m.posY = s.player.posY - 70;
 
         let lastRange = null;
@@ -1136,6 +1159,73 @@ async function run() {
         );
       }
 
+      // ── §14.2 The objective lock survives a nudge, and drops on a detour ──
+      //
+      // Two halves of the same contract. The lock exists to stop `target` being
+      // re-chosen every frame from a field whose scores straddle a moving
+      // saddle (design §14.2), so the thing worth pinning is that a *small*
+      // disturbance leaves it alone and a *large* one does not. Asserting only
+      // the first would pass trivially on a lock that never drops — which is
+      // the absorbing-latch failure §14.6 records for the retreat latch, one
+      // boolean over.
+      {
+        const s = fresh();
+        const cfg = s.configs[4];
+        s.monsters.length = 0;
+        s.items.length = 0;
+        // A knot in the centre, spread by less than `CLUSTER_RADIUS` so it
+        // reads as one group. `solo` empties the list on every call, so build
+        // them aside and push the batch — and give them distinct ids, since
+        // `solo` hands out 999 to everything.
+        const knot = [-30, 0, 30].map((dx) => {
+          const m = solo(s, "wanderer", 4, (mm) => {
+            mm.posX = cfg.x + cfg.w / 2 + dx;
+            mm.posY = cfg.y + cfg.h / 2;
+            mm.hp = 1e9;
+            mm.maxHp = 1e9;
+          });
+          m.id = 900 + dx;
+          return m;
+        });
+        s.monsters.length = 0;
+        s.monsters.push(...knot);
+        // The player starts well back so the route is long: the deviation limit
+        // is a *fraction* of it, and a short route would put `d / 3` below the
+        // robot's own turning radius, making the second half untestable. At
+        // ~310px the limit is ~103px, so a 10px nudge is unambiguously inside
+        // it and a 310px shove unambiguously outside.
+        s.player.posX = cfg.x - 150;
+        s.player.posY = cfg.y + cfg.h / 2;
+
+        const st = robot.createRobotState();
+        robot.decide(robot.perceive(s), st);
+        check(st.locked, "the robot locks an objective");
+        const lockedX = st.objectiveX;
+        const lockedY = st.objectiveY;
+
+        // A nudge well inside the limit: 10px sideways against a route of
+        // several hundred. The lock must not move.
+        s.player.posY += 10;
+        for (let i = 0; i < 5; i++) robot.decide(robot.perceive(s), st);
+        check(
+          st.locked && st.objectiveX === lockedX && st.objectiveY === lockedY,
+          "a nudge does not re-choose it",
+          `objective moved ${Math.hypot(st.objectiveX - lockedX, st.objectiveY - lockedY).toFixed(0)}px`,
+        );
+
+        // Now shove it far off the route. The perpendicular distance to the
+        // origin→objective line exceeds `d / 3`, so the lock must be rebuilt —
+        // and rebuilt *here*, which is what `origin` records.
+        const route = Math.hypot(lockedX - st.originX, lockedY - st.originY);
+        s.player.posY += route; // comfortably past d/3
+        robot.decide(robot.perceive(s), st);
+        check(
+          st.originX === s.player.posX && st.originY === s.player.posY,
+          "a real detour re-locks from where the robot now is",
+          `route ${route.toFixed(0)}px, new origin (${st.originX.toFixed(0)}, ${st.originY.toFixed(0)})`,
+        );
+      }
+
       // ── §14.2 With nothing in range, it goes and gets in range ───────────
       //
       // The user's report: "robot 的 range 范围内没有怪物的时候，应该……尝试去攻
@@ -1185,8 +1275,10 @@ async function run() {
         const s = fresh();
         s.monsters.length = 0;
         s.items.length = 0;
-        // Put a leashed stranger in another region purely so the robot is not
-        // in a world with nothing to do — it must still prefer the potion.
+        // Put a stranger in the far corner purely so the robot is not in a
+        // world with nothing to do — it must still prefer the potion. Regions
+        // are spawn partitions, not movement bounds (§6.2), so the corner buys
+        // distance and nothing else.
         solo(s, "brute", 8, (mm, cfg) => {
           mm.posX = cfg.x + 10;
           mm.posY = cfg.y + 10;
@@ -1223,11 +1315,15 @@ async function run() {
       //
       // Seeds are `i * 1013 + 7`, the same family the policy was tuned against,
       // and the thresholds are grounded in a 96-seed headless sweep rather than
-      // in these twelve: there, the median run outlives an idle control by
-      // 7.14×, every one of the 96 seeds reaches the cap, and the worst still
-      // manages 3.59×. Asserting the median rather than a mean is deliberate —
-      // one unlucky trajectory cannot move it, and survival is genuinely
-      // bimodal.
+      // in these twelve. **They were re-baselined when the region leash came
+      // out (§6.2), and they did not come back to the old levels** — that world
+      // is gone and its numbers are not a target. On 96 seeds now: median 2.48×
+      // (was 6.49× leashed), worst 1.25×, escapes 46.0% (was 66.1%), 0/96 reach
+      // the cap (was 96/96). The robot is *less* protected than the leashed
+      // version and *more* stable; §14.6 carries the trade in full.
+      //
+      // Asserting the median rather than a mean is deliberate — one unlucky
+      // trajectory cannot move it, and survival is genuinely bimodal.
       {
         const SEEDS = [];
         for (let i = 1; i <= 12; i++) SEEDS.push(i * 1013 + 7);
@@ -1235,6 +1331,12 @@ async function run() {
         const ratios = [];
         let capped = 0, kills = 0, pickups = 0;
         let contact = 0, escaped = 0;
+        // Dithering, measured the way the sweep measures it: a reversal is
+        // leaving a moving frame for a *different* non-zero direction. This is
+        // the round's main criterion, so it is asserted here too rather than
+        // only in `sweep-robot.mjs`, which is not part of `npm run test:e2e`.
+        let reversals = 0;
+        let lastDx = 0, lastDy = 0;
 
         for (const seed of SEEDS) {
           const idleRun = sim.createSim({ rng: rngFrom(seed) });
@@ -1242,6 +1344,12 @@ async function run() {
 
           const run = sim.createSim({ rng: rngFrom(seed) });
           const st = robot.createRobotState();
+          // Each run starts with a fresh policy state, so the "previous input"
+          // has to be fresh too — otherwise the first frame of this run is
+          // compared against the last frame of the previous one and invents a
+          // reversal at every seed boundary.
+          lastDx = 0;
+          lastDy = 0;
           while (run.alive && run.time < CAP) {
             // The nearest monster, and whether it is already hitting us — the
             // state the user reported on. Sampled before the step, so the
@@ -1256,7 +1364,16 @@ async function run() {
             const inReach = near.m !== null && near.d <= near.m.attackRange;
             const id = near.m === null ? -1 : near.m.id;
 
-            sim.stepSim(run, robot.decide(robot.perceive(run), st).input, 1 / 60);
+            const decision = robot.decide(robot.perceive(run), st);
+            const wasMoving = lastDx !== 0 || lastDy !== 0;
+            const isMoving = decision.input.dx !== 0 || decision.input.dy !== 0;
+            if (wasMoving && isMoving && (decision.input.dx !== lastDx || decision.input.dy !== lastDy)) {
+              reversals++;
+            }
+            lastDx = decision.input.dx;
+            lastDy = decision.input.dy;
+
+            sim.stepSim(run, decision.input, 1 / 60);
 
             if (inReach && run.alive) {
               const after = run.monsters.find((m) => m.id === id);
@@ -1276,40 +1393,67 @@ async function run() {
         ratios.sort((a, b) => a - b);
         const median = ratios[ratios.length >> 1];
         check(
-          median >= 3,
+          median >= 2,
           "the robot outlives an idle player by several times (median)",
-          `${median.toFixed(2)}x over ${SEEDS.length} seeds`,
+          `${median.toFixed(2)}x over ${SEEDS.length} seeds, ${capped} reached the cap`,
         );
-        check(capped >= 10, "and most runs reach the 10-minute cap rather than dying", `${capped}/${SEEDS.length}`);
+        // The cap used to be asserted here — "most runs reach the 10-minute
+        // cap" held 96/96 in the leashed world, because a leash let the robot
+        // park monsters somewhere they could not follow. Without it 0/96 reach
+        // the cap and the statistic cannot fail, so what replaces it is the
+        // property this round actually established: the robot holds a heading
+        // long enough to matter. The escape mechanic needs ~3.9s of unbroken
+        // running to break a hunter's aggro, and a vibrating robot never gets
+        // there — pre-fix this was 90 reversals/run and a 1.37s longest run, now
+        // 20 and 2.95s (96 seeds). The bound is loose on purpose: it is a
+        // dithering alarm, not a tuned figure, and the twelve-seed sample runs
+        // fewer reversals than the full sweep does.
+        const reversalsPerRun = reversals / SEEDS.length;
+        check(
+          reversalsPerRun < 60,
+          "and it holds a heading instead of vibrating in place",
+          `${reversalsPerRun.toFixed(1)} reversals/run`,
+        );
         check(
           ratios[0] > 1,
           "even the worst seed outlives standing still",
           `worst ${ratios[0].toFixed(2)}x`,
         );
         // "Plays rather than hides": a robot that only survived by retreating
-        // would clear the ratio above with nothing to show for it.
-        check(kills > 0 && pickups > 0, "and it is playing, not hiding", `${kills} kills, ${pickups} pickups`);
+        // would clear the ratio above with nothing to show for it. Kills carry
+        // that claim on their own — `pickups` used to be conjoined here and is
+        // not any more, because at 0.55 pickups per run (96 seeds: 53) a
+        // twelve-seed `> 0` is close to a coin flip and would fail on noise.
+        check(kills > 0, "and it is playing, not hiding", `${kills} kills, ${pickups} pickups`);
 
         // ── §14.2 The user's report, as a number ──────────────────────────
         //
         // "怪物冲到player面前了，player没有跑." The retreat test above does not
         // catch this one and never did — it parks the robot beside a single
         // monster in an otherwise empty arena, where the escape direction has
-        // nothing in its way. The real failure was positional: `riskAt` honours
-        // the region leash (design §6.2), so a `PROBE_S` step of 40px
-        // (`moveSpeed` 160 × 0.25) that crosses a border reports the risk of a
-        // *different region*, and when the escape direction was the one pointing
-        // at that border the risk term vetoed it. It needs the whole arena to
-        // reproduce, not a puppet.
+        // nothing in its way. It needs the whole arena to reproduce, not a
+        // puppet, because the failure is about *crowding*: with several monsters
+        // on the risk field the risk term's ±`RISK_CAP` swing outbids the goal
+        // term (`GOAL[flee] × |goal|` ≈ 7.0), and once the region leash was
+        // lifted (design §6.2) the field was high everywhere, so no direction
+        // stayed best for long. The check above is the direct measure of that
+        // (dithering); this one is the behaviour it was supposed to cause.
         //
-        // Measured over the 96-seed sweep: 26-34% of contact frames opened the
-        // gap before `KITE_CONTACT_WEIGHT` existed, 66% under the shipped policy
-        // (`docs/game-design.md` §14.5 cites the same run). The threshold sits
-        // below that because this is a twelve-seed sample and the statistic is
-        // noisy.
+        // **The bar came down, on purpose, and this is the one place the round
+        // is a trade rather than a win.** 0.55 was a leashed-world figure —
+        // there the robot opened the gap on 66.1% of contact frames, because it
+        // was reacting to every touch. Commitment is precisely the decision to
+        // *not* react to every touch: holding a heading means walking through
+        // some contacts in order to accumulate the ~3.9s of unbroken running a
+        // real disengage needs. So 46.0% is the cost of the fix, not a
+        // regression from it, and the number that shows the mechanic now exists
+        // is the 2.95s longest straight run, not this. The bound is set well
+        // under the shipped figure to alarm only on a collapse toward "stands
+        // there and takes it" (`escapeRate` 0), which is the failure the user
+        // reported; it is not a tuned target.
         const escapeRate = contact ? escaped / contact : 0;
         check(
-          escapeRate > 0.55,
+          escapeRate > 0.35,
           "in contact, it opens the gap rather than standing there",
           `${(escapeRate * 100).toFixed(0)}% of ${contact} contact frames`,
         );

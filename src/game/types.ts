@@ -76,15 +76,19 @@ export interface MonsterStats {
   /** Seconds until this monster may attack again. */
   attackCooldown: number;
   /**
-   * Home region index (0..8). A monster is leashed to it: it wanders, chases
-   * and dies there, and its respawn is scheduled there. Per-region counts are
-   * therefore meaningful, and each tier's difficulty is its own.
+   * **Home** region index (0..8) — where this monster was spawned, where it
+   * respawns when killed, and which region's spawn budget it is counted against.
+   *
+   * It is not a leash and not a location: since §6.2's leash was removed, a
+   * monster wanders and chases wherever it likes, and `posX`/`posY` may be in
+   * any region or none of this one's. Use `regionIndexAt` for "where is it
+   * standing"; use this for "whose quota is it".
    */
   region: number;
   /**
-   * True while the player is inside this monster's `senseRange` **and** inside
-   * its home region — see design §6. Aggro, damage and `V`'s aggro byte all
-   * follow this one flag.
+   * True while the player is inside this monster's `senseRange` — design §6.
+   * Aggro, damage and `V`'s aggro byte all follow this one flag. The region is
+   * not part of it.
    */
   attacking: boolean;
   /** Seconds until this monster picks a new wander heading. */

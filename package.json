@@ -8,6 +8,7 @@
     "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test:e2e": "node tests/hex-tab.mjs && node tests/game-tab.mjs && node tests/game-sim.mjs",
+    "sweep:robot": "node tests/sweep-robot.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
