@@ -348,6 +348,7 @@ export const ROBOT = {
    * *along* that line stays on it and is overtaken by 120px/s of closing speed.
    */
   ORBIT: 0.6,
+
   /**
    * The same knob for `flee`, and it is a separate one because the two rungs
    * cannot share a value.
@@ -646,6 +647,46 @@ export const ROBOT = {
 
   /** Inside this radius a monster is worth farming rather than ignoring. */
   FARM_RADIUS: 260,
+
+  /**
+   * The largest pack the robot will stand and fight: the user's 「引到了 1-4 只怪
+   * 后，就该风筝了」. Above this it is a swarm, and a swarm is what `flee` is
+   * for — the ring tactic holds a ring around *one* monster, and clearing
+   * distance from a threat you cannot out-position is the only move left.
+   *
+   * **4 is the user's number, not a fitted one.** It is worth recording what it
+   * costs, because the measurement says the situation it describes is not the
+   * common one: at 36 monsters on a 960×540 arena a hunter's 260px `senseRange`
+   * covers 41% of the floor, so the *aggro* count is 9+ on 72.7% of frames and
+   * 1–4 on 3.6% (96 seeds, §14.5). See `PACK_RADIUS` for why the gate is not
+   * written on that number.
+   */
+  PACK_MAX: 4,
+
+  /**
+   * How near a monster has to be to count as part of the pack *on* the player,
+   * which is the count `PACK_MAX` is compared against.
+   *
+   * The same 120 as `CLUSTER_RADIUS` on purpose, and kept separate so that
+   * moving the targeting knot stays a decision about targeting. "Pulled" is
+   * read as *on you* rather than *aware of you*, and that is a measurement
+   * rather than a preference: gating on the sim's own aggro test
+   * (`dist <= senseRange`, §6.2) would fire on 3.6% of frames — dead code
+   * wearing the appearance of a rule, which §14.1 has already had to withdraw
+   * once for exactly this — while gating on this radius fires on 36.0%. The set
+   * the rule is about is also the right one on the merits: kiting is about
+   * staying outside the reach of what can touch you, and a hunter 260px away is
+   * not something you orbit, it is something you might walk toward.
+   *
+   * **Neither reading gives the rule a working domain, and that is the honest
+   * summary of this constant.** At 3.6% it almost never fires; at 36.0% it
+   * fires, but on a set the user did not mean — so the gate is written on the
+   * reading that at least runs, and the whole mechanism's contribution stays a
+   * wash (96 seeds: 6.10× → 6.27×, 80 → 81 kills, §14.2). The knob that does
+   * move this world is `MONSTER_ARCHETYPES.hunter.senseRange`, not this one:
+   * 260 → 140 puts 1–4 at 59.2% of frames and kills at 80 → 330.
+   */
+  PACK_RADIUS: 120,
 
   /**
    * Weight on the wall penalty. The per-axis term is squared, so this is the
@@ -1308,6 +1349,77 @@ function standoffRing(attackRange: number, reach: number): number {
 }
 
 /**
+ * The direction a kite (or a roam-approach) walks in, as an unnormalised vector.
+ *
+ * A proportional pull toward the standoff ring around `target`, plus an orbit of
+ * `ORBIT` on one side or the other. The radial error is proportional rather than
+ * a sign so that *at* the ring the radial term vanishes and the robot orbits
+ * instead of chattering between "in" and "out".
+ *
+ * The error is normalised *asymmetrically*, and that is load-bearing. Outside
+ * the ring it saturates over the distance we are outside our **own attack
+ * range**; inside it saturates over the target's own reach. Measured: with a
+ * single symmetric band of 30 the radial term was still only 0.567 at a brute's
+ * reach — weaker than the 0.6 orbit — so the robot circled a monster while it
+ * was being hit, which is 72% of all contact frames. Saturating at `reach` means
+ * the retreat is at full strength exactly when the target starts landing blows,
+ * and the radial term (1.0) then outranks the orbit as it must.
+ *
+ * The outside band used to be `KITE_BAND` 30, and that was wrong in the same
+ * way, just in the direction nobody had measured. An error of 30 means the
+ * radial term only reaches 0.6 — parity with the orbit — at 18px outside the
+ * ring, i.e. 69px from the target. Since our range is 55px, *the robot could
+ * orbit permanently outside its own attack range*: it circled a stationary
+ * monster at 58px and never once hit it. Saturating over `ourRange − desired` —
+ * the width of the band in which we are outside our own reach, 4px as shipped —
+ * puts the radial term at full strength for the whole approach and lets the
+ * ring, not the orbit, decide when to stop.
+ *
+ * Both bands carry a deadband, and that is a separate repair from the saturation
+ * above. `err` reaching full strength over 4px means that within four pixels of
+ * the ring the radial term swings the whole 0→1 while the orbit holds at 0.6,
+ * which rotates the goal by ~59° in under two frames of travel — and since both
+ * bodies move 2–2.8px per frame, `target.dist` crosses `desired` constantly and
+ * the rotation is continuous. Inside the deadband the radial term is zero and
+ * the orbit decides alone, which is a heading that holds.
+ *
+ * Extracted from the `kite` rung when `roam` was given the same goal: the two
+ * used to differ, and the difference *was* the charge the user objected to —
+ * `roam`'s goal was the monster's own position, so from anywhere past
+ * `FARM_RADIUS` the robot walked straight at a body instead of stopping on the
+ * ring. One ring, one formula, no way for the approach and the standoff to
+ * disagree.
+ */
+function standoffGoal(
+  px: number,
+  py: number,
+  target: Threat,
+  attackRange: number,
+  side: number,
+): [number, number] | null {
+  const u = unitTo(px, py, target.m.posX, target.m.posY);
+  if (!u) return null;
+  const desired = standoffRing(attackRange, target.reach);
+  const err =
+    target.dist >= desired
+      ? clamp(
+          (target.dist - desired - ROBOT.KITE_ERR_DEADBAND_OUT) /
+            Math.max(1, attackRange - desired),
+          0,
+          1,
+        )
+      : -clamp(
+          (desired - target.dist - ROBOT.KITE_ERR_DEADBAND) /
+            Math.max(1, desired - target.reach),
+          0,
+          1,
+        );
+  const tx = -u[1];
+  const ty = u[0];
+  return [err * u[0] + ROBOT.ORBIT * side * tx, err * u[1] + ROBOT.ORBIT * side * ty];
+}
+
+/**
  * Distance from a point to the segment `a → b`, clamped at both ends.
  *
  * The clamping is what makes this the right measure rather than a nuisance.
@@ -1431,6 +1543,16 @@ export function decide(
   // below do with it.
   const hereRisk = riskAt(threats, NO_HAZARDS, px, py);
 
+  // ── The pack on us ───────────────────────────────────────────────────────
+  // The user's rule, in three parts: 「引到了 1-4 只怪后，就该风筝了：绕圈子走位
+  // （躲避引来更多怪，确保优先击杀已经引到的怪），而不是到处转悠引来更多怪物，
+  // 更不能直接冲向怪物撞过去。」 — commit to the pack that is on you, circle it,
+  // kill what you already pulled, and stop treating every new monster as a
+  // reason to restart. `PACK_RADIUS`/`PACK_MAX` carry the two numbers and the
+  // measurement behind them.
+  const pack = threats.filter((t) => t.dist <= ROBOT.PACK_RADIUS);
+  const committed = pack.length > 0 && pack.length <= ROBOT.PACK_MAX;
+
   // ── Potions ──────────────────────────────────────────────────────────────
   // Scored by what they do, discounted by how far the walk is, and skipped
   // outright if they will fade before the robot could arrive.
@@ -1501,7 +1623,8 @@ export function decide(
       );
       // The knot is "cleared" when nothing is standing in it any more — but
       // only tested on arrival. Monsters respawn in their home regions on a
-      // 2.5–6s clock (`respawnSeconds` decays to a 0.8s floor), so a dense
+      // clock set by the player's level (§4.1: 5.0s at level 1, falling to a
+      // 0.8s floor), so a dense
       // area does not stay empty; and a window that happens to open *en route*
       // would re-lock the robot to whatever is nearest it right now — a near
       // knot — and walk it back. That is the flip-flop this lock exists to
@@ -1529,8 +1652,23 @@ export function decide(
     // one place in it with no ring to stand on.
     objective = nearestToPoint(threats, state.objectiveX, state.objectiveY);
   }
-  /** What the kite and roam rungs walk at. */
-  const target = objective ?? pick?.t ?? null;
+  /**
+   * What the kite and roam rungs walk at.
+   *
+   * 「确保优先击杀已经引到的怪」 reorders this, and only this. Under a committed
+   * pack the thing to fight is the monster *on* the robot rather than whichever
+   * member of the locked knot is nearest the frozen centroid: the lock is a
+   * long-range destination and it is still maintained underneath (its state
+   * machine is untouched, so nothing re-picks or dithers here), it just is not
+   * what the feet serve while something is already in reach.
+   *
+   * No new lookup is needed for it. `pick`/`objective` and `nearest` are drawn
+   * from the same `threats`, and `committed` requires a non-empty pack, so
+   * `nearest.dist <= PACK_RADIUS` whenever `committed` — the nearest threat
+   * *is* the nearest pack member, and the "already pulled" set does not need to
+   * be searched again to find its closest member.
+   */
+  const target = (committed ? nearest : (objective ?? pick?.t)) ?? null;
 
   // Where a retreat is measured from, and what it runs at. One value, shared by
   // the flee goal — a release measured against a different danger than the
@@ -1556,6 +1694,17 @@ export function decide(
   // so ordinary farming never trips it and a retreat that opened real distance
   // always does. `hereRisk < KITE_SAFE_RISK` stays as a second exit, for the
   // retreats contact cannot explain — a bomb field, a stale latch.
+  //
+  // **A committed pack was tried here and rejected on measurement.** The
+  // argument for it was 「引到了 1-4 只怪后……坚持风筝」: a robot that is
+  // successfully kiting produces contact frames as a matter of course, so
+  // contact is a trigger without being a reason, and `&& !committed` should let
+  // it stand. Swept over 96 seeds, `&& !committed` alone: 存活比中位 5.42×
+  // （对照 6.10×）、机器人中位 13.87s（14.83s）、击杀 73（80），flee 从 73.6% 只
+  // 降到 72.4% —— **它没有换来风筝，只换来了挨打**。Refusing to leave contact is
+  // tanking, and kiting is the opposite: the standing decision is already made
+  // by the `kite` rung holding the ring, and the latch is what happens when
+  // that failed. See §14.2 for the full attribution.
   const threatened =
     (nearest !== null && nearest.dist <= nearest.reach) ||
     (hpFrac < ROBOT.FLEE_HP &&
@@ -1671,75 +1820,57 @@ export function decide(
     // The same ring runs in both directions, so this one rung covers the user's
     // two requirements at once: from outside it closes to just within our own
     // range, and from inside it backs off. There is no separate "approach" rule
-    // to get out of step with the "retreat" one.
+    // to get out of step with the "retreat" one. The goal itself is built by
+    // `standoffGoal`, because `roam` below now uses the same one.
     intent = "kite";
     const u = unitTo(px, py, target.m.posX, target.m.posY);
     if (u) {
-      const desired = standoffRing(p.attackRange, target.reach);
-      // Proportional, not a sign: at the ring the radial term vanishes and the
-      // robot orbits instead of chattering between "in" and "out".
-      //
-      // The error is normalised *asymmetrically*, and that is load-bearing.
-      // Outside the ring it saturates at the distance we are outside our **own
-      // attack range**; inside it saturates at the target's own reach. Measured:
-      // with a single symmetric band of 30 the radial term was still only 0.567
-      // at a brute's reach — weaker than the 0.6 orbit — so the robot circled a
-      // monster while it was being hit, which is 72% of all contact frames.
-      // Saturating at `reach` means the retreat is at full strength exactly when
-      // the target starts landing blows, and the radial term (1.0) then outranks
-      // the orbit (0.6) as it must.
-      //
-      // The outside band used to be `KITE_BAND` 30, and that was wrong in the
-      // same way, just in the direction nobody had measured. An error of 30
-      // means the radial term only reaches 0.6 — parity with the orbit — at 18px
-      // outside the ring, i.e. 69px from the target. Since our range is 55px,
-      // *the robot could orbit permanently outside its own attack range*: it
-      // circled a stationary monster at 58px and never once hit it. Saturating
-      // over `ourRange − desired` — the width of the band in which we are
-      // outside our own reach, 4px as shipped — puts the radial term at full
-      // strength for the whole approach and lets the ring, not the orbit,
-      // decide when to stop. See the "with nothing in range" check.
-      //
-      // Both bands now carry a deadband, and that is a separate repair from the
-      // saturation above. `err` reaching full strength over 4px means that
-      // within four pixels of the ring the radial term swings the whole 0→1
-      // while the orbit holds at 0.6, which rotates the goal by ~59° in under
-      // two frames of travel — and since both bodies move 2–2.8px per frame,
-      // `target.dist` crosses `desired` constantly and the rotation is
-      // continuous. Inside the deadband the radial term is zero and the orbit
-      // decides alone, which is a heading that holds. See `KITE_ERR_DEADBAND`.
-      const err =
-        target.dist >= desired
-          ? clamp(
-              (target.dist - desired - ROBOT.KITE_ERR_DEADBAND_OUT) /
-                Math.max(1, p.attackRange - desired),
-              0,
-              1,
-            )
-          : -clamp(
-              (desired - target.dist - ROBOT.KITE_ERR_DEADBAND) /
-                Math.max(1, desired - target.reach),
-              0,
-              1,
-            );
       // Perpendicular to the target direction, oriented by whether it also
       // carries the robot toward the middle of the arena. That is what stops a
       // kite from spiralling into a corner and dying there.
+      //
+      // **「躲避引来更多怪」 was tried here and rejected on measurement.** The
+      // candidate rule was to compare the two sides by how many *unpulled*
+      // monsters' sense circles one probe step would enter, and take the
+      // cheaper side — the cost of a new aggro as an explicit term. Swept over
+      // 96 seeds (`KITE_AVOID_MARGIN` 2): 存活比中位 5.58×（对照 6.10×）、机器人
+      // 中位 13.30s（14.83s），击杀 80 → 85；而**与下面那条目标改动叠在一起时
+      // 击杀从 81 崩到 46**。The mechanism is in `circling: heading
+      // consistency`, which fell 0.19 → 0.16 and 0.13 in the two arms: the
+      // comparison re-derives chirality every frame from many *moving* bodies,
+      // so it dithers the orbit it was meant to improve. That is the same class
+      // of vibration `flee` had to latch its side on the opening frame to avoid,
+      // and a per-frame margin is not a latch. See §14.2.
       const tx = -u[1];
       const ty = u[0];
       const s = toCentre && tx * toCentre[0] + ty * toCentre[1] < 0 ? -1 : 1;
-      goalX = err * u[0] + ROBOT.ORBIT * s * tx;
-      goalY = err * u[1] + ROBOT.ORBIT * s * ty;
+      const g = standoffGoal(px, py, target, p.attackRange, s);
+      if (g) {
+        goalX = g[0];
+        goalY = g[1];
+      }
     }
   } else {
-    // Nothing nearby worth having: go and find something. Positions are public,
-    // so "the nearest monster" is always answerable and the robot never idles.
+    // Nothing inside `FARM_RADIUS` worth having: go and find something.
+    // Positions are public, so "the nearest monster" is always answerable and
+    // the robot never idles.
+    //
+    // **The approach is the same ring, not the monster** — 「更不能直接冲向怪物
+    // 撞过去」. This rung used to aim at `target.m.posX/posY`, and from beyond
+    // `FARM_RADIUS` the only thing that stopped the robot was arriving, so the
+    // walk from 260px in was a straight line at a body. Under the ring goal it
+    // closes at full radial strength until the ring at 51 and then stops, which
+    // is also why the two rungs can share one formula: the difference between
+    // them was never the goal, only how far away the thing being approached is.
     intent = "roam";
     if (target) {
-      const u = unitTo(px, py, target.m.posX, target.m.posY);
-      if (u) {
-        goalX = u[0];
-        goalY = u[1];
+      // Side 1 is arbitrary here and does not matter: beyond `FARM_RADIUS` the
+      // radial error saturates at 1, so the goal is dominated by the approach
+      // and the orbit is the 0.6 that keeps it a curve rather than a beeline.
+      const g = standoffGoal(px, py, target, p.attackRange, 1);
+      if (g) {
+        goalX = g[0];
+        goalY = g[1];
       }
     }
   }

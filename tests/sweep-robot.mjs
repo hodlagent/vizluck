@@ -18,6 +18,7 @@
  *   SWEEP_SEEDS=12 npm run sweep:robot               # a cheap look
  *   SWEEP_OVERRIDE=CHASE=2.5 npm run sweep:robot     # tune without editing source
  *   SWEEP_OVERRIDE=GOAL.flee=10 npm run sweep:robot  # nested tables use a dot path
+ *   SWEEP_OVERRIDE=M.hunter.senseRange=140 npm run sweep:robot  # world knob (`M.`)
  *   SWEEP_SEEDS=12 SWEEP_OVERRIDE=RISK_CAP=1000 npm run sweep:robot
  *   SWEEP_VERBOSE=1 npm run sweep:robot              # also print per-seed rows
  *   SWEEP_ZONES=1 npm run sweep:robot                # add the 6×4 position maps
@@ -26,10 +27,10 @@
  * `SWEEP_ZONES` adds two heat maps of where the robot spends its time, plus a
  * second one restricted to t ≥ 10 s. It is off by default because a 6×4 map is a
  * lot of output for a question most sweeps are not asking. It exists for one
- * question in particular: the player spawns at the centre of region 0, which is
- * the top-left *corner* region (§4.1), so a map of all frames mostly shows where
- * the robot woke up. The t ≥ 10 s map is the spawn control — if the hot cells are
- * the same in both, the corner is a place it *goes*, not a place it *starts*.
+ * question in particular: the player spawns at the centre of the arena, so a map
+ * of all frames partly shows where the robot woke up. The t ≥ 10 s map is the
+ * spawn control — if the hot cells are the same in both, the hot corner is a
+ * place it *goes*, not a place it *starts*.
  *
  * `SWEEP_OVERRIDE` mutates the exported `ROBOT` table inside the page before any
  * run starts. `as const` is a TypeScript assertion, so the object is an ordinary
@@ -113,6 +114,29 @@ const ZC = 6;
 const ZR = 4;
 // Elapsed-time buckets, in seconds, for the spawn control.
 const BUCKETS = [5, 15, 30, Infinity];
+// Pack-size buckets, in *two* readings, because "引到几只怪" has two defensible
+// definitions in this game and they disagree by a factor of two:
+//
+//  - `aware` — monsters with the player inside their `senseRange`. This is the
+//    sim's own aggro test (`m.attacking` is exactly `dist <= m.senseRange`,
+//    §6.2), so it is the set that is chasing and shooting. Its weakness is that
+//    a hunter's `senseRange` is 260px, i.e. 41% of the 960×540 arena's area, so
+//    it counts monsters a human would not point at and call "the ones I pulled".
+//  - `close` — monsters within 120px, the policy's own `CLUSTER_RADIUS`: the
+//    knot around the player rather than everyone who has noticed.
+//
+// `monsters aware of player  mean` already exists and answers "is the arena
+// crowded"; neither of these replaces it, because that is a question about the
+// centre of the distribution and these are questions about its *shape*. The
+// edges are the user's: 1–4 is the pack worth committing to, 0 is nothing to
+// farm, 5+ is already more than a kite can hold. Frames and kills are bucketed
+// on the same read, so the two columns are directly comparable.
+const PACK_EDGES = [0, 4, 8];
+const packLabels = ["0", "1-4", "5-8", "9+"];
+// The "knot around the player" radius for the `close` reading. Same 120 as
+// `ROBOT.CLUSTER_RADIUS`, which is the policy's existing notion of a knot, so
+// the statistic and the rule it is meant to justify cannot drift apart.
+const CLOSE_RADIUS = 120;
 // The wall band, in px, for the death statistics below. Same fixed 70 as the
 // sampler's own `NEAR_WALL` — which is scoped inside the page-evaluate body and
 // so is invisible down here — and fixed for the same reason: the number has to
@@ -133,7 +157,7 @@ async function run() {
   const seeds = [];
   for (let i = 1; i <= SEEDS; i++) seeds.push(i * 1013 + 7);
 
-  const data = await page.evaluate(async ([seedList, overrides, ZC, ZR, ZONES, BUCKETS]) => {
+  const data = await page.evaluate(async ([seedList, overrides, ZC, ZR, ZONES, BUCKETS, PACK_EDGES, CLOSE_RADIUS]) => {
     const sim = await import("/src/game/sim.ts");
     const robot = await import("/src/game/robot.ts");
 
@@ -145,12 +169,23 @@ async function run() {
       // able to reach — several constants have now turned out to rest on
       // measurements from a world that no longer exists, and a knob that cannot
       // be re-measured is a knob that keeps its stale justification.
+      //
+      // A leading `M.` roots the path at `MONSTER_ARCHETYPES` instead of
+      // `ROBOT`: `M.hunter.senseRange=140`. That second root was added for one
+      // question in particular — whether the arena's *aggro* count (9+ on 72.7%
+      // of frames, §14.5) is a property of the policy or of the radii, since a
+      // hunter's 260px sense is 41% of the floor's area and no amount of kiting
+      // policy can change what is already chasing. Without this the only way to
+      // ask it was to edit `sim.ts`, which is a world change rather than a
+      // measurement.
       const [path, raw] = o.split("=");
       const value = Number(raw);
       const parts = path.split(".");
-      let host = robot.ROBOT;
-      for (const part of parts.slice(0, -1)) host = host?.[part];
-      const key = parts[parts.length - 1];
+      const monster = parts[0] === "M";
+      let host = monster ? sim.MONSTER_ARCHETYPES : robot.ROBOT;
+      const rest = monster ? parts.slice(1) : parts;
+      for (const part of rest.slice(0, -1)) host = host?.[part];
+      const key = rest[rest.length - 1];
       if (typeof host?.[key] !== "number" || !Number.isFinite(value)) {
         applied.push(`${o} (IGNORED: unknown key or non-numeric value)`);
         continue;
@@ -196,6 +231,24 @@ async function run() {
       let wasRetreating = false;
       let crowdSum = 0;
       let crowdPeak = 0;
+      // Pack-size buckets, one entry per `PACK_EDGES` gap plus the open top, and
+      // one pair per reading (see `PACK_EDGES` above). Frames are bucketed on
+      // the read taken *before* the step — the same pass `crowd` comes from, so
+      // the three agree. A kill lands during the step and is attributed to the
+      // bucket that was in force when the frame began; that is the only ordering
+      // available, since `stepSim` reports kills as a counter rather than as
+      // events, and it is the right one for the question: "while N monsters were
+      // on us, how much did we kill".
+      const mk = () => new Array(PACK_EDGES.length + 1).fill(0);
+      const awareFrames = mk();
+      const awareKills = mk();
+      const closeFrames = mk();
+      const closeKills = mk();
+      const packBucket = (n) => {
+        let b = 0;
+        while (b < PACK_EDGES.length && n > PACK_EDGES[b]) b++;
+        return b;
+      };
       let lastDx = 0;
       let lastDy = 0;
       let streak = 0;
@@ -231,11 +284,11 @@ async function run() {
       const zoneLate = new Array(ZR * ZC).fill(0);
       let lateFrames = 0;
       // Clearance and heading by elapsed run time. **This is the control for the
-      // spawn**: `sim.ts` starts the player at the centre of region 0, which is
-      // the top-left *corner* region, and a median run is short enough that a
-      // plain position map mostly shows where the robot woke up rather than
-      // where it chose to go. If the boundary share decays with time it is a
-      // startup artefact; if it holds or grows, the boundary is an attractor.
+      // spawn**: `sim.ts` starts the player at the centre of the arena, and a
+      // median run is short enough that a plain position map mostly shows where
+      // the robot woke up rather than where it chose to go. If the boundary
+      // share decays with time it is a startup artefact; if it holds or grows,
+      // the boundary is an attractor.
       const bucketFrames = BUCKETS.map(() => 0);
       const bucketNear = BUCKETS.map(() => 0);
       const bucketEdge = BUCKETS.map(() => 0);
@@ -294,10 +347,13 @@ async function run() {
         // sums. Under the leash this was bounded by one region's population;
         // the sweep's open question (§14.6) is whether it now grows without
         // bound as everything converges on wherever the player is standing.
+        // `close` is the same pass under the tighter radius — see `PACK_EDGES`.
         let crowd = 0;
+        let close = 0;
         for (const m of run.monsters) {
           const d = Math.hypot(m.posX - run.player.posX, m.posY - run.player.posY);
           if (d <= m.senseRange) crowd++;
+          if (d <= CLOSE_RADIUS) close++;
           // The aggro tally. `escape rate in contact` above answers "did the gap
           // open while we were inside reach" — a per-frame question. Breaking
           // aggro is a *different* mechanic with a *different* cost: it needs
@@ -316,6 +372,11 @@ async function run() {
         }
         crowdSum += crowd;
         if (crowd > crowdPeak) crowdPeak = crowd;
+        const aware = packBucket(crowd);
+        const clos = packBucket(close);
+        awareFrames[aware]++;
+        closeFrames[clos]++;
+        const killsBefore = run.kills;
 
         const edge = Math.min(
           run.player.posX,
@@ -469,6 +530,11 @@ async function run() {
         }
 
         sim.stepSim(run, decision.input, DT);
+        if (run.kills > killsBefore) {
+          const n = run.kills - killsBefore;
+          awareKills[aware] += n;
+          closeKills[clos] += n;
+        }
 
         if (inReach && run.alive) {
           const after = run.monsters.find((m) => m.id === id);
@@ -554,6 +620,10 @@ async function run() {
         fleeSpans,
         crowdMean: frames ? crowdSum / frames : 0,
         crowdPeak,
+        awareFrames,
+        awareKills,
+        closeFrames,
+        closeKills,
         nearWallFrames,
         edgeMean: frames ? edgeSum / frames : 0,
         nearWallMoving,
@@ -583,7 +653,7 @@ async function run() {
     }
 
     return { rows, applied, seeds: seedList.length, cap: CAP, dt: DT };
-  }, [seeds, OVERRIDES, ZC, ZR, ZONES, BUCKETS]);
+  }, [seeds, OVERRIDES, ZC, ZR, ZONES, BUCKETS, PACK_EDGES, CLOSE_RADIUS]);
 
   const { rows, applied, cap, dt } = data;
 
@@ -723,8 +793,9 @@ async function run() {
     };
     row("  intent near a wall", bandIntents("nearIntents"));
     row("  intent in the open", bandIntents("openIntents"));
-    // The control for the spawn point: the player starts in a corner region, so
-    // anything measured over the whole run is partly measuring where it woke up.
+    // The control for the spawn point: the player starts in the middle of the
+    // arena, so anything measured over the whole run is partly measuring where
+    // it woke up.
     const bFrames = BUCKETS.map((_, i) => sum((r) => r.bucketFrames[i]));
     const bNear = BUCKETS.map((_, i) => sum((r) => r.bucketNear[i]));
     const bEdge = BUCKETS.map((_, i) => sum((r) => r.bucketEdge[i]));
@@ -764,9 +835,9 @@ async function run() {
       }
       console.log(`  ${cells.join(" ")}`);
     }
-    // The same map for t >= 10s only. The player spawns at the centre of region
-    // 0 — the top-left corner — so the map above is dominated by the first few
-    // seconds of every run. This one is the closest thing to a policy preference.
+    // The same map for t >= 10s only. The player spawns at the centre of the
+    // arena, so the map above is dominated by the first few seconds of every
+    // run. This one is the closest thing to a policy preference.
     const zl = new Array(ZR * ZC).fill(0);
     for (const r of rows) for (let i = 0; i < zl.length; i++) zl[i] += r.zoneLate[i];
     const lTotal = zl.reduce((a, b) => a + b, 0) || 1;
@@ -834,6 +905,33 @@ async function run() {
   console.log("");
   row("monsters aware of player  mean", `${fixed(crowdMean)}`);
   row("monsters aware of player  peak", `${crowdPeak}`);
+  // The distribution behind that mean, with kills attributed to the same read.
+  // Report both a share of frames and a rate, because they answer different
+  // halves of the question: the share says how often the robot is *in* the
+  // one-to-four situation, the rate says whether it converts it. A pack it can
+  // farm and a pack it merely survives look identical in the frame count alone.
+  {
+    const block = (name, framesKey, killsKey) => {
+      const aFrames = packLabels.map((_, i) => sum((r) => r[framesKey][i]));
+      const aKills = packLabels.map((_, i) => sum((r) => r[killsKey][i]));
+      const aTotal = aFrames.reduce((a, b) => a + b, 0);
+      row(
+        `${name}  frames`,
+        packLabels.map((l, i) => `${l}:${pct(aTotal ? aFrames[i] / aTotal : 0)}`).join("  "),
+      );
+      row(`${name}  kills`, packLabels.map((l, i) => `${l}:${aKills[i]}`).join("  "));
+      // Kills per 1000 frames spent in the bucket — the conversion rate, on the
+      // same scale for every bucket regardless of how much time each one gets.
+      row(
+        `${name}  kills/1k frames`,
+        packLabels
+          .map((l, i) => `${l}:${fixed(aFrames[i] ? (aKills[i] / aFrames[i]) * 1000 : 0, 1)}`)
+          .join("  "),
+      );
+    };
+    block("pack aware", "awareFrames", "awareKills");
+    block("pack close", "closeFrames", "closeKills");
+  }
   row("alive at end (per run avg)", `${fixed(alive / rows.length, 1)}`);
   row("of those, standing in home region", `${pct(alive ? homed / alive : 0)}`);
   console.log("");
