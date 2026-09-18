@@ -438,11 +438,20 @@ export function createSim(opts: SimOptions = {}): SimState {
       hp: TUNING.hp,
       maxHp: TUNING.hp,
       hpSpeed: TUNING.hpSpeed,
-      // Spawn in the middle of a corner region — the thinnest, slowest-refilling
-      // tier, which is where a run should start (design §4.1). It is no longer a
-      // *safe* corner, only a quiet one: see §6.2.
-      posX: configs[0].x + configs[0].w / 2,
-      posY: configs[0].y + configs[0].h / 2,
+      // Spawn at the centre of the arena, not in a corner region. This reverses
+      // §4.1's original "start in the thinnest tier" call, and it is a
+      // consequence of §6.2: once the leash came off, a corner stopped being a
+      // quiet place to begin and became a trap to begin in. The robot spends
+      // 77% of its life within 70px of an edge and its traversal of the middle
+      // is what breaks the aggro that keeps it there, so a run that starts
+      // already pinned has to escape before it can play. Measured over 32 seeds
+      // with the policy held fixed: median survival 17.6s against 9.9s from the
+      // corner, mean clearance 71px against 47px. The cost is real and belongs
+      // to the §13 difficulty item, not here — the centre is denser (9.9
+      // monsters aware on average against 5.6) and a stationary player dies in
+      // 1.9s instead of 3.6s.
+      posX: width / 2,
+      posY: height / 2,
     },
     monsters: [],
     items: [],
