@@ -1159,6 +1159,94 @@ async function run() {
         );
       }
 
+      // ── §14.2 A retreat curves, so a corner is not a dead end ────────────
+      //
+      // The user's second report of the same symptom — "好点有限，仍然是直奔边
+      // 界和角落而去" — after the spawn and room-weight repairs. The cause is
+      // the *shape* of `flee`'s radial term, not its size: `kite`'s vanishes at
+      // the standoff ring, so the orbit takes over there, while `flee`'s is a
+      // constant unit vector that never vanishes. "Away from the danger" is
+      // then a gradient flow whose only attractor in a bounded arena is a wall,
+      // and the wall-slide projects what is left of it along the wall into a
+      // corner — where a retreat cannot open the ~640px of runway that breaking
+      // a hunter's aggro takes. Measured before the repair, 96 seeds: 63.1% of
+      // frames within 70px of an edge, rising from 49.6% under 5s to 75.7% by
+      // 30s.
+      //
+      // This is the deterministic form of it, and the geometry is chosen so
+      // that only the orbit can produce the outcome. Player at the exact centre
+      // of the arena, monster 210px due south of it — inside
+      // `DISENGAGE_RADIUS` 220, so the hp clause latches, and directly below,
+      // so the radial term is purely vertical.
+      //
+      // The centre is what makes this a test rather than a coincidence. Every
+      // heading from the centre clears more than `ROOM_REF` 90 before it meets
+      // a wall, so the room term scores identically for all of them — "exactly
+      // zero difference between two candidates in open ground", as the scoring
+      // says — and the wall and risk terms are both symmetric about the
+      // vertical, the monster being on it. Nothing but the orbit can supply an
+      // x component. Off-centre this would prove nothing: the orbit's sign rule
+      // is *defined* as the side that also carries the robot toward the middle,
+      // which is the same direction the room term rewards, so anywhere else the
+      // two agree and the check would pass either way.
+      //
+      // Here `from` is (0, -1), the tangent is (1, 0), and `toCentre` is null —
+      // the player is standing on the arena centre, so `unitTo` has no
+      // direction to give and the sign falls to its documented `: 1` default.
+      // The goal therefore becomes (+0.6, -1): a retreat that still opens
+      // distance *and* curves, instead of a straight radial line.
+      //
+      // What this pins is that the tangential term exists, at `ORBIT`'s
+      // magnitude, on the flee goal. It does not pin the sign rule's `dot < 0`
+      // branch, because as noted that branch is deliberately indistinguishable
+      // from the room term — the run-scale claim is measured instead by the
+      // sweep's chirality-consistency channel.
+      {
+        const s = fresh();
+        const cx = s.width / 2;
+        const cy = s.height / 2;
+        const m = solo(s, "wanderer", 0, (mm) => {
+          mm.posX = cx;
+          mm.posY = cy + 210;
+          // `solo`'s stock puppet is harmless, which here means weightless:
+          // `dangerCentre` skips a threat whose `dps` is zero, so a zero-power
+          // monster is not a danger at all and the robot would have no goal to
+          // curve. Give it real power with a reach it cannot use at 210px, and
+          // leave `attackCooldown` at `solo`'s 1e9 so it never fires.
+          mm.attackPower = 12;
+          mm.attackRange = 0;
+        });
+        // `solo` leaves the puppet immobile, so the geometry the hand-
+        // computation assumes is the geometry that actually runs.
+        s.player.posX = cx;
+        s.player.posY = cy;
+        // The hp clause is the only way this distance latches: contact means
+        // `dist <= reach`, and this puppet's reach is 0 against 210px.
+        s.player.hp = 20;
+
+        const st = robot.createRobotState();
+        const first = robot.decide(robot.perceive(s), st);
+        check(first.intent === "flee", "the straight-line case is a retreat", first.intent);
+        check(
+          first.input.dx > 0 && first.input.dy < 0,
+          "the flee goal carries a tangential half, so the retreat does not go straight back",
+          `dx=${first.input.dx} dy=${first.input.dy}`,
+        );
+
+        // What is deliberately *not* asserted here is that the robot travels a
+        // curve. Driven for a second in this geometry it nets (−2, −10) — it
+        // barely leaves the spot — and that is not a defect in the orbit but a
+        // property of the latch: `flee` releases the moment the distance passes
+        // `DISENGAGE_RADIUS` 220, and the robot starts at 210, so it opens ten
+        // pixels and hands over to `kite`, which closes back to the 51px ring
+        // and latches `flee` again. The steady state is a radial yo-yo between
+        // 51 and 220px, and a test measured over it would be measuring the
+        // yo-yo. Whether the orbit survives that hand-over — and whether
+        // `kite`'s independently-derived chirality agrees with the retreat's
+        // latched one instead of cancelling it — is the run-scale question, and
+        // the sweep's chirality-consistency channel is where it is answered.
+      }
+
       // ── §14.2 The objective lock survives a nudge, and drops on a detour ──
       //
       // Two halves of the same contract. The lock exists to stop `target` being
@@ -1337,6 +1425,11 @@ async function run() {
         // only in `sweep-robot.mjs`, which is not part of `npm run test:e2e`.
         let reversals = 0;
         let lastDx = 0, lastDy = 0;
+        // How much room the robot keeps around itself — the user's report was
+        // that it reaches the boundary and then only slides along it, so this is
+        // the regression guard for that. Accumulated here rather than in a
+        // dedicated short run so it is measured over real seeded play.
+        let clearanceSum = 0, clearanceFrames = 0;
 
         for (const seed of SEEDS) {
           const idleRun = sim.createSim({ rng: rngFrom(seed) });
@@ -1374,6 +1467,12 @@ async function run() {
             lastDy = decision.input.dy;
 
             sim.stepSim(run, decision.input, 1 / 60);
+
+            if (run.alive) {
+              const p = run.player;
+              clearanceSum += Math.min(p.posX, run.width - p.posX, p.posY, run.height - p.posY);
+              clearanceFrames++;
+            }
 
             if (inReach && run.alive) {
               const after = run.monsters.find((m) => m.id === id);
@@ -1418,6 +1517,27 @@ async function run() {
           ratios[0] > 1,
           "even the worst seed outlives standing still",
           `worst ${ratios[0].toFixed(2)}x`,
+        );
+        // The user's boundary report, as a number. The robot used to spend 85%
+        // of its life within 70px of an edge at a 33px mean clearance — less
+        // than the 41px a bomb dodge needs (`bombBlast` + `playerRadius`, §15.3)
+        // — because nothing in the score paid for moving inward and the wall
+        // penalty only stops charging once you are out (it never pulls).
+        //
+        // **This no longer isolates the room term, and the floor was left where
+        // it is on purpose.** Measured with the room term switched off entirely
+        // (`ROOM_WEIGHT=0, ROOM_WEIGHT_FLEE=0`) but the centre spawn in place,
+        // clearance is 75px — above the floor — so this assertion now passes on
+        // the spawn change alone. The room weight's own contribution is 75 → 82px,
+        // a 7px margin that no twelve-seed sample can carry; asserting on it here
+        // would be a coin flip dressed as a contract. So this stays a floor on
+        // clearance (its name still describes what it checks) and the room term's
+        // effect is measured where it can be measured: the 96-seed sweep, §14.5.
+        const meanClearance = clearanceFrames ? clearanceSum / clearanceFrames : 0;
+        check(
+          meanClearance >= 40,
+          "and it keeps room to dodge in instead of living on the boundary",
+          `${meanClearance.toFixed(0)}px mean clearance over ${clearanceFrames} frames`,
         );
         // "Plays rather than hides": a robot that only survived by retreating
         // would clear the ratio above with nothing to show for it. Kills carry

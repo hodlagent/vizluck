@@ -326,11 +326,90 @@ export const ROBOT = {
    */
   STANDOFF_MARGIN: 4,
   /**
-   * How much of the kite goal is a tangential (orbiting) bias rather than a
-   * radial correction. Without it the robot walks straight backwards until a
-   * wall stops it; with it, it circles the target instead.
+   * How much of a disengagement goal is a tangential (orbiting) bias rather
+   * than a radial correction. Without it the robot walks straight backwards
+   * until a wall stops it; with it, it circles the target instead.
+   *
+   * **Both** rungs that disengage read a knob of this shape — `kite` reads
+   * this one, `flee` reads `FLEE_ORBIT`, and the two values differ (0.6 and
+   * 1.2) for the reason recorded there. That `flee` was originally the one
+   * rung without any tangential term is what still walked the robot into
+   * corners after the spawn and room-weight repairs, and the mechanism is the
+   * radial term's *shape*, not its size: `kite`'s vanishes at the standoff ring
+   * so the orbit takes over there, while `flee`'s never vanishes, which makes
+   * "away from the danger" a gradient flow whose only attractor in a bounded
+   * arena is the boundary — and the wall-slide then projects what is left of it
+   * *along* the wall, one-dimensionally, into a corner. See §14.6.
+   *
+   * The tangential half is also the correct dodge in this combat system rather
+   * than merely the prettier one (§7): bullets aim where the player stood, so
+   * over the 0.182s flight to the 51px ring a 160px/s player travels 29.1px
+   * across the firing line against an 11.5px hit threshold, while retreating
+   * *along* that line stays on it and is overtaken by 120px/s of closing speed.
    */
   ORBIT: 0.6,
+  /**
+   * The same knob for `flee`, and it is a separate one because the two rungs
+   * cannot share a value.
+   *
+   * `kite`'s orbit is bounded above by its radial term: while the target is
+   * landing blows the radial must outrank the orbit, or the robot circles a
+   * monster it is being hit by — the defect §14.2 records at length, measured
+   * at 72% of contact frames when the radial was the weaker half. That caps
+   * `kite` below 1.0 and puts the shipped 0.6 where it is.
+   *
+   * `flee` has no such bound, and it wants much more. Measured over 96 seeds,
+   * raising the *shared* knob moved every wall statistic: near-wall frames
+   * 63.1% (shipped) → 60.5% → 47.5% at 1.2, clearance 82 → 85 → 96px, and the
+   * near-wall share by run time — 51.9 / 63.5 / 75.8 / 100% at 0.6 — flattened
+   * to 44.5 / 44.4 / 51.0 / 54.8%, which is the user's complaint actually
+   * going away rather than merely shrinking. Survival rose with it, 14.13 →
+   * 17.95s median.
+   *
+   * **But that grid cannot say which half of the change did the work**, and
+   * this is why the constant is split rather than re-valued: raising the orbit
+   * also raises the goal's *magnitude*, `hypot(1, orbit)`, so 1.2 is
+   * `flee`'s goal at 1.56 against 1.17 — a 34% stronger intent, which is what
+   * `GOAL.flee` would have bought too. The two arms that separate them:
+   * `GOAL.flee` 8 at `FLEE_ORBIT` 0.6 (matched goal strength, 6 × 1.562 ≈
+   * 8 × 1.166) buys **nothing** — near-wall 61.6%, clearance 83px, survival
+   * 14.52s, all at or below the 0.6 baseline — while `FLEE_ORBIT` 1.2 at an
+   * unchanged `GOAL.flee` 6 reaches 57.9% / 90px / 16.77s. **The orbit is
+   * doing the work, not the magnitude.** The shared-knob grid's larger win was
+   * mostly `kite`, which the kite-only arm confirms (§14.6).
+   *
+   * The grid for *this* constant, all 96 seeds, `GOAL.flee` held at 6:
+   *
+   * | `FLEE_ORBIT` | near-wall | clearance | 5-15s | 15-30s | 30s+ | survives | bearing cons. |
+   * |---|---|---|---|---|---|---|---|
+   * | 0.0 (pure radial) | 58.6% | 82px | 63.5% | 75.8% | 100.0% | 14.13s | 0.11 |
+   * | 0.6 | 60.4% | 83px | 66.9% | 67.4% | 64.4% | 13.60s | 0.11 |
+   * | 0.9 | 60.2% | 83px | 64.8% | 64.8% | 63.4% | 16.68s | 0.13 |
+   * | **1.2 (shipped)** | **57.9%** | **90px** | **58.7%** | **61.4%** | 73.3% | 16.77s | **0.17** |
+   * | 1.5 | 56.5% | 91px | 57.7% | 65.9% | 72.8% | 17.07s | 0.14 |
+   *
+   * 1.2 is the knee and the peak of the chirality criterion, which is the one
+   * §14.2 nominates as primary. On outcomes alone the surface between 0.9 and
+   * 1.2 is nearly flat, and 0.9 holds the flatter 30s+ bucket; past 1.2 the
+   * trend turns — consistency *falls* to 0.14 and reversals rise to 22, which
+   * is overshoot rather than more circling. The 30s+ column is the weakest
+   * number here and the smallest sample (roughly the top of the survival
+   * distribution), which is why it does not overrule the rest, but it is the
+   * one to watch if a later change pushes runs longer.
+   *
+   * A threshold argument from statics says stop at 0.6: `hypot(1, f)` divides
+   * the outward speed, so 160/hypot(1, 0.9) = 119px/s already sits under the
+   * hunter's 120px/s and §14.5's ~3.9s escape at a 40px/s closing difference
+   * becomes *never*. It was measured, and it is **wrong about this sim**:
+   * aggro breaks per run go 17.1 → 17.3 → 21.2 → 21.7 across 0.0 → 0.6 → 0.9 →
+   * 1.2, i.e. *up*, and are flat per second of life. Monsters do not run a
+   * clean straight-line chase — they move at `wanderSpeedScale` with
+   * 8-direction snapping and stop at `attackRange × 0.7` (§6.2) — so the break
+   * is dominated by lateral geometry rather than by net straight-line gain.
+   * The static model is recorded only so the next reader does not re-derive it
+   * and act on it.
+   */
+  FLEE_ORBIT: 1.2,
 
   /** A potion further away than this is not worth the walk. */
   LOOT_RANGE: 320,
@@ -576,6 +655,190 @@ export const ROBOT = {
    */
   WALL_MARGIN: 70,
   WALL_WEIGHT: 10,
+
+  /**
+   * Weight on the **corner penalty**: how much worse the *same* threat is when
+   * there is nowhere to escape it in *either* axis.
+   *
+   * `WALL_WEIGHT` above charges for standing near an edge on its own account and
+   * is a veto, not a reason. This is the reason, and it exists because three
+   * rounds of adding *shape* to the goal (orbit, chirality, arc) bought the user
+   * almost nothing: at 40 genuine failure frames — pressed to a wall and sliding
+   * along it — neutralising `WALL_WEIGHT` flips 0/40 moves and neutralising the
+   * room term 0/40, while zeroing the risk field's cap flips 27/40. The terms
+   * written to keep the robot off walls are never consulted. The field that
+   * decides is the risk field, so the risk field is what has to change.
+   *
+   * **Why the risk field sends it to the edge at all.** `riskAt` is a sum over
+   * nearby monsters, so the risk minimum is wherever the fewest of them are —
+   * and at an arena edge they are all on one side, which makes the boundary the
+   * locally safest ground in the field. That is the mechanism behind "总是倾向于
+   * 往角落里或者边界上跑", and no goal-shaped term can outvote it.
+   *
+   * Damage taken per second of **exposure**, 48 seeds, bucketed by distance to
+   * the nearest edge and controlled for how many monsters were within 150px:
+   *
+   * | monsters within 150px | edge ≤70 | 70–240 | >240 | time in each |
+   * |---|---|---|---|---|
+   * | 0 | 0.00 | 0.00 | — | 1.5% / 0.2% / 0.0% |
+   * | 1 | 1.22 | 1.02 | — | 3.8% / 0.5% / 0.0% |
+   * | 2 | 1.72 | 3.65 | — | 5.4% / 1.2% / 0.0% |
+   * | 3 | 2.72 | 6.18 | 0.00 | 4.3% / 1.1% / 0.2% |
+   * | 4–5 | 4.24 | 2.30 | 0.00 | 5.1% / 1.9% / 0.2% |
+   * | **6+** | **7.87** | **5.03** | **4.63** | **38.3% / 30.9% / 5.5%** |
+   *
+   * The last row is where the robot lives — 75% of its life is spent with six or
+   * more monsters inside 150px — and there the wall band reads 1.56× the
+   * mid-field at equal threat density. The top row is the control that says the
+   * hazard is an *interaction*: with nothing nearby a corner is free (0.00 dmg/s
+   * at every distance). Hence a multiplier on `riskAt` rather than a term beside
+   * it — a flat charge would price an empty corner that costs nothing.
+   *
+   * **That table is confounded, and the confound is what this constant's shape
+   * came from.** It conditions on the *old* policy's positions, and a policy
+   * changes which positions it visits in which states, so "damage per second
+   * while in band X" is not "damage per second if you live in band X". The first
+   * formulation tried — pricing the whole wall band, `1 + TRAP_WEIGHT * (push_x
+   * + push_y)` — took the robot's wall share from 56.6% to 12.0% and its corner
+   * deaths to zero, exactly as asked, and cost **16% of median survival** with
+   * *32% more damage per second* (7.46 → 9.82). It is not a tuning matter: 0.25,
+   * 0.5, 0.75, 1 and 2 all cost about the same 5s, so the response is a
+   * threshold rather than a gradient. The boundary is load-bearing ground for
+   * this robot, and every unit of pressure off it is paid for in health.
+   *
+   * So the wall is left alone and only the *corner* is priced — `2 × TRAP_WEIGHT
+   * × trapPush(x) × trapPush(y)`, a product, so a single wall costs nothing and
+   * the 70×70 corner box costs everything. The user's instinct was right about
+   * *where* and wrong about *why*: the corner is genuinely the worst ground, but
+   * the fix is to stop camping it, not to stop using walls.
+   *
+   * 5, measured against both `0` and higher values. Paired per-seed over 96
+   * seeds, and repeated on a **disjoint** 96 (seed offset 300) because the
+   * survival median has fooled this project twice:
+   *
+   * | TRAP_WEIGHT | survival med (train / holdout) | P10 (train / holdout) | dmg/sec | paired better/worse |
+   * |---|---|---|---|---|
+   * | 0 | 16.77 / 19.60 | 6.17 / 6.78 | 7.46 / 6.75 | — |
+   * | 2 | 22.88 / 22.15 | 8.83 / 7.55 | 6.14 / 6.43 | 48/30 · 35/37 |
+   * | **5** | **22.33 / 22.93** | **8.83 / 9.28** | **6.20 / 6.05** | **54/25 · 46/33** |
+   * | 8 | — / 22.58 | — / 8.12 | — / 6.17 | — / 43/36 |
+   * | 12 | — / 21.80 | — / 8.12 | — / 6.32 | — / 38/39 |
+   *
+   * The honest reading: the train-seed medians flatter it and 8 and 12 fall off,
+   * so the durable claim is the one that holds on *both* sets — the worst decile
+   * of runs gains ~40% (6.2 → 8.8s, 6.8 → 9.3s) and damage per second falls
+   * ~10–15%, which is the user's actual symptom (两次都很快就死). Median survival
+   * is the weaker claim at +13–17%.
+   *
+   * **What this does not do is stop the robot using the boundary.** Wall share is
+   * 56.6% before and 59.5% after — unchanged, deliberately. Anything that moves
+   * that number costs survival, per the table above. If the user wants the
+   * boundary itself abandoned, the lever is the *world* (what makes the edge a
+   * refuge), not another weight here.
+   *
+   * The hazard is not exotic. **98.0% of all damage across those 48 runs was
+   * bullets** (contact 1.0%, bombs 1.1%), and a shot is fired at where the player
+   * *stood* — so the same monster connects more often when both escape
+   * directions are a wall. That geometry is what a human reads as "don't get
+   * cornered", which is why pricing it costs the robot no information a player
+   * lacks: it still never models a bullet, it only knows it has less room.
+   */
+  TRAP_WEIGHT: 5,
+
+  /**
+   * Clear space, in px, beyond which more of it is worth nothing.
+   *
+   * The room term has to be **inert in open ground**, and that is not cosmetic.
+   * Measured with no reference at all, the arena's own shape biases the robot:
+   * from the centre there is 480px of runway along the long axis and 270px along
+   * the short one, so an unsaturating room term would quietly make every open
+   * floor decision a vote for the long axis — a steering effect nobody asked for
+   * and nothing in the design wants. Saturating at 90 collapses those to the
+   * same score and leaves the term no opinion at all until a wall is close.
+   *
+   * 90 is chosen against the two distances that matter at the edge: it is a
+   * little over twice the 41px a bomb dodge needs (`bombBlast` + `playerRadius`)
+   * and comfortably clear of `WALL_MARGIN` 70, so the whole wall band is inside
+   * the ramp and the term has resolved an opinion before the wall penalty starts
+   * to bite.
+   *
+   * That the ramp should be *tight* is measured, not assumed. Widening it to 140
+   * — so the term has an opinion 140px out instead of 90 — is worse on every
+   * axis it was built for and breaks the tail besides: clearance 49px → 46px,
+   * escape rate 56.9% → 53.4%, and the worst seed falls to 0.72×, well under the
+   * idle control. A term that is active across most of the arena is no longer
+   * answering "is there a wall in the way", and it starts to compete with the
+   * goal on open ground where it has no business having a preference.
+   */
+  ROOM_REF: 90,
+  /**
+   * Weight on the room term — the reward for heading somewhere with space to
+   * maneuver in, as opposed to merely being somewhere.
+   *
+   * **It only has to be a steer, and it only has to be small.** Every frame the
+   * direction already being walked is in the candidate set and collects `HYST`
+   * 8, so a term worth less than that cannot flip a heading on its own — and 4
+   * is comfortably under. What it can do is the thing nothing else in the score
+   * does: give "inward" a *positive* reason. The wall penalty only stops
+   * charging once the robot is out; it never pulls, and the reason the robot sat
+   * at 33px for 85% of its life is that the alternatives to sliding along the
+   * boundary all had something actively against them — `flee`'s goal points
+   * outward and is deleted by the wall-slide, while inward is where the monsters
+   * are, so risk charges for it. Room is the first term in the score that pays
+   * for going inward on ground that is otherwise merely cheaper.
+   *
+   * Measured over 96 seeds, and the reason the value is 4 rather than "as high
+   * as it goes": clearance 33px → 49px, near-wall frames 85.3% → 75.6% and
+   * escape rate 46.0% → 56.9%, with the fighting *better* than before (194 kills
+   * against 175) and every survival order statistic at or above the baseline.
+   * The intended effect is bought almost entirely by 4 — at 6 it is 53px and
+   * 55.8%, at 10 it is 63px and 57.1% — and past 6 the extra room starts to cost
+   * the run instead: 10 pulls the robot off fights (138 kills), shortens its
+   * committed runs to 1.85s, and 8 is the point where a seed does worse than
+   * standing still (worst 0.82×). Being pinned is fatal; being *free* is not
+   * free either.
+   */
+  ROOM_WEIGHT: 4,
+  /**
+   * Weight on the room term while the intent is `flee`.
+   *
+   * The measurement above says the *reason* room cannot simply be worth more is
+   * that a single global weight makes the robot pay for inward room on frames
+   * where it is fighting — at 10 it takes 138 kills against 194 at 4, and its
+   * committed runs shorten from 2.33s to 1.85s. But that cost is not the room
+   * term's fault in general; it is the room term arguing with `kite`, which
+   * *wants* to stand in the ring at 51px, near the pack.
+   *
+   * `flee` is the opposite case, and it is the one the user's report is about.
+   * Of the five rungs it is the only one whose goal is defined without any
+   * reference to the arena — purely radially away from the danger centroid — so
+   * it is the only one that can point out of the arena, and the wall-slide then
+   * turns that into a one-dimensional slide that ends in a corner. Measured:
+   * 76.6% of frames within 70px of an edge, moving outward on 28.1% of the
+   * near-wall frames against inward on 16.0%, and `flee` is 77.3% of the frames
+   * spent near a wall against 66.2% in the open. So the intent split is not a
+   * tuning convenience: it separates the rung that has the defect from the rung
+   * that has the objection.
+   *
+   * Measured over 96 seeds with the spawn at the arena centre, `4` being the
+   * arm where the split is inert (`ROOM_WEIGHT_FLEE === ROOM_WEIGHT`):
+   *
+   *   W    near-wall (median)   clearance   survives (median)   worst seed
+   *   4          63.9%            77px          15.57s            2.82×
+   *   6          58.6%            82px          14.13s            2.10×
+   *   8          57.0%            85px          13.23s            2.10×
+   *
+   * It works, and it is a bad deal past 6: the first two points buy 5.3 points
+   * of near-wall share and 5px of clearance, and the next two buy 1.6 points and
+   * 3px for another 0.9s of survival. 6 is where the curve is still moving.
+   *
+   * **And the whole effect is half what a 32-seed grid said it was.** That grid
+   * put near-wall at 53.5% and clearance at 86px for W=8, against 57.0% and 85px
+   * at 96 seeds — the small sample had flattered it, the same way it flattered
+   * the outlier that made an earlier W=8 arm read as a 25-point win. Tune at 96
+   * or do not quote the number.
+   */
+  ROOM_WEIGHT_FLEE: 6,
 } as const;
 
 /**
@@ -662,6 +925,24 @@ export interface RobotState {
   originY: number;
   /** False when there is nothing to lock onto, or the lock was just dropped. */
   locked: boolean;
+  /**
+   * Which way a retreat orbits: `+1` or `-1`, fixed at the moment the latch was
+   * set and held until it releases.
+   *
+   * `kite` re-derives its side every frame from the target direction, which is
+   * stable because a single monster's bearing is. `flee`'s reference is
+   * `dangerCentre`, and a centroid *drifts*: as the robot arcs around it the
+   * tangent rotates too, and once it passes perpendicular to the direction of
+   * the arena centre the derived sign flips — mid-retreat, reversibly, frame
+   * after frame. That is the same class of vibration `dangerCentre` was
+   * introduced to end, arriving by a different route. One decision per retreat
+   * costs one boolean-shaped field and removes the possibility.
+   *
+   * A retreat always begins with `retreating` false (see `createRobotState`),
+   * so the latch's first frame is always available to set this and no separate
+   * "unset" marker is needed.
+   */
+  orbitSign: 1 | -1;
 }
 
 export function createRobotState(): RobotState {
@@ -674,6 +955,7 @@ export function createRobotState(): RobotState {
     originX: 0,
     originY: 0,
     locked: false,
+    orbitSign: 1,
   };
 }
 
@@ -768,6 +1050,95 @@ function wallPush(v: number, extent: number): number {
   if (d >= ROBOT.WALL_MARGIN) return 0;
   const t = (ROBOT.WALL_MARGIN - d) / ROBOT.WALL_MARGIN;
   return t * t;
+}
+
+/**
+ * How boxed-in one axis is at `v`, as a **fraction**: 0 at `WALL_MARGIN` out, 1
+ * hard against the wall.
+ *
+ * The linear twin of `wallPush`, and deliberately not the same function. That
+ * one is squared because it is a veto and has to stay out of the way until the
+ * edge is genuinely close; this one prices a hazard that is measured as *flat
+ * across the band*, so squaring it would undercharge exactly the part of the
+ * band that costs the most — see the table on `TRAP_WEIGHT`.
+ */
+function trapPush(v: number, extent: number): number {
+  const d = Math.min(v, extent - v);
+  if (d >= ROBOT.WALL_MARGIN) return 0;
+  return (ROBOT.WALL_MARGIN - d) / ROBOT.WALL_MARGIN;
+}
+
+/**
+ * How much worse every threat at `(x, y)` is for want of somewhere to go: 1
+ * anywhere but a corner, up to `1 + 2 * TRAP_WEIGHT` in one.
+ *
+ * The two pushes are **multiplied**, not summed, and that is the whole design:
+ * a sum prices the entire wall band, which was tried and costs 16% of median
+ * survival for 32% more damage taken — the boundary is load-bearing ground for
+ * this robot. The product is zero unless *both* axes are boxed in, so a wall is
+ * untouched and only the escape-proof box pays. `TRAP_WEIGHT` carries the
+ * measurements for both forms.
+ *
+ * A multiplier on `riskAt` rather than a term beside it, so it is inert where
+ * the field is already zero — an empty corner costs nothing, which is what the
+ * measurement says it costs. Note the consequence for the score: the *product*
+ * is what has a spatial gradient now, and its minimum is no longer the corner.
+ * Nothing that reads `riskAt` directly (`hereRisk`, and with it every threshold
+ * in the intent ladder) sees any of it, which is what keeps the blast radius to
+ * the one quantity that was steering.
+ */
+function trapAt(x: number, y: number, w: number, h: number): number {
+  return 1 + 2 * ROBOT.TRAP_WEIGHT * trapPush(x, w) * trapPush(y, h);
+}
+
+/**
+ * Distance from `(x, y)` to the arena edge along the unit direction `(dx, dy)`.
+ *
+ * The ray-vs-rectangle slab test in closed form — the rectangle is axis-aligned,
+ * so whichever axis runs out first is the answer, and `Infinity` is the honest
+ * result for an axis the ray never moves along.
+ *
+ * This is "runway": how far the robot gets before the arena stops it. It is a
+ * different question from `wallPush`, which asks only how close it is standing.
+ * A robot 33px from the left wall has 33px of runway leftward, 270px upward and
+ * 920px rightward, and the whole point of the room term is that those three are
+ * not the same move.
+ */
+function clearance(x: number, y: number, dx: number, dy: number, w: number, h: number): number {
+  const tx = dx > 0 ? (w - x) / dx : dx < 0 ? x / -dx : Infinity;
+  const ty = dy > 0 ? (h - y) / dy : dy < 0 ? y / -dy : Infinity;
+  return Math.min(tx, ty);
+}
+
+/**
+ * How much room there is to maneuver in, standing at `(x, y)` and heading along
+ * the unit direction `(dx, dy)`.
+ *
+ * The user's report is what this exists for: the robot reaches the boundary and
+ * then only moves *along* it, which leaves it nowhere to dodge to. Two things
+ * are measured, and the tighter one wins.
+ *
+ * **Runway** is where the heading leads — `clearance` along it. **Lateral room**
+ * is the space to break off sideways: the `min` of the clearances along both
+ * perpendiculars, because a robot running parallel to a wall it is hugging has
+ * one perpendicular aimed straight into that wall, and half a dodge is not a
+ * dodge. Taking the tighter of the two is what makes sliding along a wall score
+ * *below* heading away from it: at 33px out, running parallel has 33px of
+ * lateral room while running inward has 270px, and that gap is the entire steer.
+ *
+ * Idle has no heading, so there is no runway and no lateral to measure; the room
+ * it has is the room it is standing in. Feeding the idle zero-vector through the
+ * ray test would return `Infinity` on both axes and hand standing still a
+ * perfect score, which is how a "get me out of this corner" term would talk the
+ * robot into never leaving.
+ */
+function roomAt(x: number, y: number, dx: number, dy: number, w: number, h: number): number {
+  if (dx === 0 && dy === 0) return Math.min(x, w - x, y, h - y);
+  return Math.min(
+    clearance(x, y, dx, dy, w, h),
+    clearance(x, y, -dy, dx, w, h),
+    clearance(x, y, dy, -dx, w, h),
+  );
 }
 
 /** A monster with the numbers the policy actually branches on. */
@@ -1190,6 +1561,9 @@ export function decide(
     (hpFrac < ROBOT.FLEE_HP &&
       nearest !== null &&
       nearest.dist <= ROBOT.DISENGAGE_RADIUS);
+  // Read before the write, so the latch's opening frame can be recognised: that
+  // frame is the one place `orbitSign` is decided (see it on `RobotState`).
+  const startingRetreat = threatened && !state.retreating;
   if (threatened) state.retreating = true;
   else if (
     nearest === null ||
@@ -1228,26 +1602,50 @@ export function decide(
       goalY = u[1];
     }
   } else if (inDanger) {
-    // Disengaging: straight away from where the danger *is*.
+    // Disengaging: away from where the danger *is*, and around it.
     //
-    // This used to be a radial half away from `nearest` plus a tangential half
-    // curving toward the safest region. Both halves are gone. The tangential
-    // one went because it steered a cross-arena retreat, which is not what the
-    // user asked for ("flee 只做局部脱离") — and with the leash gone a "safest
-    // region" is not a refuge from anything that saw you, only a place with
-    // fewer bodies in it right now. The radial one's *source* went because
-    // `nearest` changes identity about ten times a second in a crowd and every
-    // swap reversed the escape by up to 180°: that was the vibration, and
-    // `dangerCentre` is the repair.
+    // The radial half is a single unit vector away from `dangerCentre`. It used
+    // to be taken from `nearest`, which changes identity about ten times a
+    // second in a crowd; every swap reversed the escape by up to 180° and that
+    // was the vibration. `dangerCentre` — the dps-weighted centroid of the
+    // threats within `DISENGAGE_RADIUS` — is continuous, and it is the repair.
     //
-    // What is left is a single unit vector away from a continuous point, which
-    // is the most stable heading this policy can produce and the only one that
-    // can hold long enough to break an aggro.
+    // The tangential half is back. It was deleted with the old `refugeRegion`,
+    // and the two are separable: what the user's "flee 只做局部脱离" ruled out
+    // was a *cross-arena destination*, and the refuge was the only thing that
+    // was ever cross-arena. An orbit around the threat is the opposite of a
+    // destination — it is the locally-confined manoeuvre. What it must never do
+    // is steer by a region, so it steers by the arena centre instead, which is
+    // not a place to go but a way to break the tie between the two sides.
+    //
+    // Without it the goal is a gradient flow whose only attractor in a bounded
+    // arena is a wall, and the wall-slide turns what is left of it into a
+    // one-dimensional slide whose endpoint is a corner. Measured against the
+    // pure-radial control (96 seeds, this round): 58.6% of frames within 70px
+    // of an edge as a per-seed median, and that share *rising* over a run —
+    // 51.9% under 5s to 63.5% / 75.8% / **100%** by 30s, with mean clearance
+    // falling 98 → 74 → 55 → 14px. The corner is where a retreat stops being
+    // able to break the aggro that started it.
+    //
+    // The radial term keeps full strength at 1.0; it is the orbit that grew, to
+    // `FLEE_ORBIT` 1.2, so the step's outward component is 1/hypot(1, 1.2) =
+    // 64% of it and the rest is lateral. That trade is licensed by measurement,
+    // not by taste: the static objection — 160/hypot(1, 1.2) = 102px/s outward
+    // is under the hunter's 120px/s — does not hold here, because aggro breaks
+    // per run *rise* across this range (17.1 → 21.7). See `FLEE_ORBIT`.
     intent = "flee";
     const from = danger ? unitTo(danger.cx, danger.cy, px, py) : null;
     if (from) {
-      goalX = from[0];
-      goalY = from[1];
+      const tx = -from[1];
+      const ty = from[0];
+      // Which side to curve toward is decided once, on the latch's opening
+      // frame, and then held — see `RobotState.orbitSign` for why re-deriving
+      // it per frame is wrong here when it is right in `kite`.
+      if (startingRetreat) {
+        state.orbitSign = toCentre && tx * toCentre[0] + ty * toCentre[1] < 0 ? -1 : 1;
+      }
+      goalX = from[0] + ROBOT.FLEE_ORBIT * state.orbitSign * tx;
+      goalY = from[1] + ROBOT.FLEE_ORBIT * state.orbitSign * ty;
     } else if (toCentre) {
       // Nothing on us but still latched (the hp clause, usually, or standing
       // exactly on top of the danger): fall back to the middle, which at least
@@ -1388,7 +1786,8 @@ export function decide(
     (intent === "kite" || intent === "roam") && target !== null && target.dist > p.attackRange
       ? target.m.id
       : null;
-  const hereForScore = riskAt(threats, view.hazards, px, py, ignoring);
+  const hereForScore =
+    riskAt(threats, view.hazards, px, py, ignoring) * trapAt(px, py, view.width, view.height);
   // Hazards *are* in this baseline, unlike in the `hereRisk` above, and both
   // halves of that are deliberate. The delta is measured against where the robot
   // is standing, so a bomb underfoot has to be in the baseline for stepping out
@@ -1413,6 +1812,11 @@ export function decide(
   // which is the "慢慢远离怪物，但是又不能跑的太远" the user asked for, arrived at
   // from the other side.
   const weight = ROBOT.GOAL[intent];
+  // Resolved once, outside the loop: `intent` is settled above and the room
+  // weight is now a function of it. See `ROOM_WEIGHT_FLEE` for why the split
+  // exists — in short, `kite` has a legitimate objection to being pushed inward
+  // and `flee` is the rung that walks into corners.
+  const roomWeight = intent === "flee" ? ROBOT.ROOM_WEIGHT_FLEE : ROBOT.ROOM_WEIGHT;
   let bestInput: MoveInput = CANDIDATES[0];
   let bestScore = -Infinity;
   let standing: { input: MoveInput; total: number } | null = null;
@@ -1426,8 +1830,10 @@ export function decide(
     // saturates the risk term every diagonal was vetoed. Measured: the robot
     // chose a diagonal on 0.0% of 172991 moving frames, purely from that.
     const mag = Math.hypot(c.dx, c.dy) || 1; // idle has no direction
-    const nx = clamp(px + (c.dx / mag) * step, 0, view.width);
-    const ny = clamp(py + (c.dy / mag) * step, 0, view.height);
+    const ux = c.dx / mag;
+    const uy = c.dy / mag;
+    const nx = clamp(px + ux * step, 0, view.width);
+    const ny = clamp(py + uy * step, 0, view.height);
 
     // The goal is scored against the displacement actually available, not the
     // raw input. Against a wall the two differ: a candidate pointing into it
@@ -1465,16 +1871,51 @@ export function decide(
     // left to reconcile. Crossing a border is now priced as the step it is —
     // cheap if the ground beyond is empty, dear if it is not — and the stall that
     // motivated the whole `max` construction has no mechanism left to happen.
-    const delta = riskAt(threats, view.hazards, nx, ny, ignoring) - hereForScore;
+    // The trap factor is applied to `next` *and* to the baseline above, so the
+    // delta stays a genuine gradient — of `riskAt × trapAt` rather than of
+    // `riskAt`. Weighting only one side would compare two different fields and
+    // hand the robot a permanent bonus for wherever it happens to be standing.
+    // See `TRAP_WEIGHT`: pricing the corner takes the escape-proof box out of
+    // the running as the risk minimum, which is the entire point.
+    const delta =
+      riskAt(threats, view.hazards, nx, ny, ignoring) * trapAt(nx, ny, view.width, view.height) -
+      hereForScore;
     const risk = clamp(delta, -ROBOT.RISK_CAP, ROBOT.RISK_CAP);
 
     // Standing near a wall is bad on its own account: it removes the directions
     // a kite needs to retreat into, and a corner is where runs end. Quadratic,
     // so it is nearly free in open ground and decisive in a corner — the flat
     // version this replaced was far too weak to outbid a goal pointing outward.
+    //
+    // **This is a veto, and the room term below is the steer.** The two are not
+    // redundant and the division of labour is deliberate: this one is a level
+    // that says where the robot may *stand*, squared so it stays out of the way
+    // until the edge is genuinely close, while `roomAt` is a gradient that says
+    // which way is worth *walking*.
+    //
+    // The gap between them is the defect the user reported. Across the 40px
+    // probe this swings by up to 10 — a step out of the wall band costs nothing
+    // while a step into it is charged the full weight — so it is not too weak to
+    // be felt. What it cannot do is *pull*: it stops charging once the robot is
+    // clear, and a penalty that has already been paid gives no reason to take
+    // the next step. Nothing else in the score supplied one either. `flee`'s goal
+    // points radially outward and the wall-slide above deletes it, so the
+    // outward option is gone; inward is where the monsters are, so risk charges
+    // for it; and the tangential residue — the one direction left with neither a
+    // penalty nor a cost — is what the robot walks along. Measured: 85% of frames
+    // within 70px of an edge and a 33px mean clearance, which is less than the
+    // 41px a bomb dodge needs.
     const wall = ROBOT.WALL_WEIGHT * (wallPush(nx, view.width) + wallPush(ny, view.height));
 
-    const score = goal - risk - wall;
+    // Room to maneuver, scored on the heading rather than the position — see
+    // `roomAt`. Normalised against `ROOM_REF` and clamped, so this is bounded by
+    // `roomWeight` and is exactly zero difference between two candidates in
+    // open ground.
+    const room =
+      roomWeight *
+      Math.min(roomAt(nx, ny, ux, uy, view.width, view.height) / ROBOT.ROOM_REF, 1);
+
+    const score = goal - risk - wall + room;
 
     // ...and a nudge toward repeating last frame. The candidate set is nine
     // discrete directions judged over a 40px probe while the robot advances
@@ -1517,7 +1958,7 @@ export function decide(
   // never the standing choice, so it must win on its own score like everything
   // else (see `HYST`).
   //
-  // The score is `goal − risk − wall`, and the two halves are mismatched: the
+  // The score is `goal − risk − wall + room`, and the halves are mismatched: the
   // goal term caps at `GOAL[intent]` × ~1.17 ≈ 7 while the risk term clamps at
   // ±`RISK_CAP` = ±12. Risk therefore outbids the goal by 1.7×, and on a 40px
   // probe through five to seven aware monsters the winner flips between two
