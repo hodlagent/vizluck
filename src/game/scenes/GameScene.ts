@@ -59,7 +59,6 @@ import {
   type MonsterKind,
   type MoveInput,
   type ProjectileKind,
-  type RegionConfig,
 } from "../types";
 import {
   createRobotState,
@@ -152,6 +151,18 @@ const MONO = '"SF Mono", Menlo, Consolas, monospace';
 const FLOOR = 0x090c15;
 const FLOOR_EDGE = 0x1b2334;
 
+/**
+ * The spawn partition's wash and rim alphas — one value each, for all nine
+ * cells.
+ *
+ * Washed out on purpose. The floor's job is to be a floor: the old map lit its
+ * middle at 0.12 because the middle was a *claim* about danger, and there is no
+ * such claim to make now. What has to stay readable is the boundary (so a
+ * player can tell which cell they are in) and nothing more.
+ */
+const REGION_WASH = 0.05;
+const REGION_RIM = 0.3;
+
 /** `#rrggbb` or `rgb(...)` → the 0xRRGGBB integer Phaser draws with. */
 function cssToInt(css: string, fallback: number): number {
   const hex = /^#?([0-9a-f]{6})$/i.exec(css.trim());
@@ -193,10 +204,11 @@ interface Palette {
   green: number;
   red: number;
   dim: number;
-  /** Region tints, by tier — the risk gradient made visible. */
-  corner: number;
-  edge: number;
-  center: number;
+  /**
+   * The spawn partition's line colour. One colour for all nine cells — the
+   * grid marks *where the bookkeeping is*, and nothing about the room.
+   */
+  region: number;
   monster: Record<MonsterKind, number>;
   /** One step lighter than the body, for rims and facing ticks. */
   monsterRim: Record<MonsterKind, number>;
@@ -247,9 +259,11 @@ function readPalette(): Palette {
     green,
     red,
     dim,
-    corner: 0x2f6fd0,
-    edge: 0xb8860b,
-    center: red,
+    // Gold, because it is the one hue left over from the old gradient that does
+    // not collide with a monster: `dim` is the wanderer, `accent` the hunter,
+    // `red` the brute. A partition line that reads as either team's colour would
+    // be read as a threat.
+    region: 0xb8860b,
     monster,
     monsterRim: {
       wanderer: shade(dim, 0.45),
@@ -271,13 +285,6 @@ const ITEM_LABEL: Record<ItemKind, string> = {
   power: "ATK+",
   agility: "SPD+",
   vitality: "MAX+",
-};
-
-/** The tier's label, painted into the corner of each region. */
-const TIER_LABEL: Record<RegionConfig["tier"], string> = {
-  corner: "SAFE",
-  edge: "CONTESTED",
-  center: "DANGER",
 };
 
 /** One flying spark, in px and px/s. */
@@ -390,7 +397,6 @@ export class GameScene extends Phaser.Scene {
   private overlay!: Phaser.GameObjects.Graphics;
   private overlayKind: GameOverlay = "none";
 
-  private regionLabels: Phaser.GameObjects.Text[] = [];
   private announce!: Phaser.GameObjects.Text;
   private announceLife = 0;
   private overlayTitle!: Phaser.GameObjects.Text;
@@ -806,13 +812,6 @@ export class GameScene extends Phaser.Scene {
     g.fillRoundedRect(-4, -4, GAME_WIDTH + 8, GAME_HEIGHT + 8, 10);
 
     const regions = buildRegions(GAME_WIDTH, GAME_HEIGHT);
-    const tint: Record<RegionConfig["tier"], number> = {
-      corner: p.corner,
-      edge: p.edge,
-      center: p.center,
-    };
-    const wash: Record<RegionConfig["tier"], number> = { corner: 0.07, edge: 0.08, center: 0.12 };
-    const rim: Record<RegionConfig["tier"], number> = { corner: 0.3, edge: 0.32, center: 0.5 };
 
     // 1. A fine grid over the whole arena — the "tactical map" substrate.
     g.lineStyle(1, p.grid, 0.5);
@@ -833,25 +832,20 @@ export class GameScene extends Phaser.Scene {
       for (let y = 60; y < GAME_HEIGHT; y += 60) g.fillPoint(x, y, 2);
     }
 
-    // 2. Per-region wash + rim. The centre is the lethal, rich tier, so it gets
-    //    the strongest wash and a double border — the risk gradient is the one
-    //    thing the floor has to communicate.
+    // 2. Per-region wash + rim, identical in all nine. These lines mark the
+    //    spawn partition and say nothing else: a cell is a cell.
     for (const r of regions) {
-      g.fillStyle(tint[r.tier], wash[r.tier]);
+      g.fillStyle(p.region, REGION_WASH);
       g.fillRect(r.x, r.y, r.w, r.h);
-      g.lineStyle(1, tint[r.tier], rim[r.tier]);
+      g.lineStyle(1, p.region, REGION_RIM);
       g.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
-      if (r.tier === "center") {
-        g.lineStyle(1, tint[r.tier], 0.28);
-        g.strokeRect(r.x + 7.5, r.y + 7.5, r.w - 15, r.h - 15);
-      }
     }
 
     // 3. Corner brackets on every region — the HUD motif that stops nine plain
     //    rectangles from reading as a spreadsheet.
     const arm = 14;
     for (const r of regions) {
-      g.lineStyle(2, tint[r.tier], 0.75);
+      g.lineStyle(2, p.region, 0.75);
       const corners: readonly (readonly [number, number, number, number])[] = [
         [r.x, r.y, 1, 1],
         [r.x + r.w, r.y, -1, 1],
@@ -871,8 +865,9 @@ export class GameScene extends Phaser.Scene {
     //    hairline rings darkening toward the rim: `fillGradientStyle` is
     //    WebGL-only and this scene has to survive the Canvas renderer, so the
     //    ramp is stacked strokes a pixel apart, which the eye reads as a smooth
-    //    falloff. It also does real work — it pulls the corners (the safe tier)
-    //    down and pushes the lit centre forward.
+    //    falloff. It used to do a second job — pushing the lit centre forward
+    //    against dim corners — and that job is gone with the gradient: it now
+    //    only keeps the eye inside the arena.
     const band = 34;
     for (let i = 0; i < band; i++) {
       const a = 0.26 * Math.pow(1 - i / band, 2.2);
@@ -894,31 +889,16 @@ export class GameScene extends Phaser.Scene {
     g.strokeRoundedRect(0.5, 0.5, GAME_WIDTH - 1, GAME_HEIGHT - 1, 8);
   }
 
-  /** The nine tier captions, plus the pooled texts. Built once. */
+  /**
+   * The pooled texts — the centre announcement and the floating numbers. Built
+   * once.
+   *
+   * The nine cell captions that used to be built here ("SAFE" / "CONTESTED" /
+   * "DANGER") are gone with the gradient they named. The partition is drawn,
+   * not labelled: nine identical cells have nothing to say about themselves.
+   */
   private buildLabels(): void {
     const p = this.palette;
-    const tierColor: Record<RegionConfig["tier"], number> = {
-      corner: p.corner,
-      edge: p.edge,
-      center: p.center,
-    };
-
-    for (const r of buildRegions(GAME_WIDTH, GAME_HEIGHT)) {
-      const label = this.add
-        .text(r.x + 22, r.y + 10, TIER_LABEL[r.tier], {
-          fontFamily: MONO,
-          fontSize: "11px",
-          color: intToCss(shade(tierColor[r.tier], 0.55)),
-        })
-        // 0.68, not 0.5: the caption colour is a *lighter tint of its own tier*,
-        // so all of its contrast comes from the lightness delta against the
-        // wash of that same hue — halving it again with alpha left "DANGER"
-        // barely above the red it sits on. Colour-coded but legible beats
-        // tastefully muted and unreadable.
-        .setAlpha(0.68)
-        .setDepth(1);
-      this.regionLabels.push(label);
-    }
 
     this.announce = this.add
       .text(GAME_WIDTH / 2, GAME_HEIGHT / 2 - 70, "", {
@@ -971,26 +951,22 @@ export class GameScene extends Phaser.Scene {
     const player = sim.player;
     const t = this.clock;
 
-    // 1. The region the player is standing in. This is the whole risk gradient
-    //    made personal: step into the centre and the floor lights up under you.
+    // 1. The cell the player is standing in, lit. This is a *bookkeeping*
+    //    readout and no longer a claim about danger: all nine are the same room,
+    //    so all it says is which quota is about to be charged. The rim is on the
+    //    current cell only because the floor already rims all nine — without it
+    //    the highlight is a wash the eye has to hunt for.
+    //
+    //    The pulse that lit the centre on its own clock is gone. It marked the
+    //    richest, deadliest cell, and there is no such cell to mark.
     const here = sim.configs[regionIndexAt(sim, player.posX, player.posY)];
-    const hereTint = here.tier === "center" ? p.center : here.tier === "edge" ? p.edge : p.corner;
     const herePulse = 0.5 + 0.5 * Math.sin(t * 2);
-    g.fillStyle(hereTint, 0.08 + 0.035 * herePulse);
+    g.fillStyle(p.region, 0.06 + 0.03 * herePulse);
     g.fillRect(here.x, here.y, here.w, here.h);
-    // A rim on the *current* region only. The floor already rims all nine, so
-    // without this the highlight is a wash the eye has to hunt for; a lit border
-    // turns "which tier am I in" into a glance.
-    g.lineStyle(1, hereTint, 0.35 + 0.25 * herePulse);
+    g.lineStyle(1, p.region, 0.35 + 0.25 * herePulse);
     g.strokeRect(here.x + 0.5, here.y + 0.5, here.w - 1, here.h - 1);
 
-    // 2. The centre breathes. Slow, low-amplitude, and only in the lethal tier,
-    //    so "somewhere dangerous" is legible from the corner of the eye.
-    const centre = sim.configs[4];
-    g.fillStyle(p.center, 0.04 + 0.035 * (0.5 + 0.5 * Math.sin(t * 1.7)));
-    g.fillRect(centre.x, centre.y, centre.w, centre.h);
-
-    // 3. Threat lines: a monster that has the player inside its sense circle is
+    // 2. Threat lines: a monster that has the player inside its sense circle is
     //    the only thing in this game that can hurt them, and a link back to it
     //    answers "what is hitting me" without hunting for the ring.
     g.lineStyle(1, p.red, 0.16);
@@ -1002,7 +978,7 @@ export class GameScene extends Phaser.Scene {
       g.strokePath();
     }
 
-    // 4. Sense rings, as dotted radar arcs. Dots rather than strokes because the
+    // 3. Sense rings, as dotted radar arcs. Dots rather than strokes because the
     //    overlap is the problem: dashes still merge into a web when three rings
     //    cross, while dots stay countable.
     for (const m of sim.monsters) {
@@ -1019,7 +995,7 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    // 5. The player's reach. Breathing, so it reads as a live stat; stretched by
+    // 4. The player's reach. Breathing, so it reads as a live stat; stretched by
     //    a swing so the auto-attack has something to show for itself. Gone
     //    entirely once dead — reach is meaningless without a unit to spend it.
     //
@@ -1043,12 +1019,12 @@ export class GameScene extends Phaser.Scene {
       );
     }
 
-    // 6. Potions on the floor. Above the rings, below the bodies: an item is a
+    // 5. Potions on the floor. Above the rings, below the bodies: an item is a
     //    decal on the ground, so a monster standing on one has to occlude it,
     //    never the other way round.
     this.drawItems(g, sim);
 
-    // 7. Shots in flight (design §15). Between the decals and the bodies, so
+    // 6. Shots in flight (design §15). Between the decals and the bodies, so
     //    the reticle a bomb casts is ground furniture while the bomb itself is
     //    a thing in the arena — and so a shot is occluded by whatever it is
     //    about to reach rather than the other way round. It costs nothing to
@@ -1057,7 +1033,7 @@ export class GameScene extends Phaser.Scene {
     //    body it just damaged.
     this.drawShots(g, sim);
 
-    // 8. Monsters.
+    // 7. Monsters.
     for (const m of sim.monsters) {
       const color = p.monster[m.kind];
       const rim = p.monsterRim[m.kind];
@@ -1115,7 +1091,7 @@ export class GameScene extends Phaser.Scene {
       this.drawHpBar(g, m.posX, m.posY - r - 9, m.hp / m.maxHp, color);
     }
 
-    // 9. Player — or its husk. Death has to change the *body*, not just dim the
+    // 8. Player — or its husk. Death has to change the *body*, not just dim the
     //    frame: a corpse still glowing green under a GAME OVER card reads as a
     //    rendering bug, and it is the last thing the run leaves on screen.
     if (!sim.alive) {

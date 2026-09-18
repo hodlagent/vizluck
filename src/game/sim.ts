@@ -47,10 +47,33 @@ export const TUNING = {
    */
   maxDt: 0.05,
 
-  /** Difficulty escalation (design §4.3). */
+  /**
+   * Density escalation (design §4.3): every `escalateEvery` seconds survived,
+   * every region's target count steps up by one, to `maxTargetCount`.
+   *
+   * This is the **only** curve still running on the survival clock. The
+   * respawn cadence used to decay here too (`×0.9` a step); it is the player's
+   * level's business now — see `respawnAtLevel`.
+   */
   escalateEvery: 30,
-  escalateRespawn: 0.9,
   maxTargetCount: 14,
+
+  /**
+   * The target monster count **every** region shares (design §4.1). Nine cells
+   * at this count is the arena's starting population; §4.3 raises it from here.
+   */
+  regionTargetCount: 4,
+
+  /**
+   * Respawn cadence (design §4.1): `respawnBase` seconds at level 1, one
+   * `respawnPerLevel` shorter for each level gained, floored at `minRespawn`.
+   *
+   * One formula for all nine regions. The grid is a spawn partition; grading
+   * the *room* was the thing this replaced, and the gradient the player feels
+   * is now their own growth rather than where they are standing.
+   */
+  respawnBase: 5,
+  respawnPerLevel: 0.1,
   minRespawn: 0.8,
 
   /**
@@ -347,40 +370,57 @@ export interface SimOptions {
 // ── Construction ────────────────────────────────────────────────────────────
 
 /**
- * The 3x3 region grid (design §4.1). It is a **spawn partition**: each region
- * owns a target population, a respawn interval and an archetype mix, so the
- * map's density and rhythm are spatially graded and "where do I stand" is a real
- * decision rather than a decoration.
+ * Seconds between a kill and that monster reappearing, at `level` (design §4.1).
  *
- * It is *not* a set of walls. Monsters are free to leave — the leash was removed
- * deliberately (§6.2) — so a tier's numbers describe where its monsters are
- * **born**, which over a long run is only loosely where they will be found.
+ * The respawn cadence is graded by **the player's level**, not by the room they
+ * are standing in: 5.0s at level 1, 0.1s shorter per level, floored at
+ * `minRespawn`. Nine regions, one number.
+ */
+export function respawnAtLevel(level: number): number {
+  const t = TUNING.respawnBase - TUNING.respawnPerLevel * (level - 1);
+  return Math.max(TUNING.minRespawn, t);
+}
+
+/** Every region's respawn interval, rewritten from the player's current level. */
+function applyRespawnCadence(s: SimState): void {
+  const seconds = respawnAtLevel(s.level);
+  for (const cfg of s.configs) cfg.respawnSeconds = seconds;
+}
+
+/**
+ * The 3x3 region grid (design §4.1). It is a **spawn partition**: nine cells,
+ * each owning a quota of living monsters and a place to put them.
+ *
+ * The nine are deliberately **identical** — same target count, same archetype
+ * mix, same cadence. The grid exists so a kill can be charged against a region
+ * and a spawn can be placed in one (`countInRegion`, §4.2); it is bookkeeping,
+ * not a difficulty map. Where the pressure actually comes from is the player's
+ * own level (`respawnAtLevel`) and the survival clock (§4.3).
+ *
+ * It is *not* a set of walls either. Monsters are free to leave — the leash was
+ * removed deliberately (§6.2) — so a region's numbers describe where its
+ * monsters are **born**, which over a long run is only loosely where they will
+ * be found.
  */
 export function buildRegions(width: number, height: number): RegionConfig[] {
   const cw = width / 3;
   const ch = height / 3;
   const out: RegionConfig[] = [];
+  const kinds = ["wanderer", "hunter", "brute"] as const;
 
   for (let row = 0; row < 3; row++) {
     for (let col = 0; col < 3; col++) {
-      const centre = row === 1 && col === 1;
-      const corner = row !== 1 && col !== 1;
-      const tier = centre ? "center" : corner ? "corner" : "edge";
-
       out.push({
         index: row * 3 + col,
-        tier,
         x: col * cw,
         y: row * ch,
         w: cw,
         h: ch,
-        targetCount: centre ? 6 : corner ? 2 : 4,
-        respawnSeconds: centre ? 2.5 : corner ? 6 : 4,
-        kinds: centre
-          ? (["brute", "hunter"] as const)
-          : corner
-            ? (["wanderer"] as const)
-            : (["wanderer", "hunter"] as const),
+        targetCount: TUNING.regionTargetCount,
+        // Level 1's cadence. `createSim` rewrites this through
+        // `applyRespawnCadence` so the formula has exactly one home.
+        respawnSeconds: respawnAtLevel(1),
+        kinds,
       });
     }
   }
@@ -394,8 +434,9 @@ function spawnMonster(s: SimState, cfg: RegionConfig, kind: MonsterKind): Monste
   // moment of spawning, rather than retro-fitted onto monsters already on the
   // floor — a monster whose bar grew while the player was hitting it reads as a
   // bug, not as difficulty. Nothing is lost by it: a region turns its whole
-  // population over in 2.5-6s, so within a minute essentially every monster on
-  // screen was spawned under the new factor anyway.
+  // population over in a few seconds (5.0s at level 1, only shorter above it),
+  // so within a minute essentially every monster on screen was spawned under
+  // the new factor anyway.
   const hp = arch.hp * monsterHpMul(s.time);
   const m: MonsterStats = {
     id: s.nextId++,
@@ -438,18 +479,17 @@ export function createSim(opts: SimOptions = {}): SimState {
       hp: TUNING.hp,
       maxHp: TUNING.hp,
       hpSpeed: TUNING.hpSpeed,
-      // Spawn at the centre of the arena, not in a corner region. This reverses
-      // §4.1's original "start in the thinnest tier" call, and it is a
-      // consequence of §6.2: once the leash came off, a corner stopped being a
-      // quiet place to begin and became a trap to begin in. The robot spends
-      // 77% of its life within 70px of an edge and its traversal of the middle
-      // is what breaks the aggro that keeps it there, so a run that starts
-      // already pinned has to escape before it can play. Measured over 32 seeds
-      // with the policy held fixed: median survival 17.6s against 9.9s from the
-      // corner, mean clearance 71px against 47px. The cost is real and belongs
-      // to the §13 difficulty item, not here — the centre is denser (9.9
-      // monsters aware on average against 5.6) and a stationary player dies in
-      // 1.9s instead of 3.6s.
+      // Spawn at the centre of the arena, not against a wall. This is a
+      // consequence of §6.2: the robot spends 77% of its life within 70px of an
+      // edge and its traversal of the middle is what breaks the aggro that keeps
+      // it there, so a run that starts already pinned has to escape before it
+      // can play. Measured over 32 seeds with the policy held fixed: median
+      // survival 17.6s against 9.9s from a corner start, mean clearance 71px
+      // against 47px. (Those numbers were taken under the old spatially graded
+      // map; the §4.1 rewrite invalidates them as absolutes, not as a
+      // comparison — the corner was never the quiet option, only the closer one
+      // to a wall.) The cost belongs to the §13 difficulty item: a stationary
+      // player dies in 1.9s here against 3.6s pinned in a corner.
       posX: width / 2,
       posY: height / 2,
     },
@@ -471,6 +511,9 @@ export function createSim(opts: SimOptions = {}): SimState {
     nextId: 1,
     rng: opts.rng ?? Math.random,
   };
+
+  // Level 1's cadence, through the same call the level-ups use.
+  applyRespawnCadence(s);
 
   for (const cfg of configs) {
     for (let i = 0; i < cfg.targetCount; i++) {
@@ -802,6 +845,7 @@ function killMonster(s: SimState, m: MonsterStats): void {
   s.monsters.splice(idx, 1);
 
   const arch = MONSTER_ARCHETYPES[m.kind];
+  const levelBefore = s.level;
   s.kills++;
   s.xp += arch.xp;
   while (s.xp >= xpForNext(s.level)) {
@@ -809,14 +853,18 @@ function killMonster(s: SimState, m: MonsterStats): void {
     s.level++;
     applyLevelUp(s.player);
   }
+  if (s.level !== levelBefore) applyRespawnCadence(s);
 
   // Requirement 3: a kill leaves potions on the floor, where the monster died
   // rather than where the player is standing. Combat happens at the edge of
   // `attackRange`, so this is what turns "kill" into "and now go and get it".
   dropLoot(s, m);
 
-  // Respawn after this region's delay, in this region (requirement: "杀死后 n
-  // 秒后刷新出来", per-region and independent).
+  // Respawn after the delay, in this region (requirement: "杀死后 n 秒后刷新出
+  // 来"). The delay is the level's, read at the moment of the kill — a countdown
+  // already running is not retro-fitted when the player levels up, which is the
+  // same call §4.4 makes for monster HP and for the same reason: a bar that
+  // changes under a fight reads as a bug.
   s.regions[m.region].pending.push({
     seconds: s.configs[m.region].respawnSeconds,
     kind: m.kind,
@@ -875,13 +923,15 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
   s.tick++;
   const p = s.player;
 
-  // ── Difficulty escalation (design §4.3) ──────────────────────────────────
+  // ── Density escalation (design §4.3) ─────────────────────────────────────
+  // The survival clock raises *how many* monsters the arena holds. It no longer
+  // touches the respawn cadence: that curve belongs to the player's level
+  // (`respawnAtLevel`), and two curves on one knob drown each other out.
   s.escalationTimer += dt;
   while (s.escalationTimer >= TUNING.escalateEvery) {
     s.escalationTimer -= TUNING.escalateEvery;
     for (const cfg of s.configs) {
       cfg.targetCount = Math.min(cfg.targetCount + 1, TUNING.maxTargetCount);
-      cfg.respawnSeconds = Math.max(cfg.respawnSeconds * TUNING.escalateRespawn, TUNING.minRespawn);
     }
   }
 
@@ -953,8 +1003,8 @@ export function stepSim(s: SimState, input: MoveInput, dtRaw: number): void {
     m.attackCooldown -= dt;
     // One condition, and the region is deliberately not part of it. A monster
     // fights whatever it can see, wherever it can see it — a hunter's 260px
-    // sense reaches from the edge region into the corner next door, so a corner
-    // is no longer a place a chaser cannot follow you into (§6.2).
+    // sense reaches across more than a region's width, so no cell of the grid
+    // is a place a chaser cannot follow you into (§6.2).
     m.attacking = dist <= m.senseRange;
 
     if (!m.attacking) {

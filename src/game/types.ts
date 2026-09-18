@@ -173,23 +173,33 @@ export interface ProjectileStats {
 
 // ── Scene (design §4, requirement 4) ────────────────────────────────────────
 
-/** Where a region sits in the 3x3 grid; drives its difficulty tier. */
-export type RegionTier = "corner" | "edge" | "center";
-
+/**
+ * One cell of the 3x3 spawn partition (design §4.1).
+ *
+ * The grid is **bookkeeping, not terrain**: all nine cells carry the same
+ * numbers, and none of them means anything the others do not. What varies
+ * between two cells is only which quota a kill is charged against.
+ */
 export interface RegionConfig {
   /** 0..8, row-major: `row * 3 + col`. */
   index: number;
-  tier: RegionTier;
   /** Bounds within the arena, in px. */
   x: number;
   y: number;
   w: number;
   h: number;
-  /** Steady-state monster count for this region. Escalates over time. */
+  /**
+   * Steady-state monster count for this region. **Identical in all nine**, and
+   * escalates over time as one global number (design §4.3).
+   */
   targetCount: number;
-  /** Seconds between a kill here and that monster reappearing. Escalates. */
+  /**
+   * Seconds between a kill here and that monster reappearing. **Identical in
+   * all nine**, and driven by the *player's level*, not by the cell: see
+   * `respawnAtLevel` in `sim.ts`.
+   */
   respawnSeconds: number;
-  /** Which archetypes spawn here, picked uniformly. */
+  /** Which archetypes spawn here, picked uniformly. The same three everywhere. */
   kinds: readonly MonsterKind[];
 }
 

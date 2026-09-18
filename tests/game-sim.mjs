@@ -131,30 +131,129 @@ async function run() {
       m.posX >= cfg.x && m.posX <= cfg.x + cfg.w && m.posY >= cfg.y && m.posY <= cfg.y + cfg.h;
 
     // ── §4 Regions ─────────────────────────────────────────────────────────
+    //
+    // The grid is a **spawn partition and nothing else** (§4.1): nine cells that
+    // bookkeep quotas. It used to be a difficulty gradient — corners thin and
+    // slow, the centre rich and fast — and these checks used to pin that
+    // gradient down. They now pin the opposite: that no cell differs from any
+    // other in anything but its bounds. If a future change reintroduces a
+    // per-cell number, this is the check that has to be argued with first.
     {
       const s = fresh();
-      check(s.monsters.length === 30, "createSim fills every region to its target", s.monsters.length);
+      const perRegion = s.configs[0].targetCount;
+      check(
+        s.monsters.length === perRegion * 9,
+        "createSim fills every region to its target",
+        s.monsters.length,
+      );
       const counts = s.configs.map((c) => s.monsters.filter((m) => m.region === c.index).length);
       check(
         counts.every((n, i) => n === s.configs[i].targetCount),
         "each region starts at its own target count",
         counts.join(","),
       );
+      const sameCount = s.configs.every((c) => c.targetCount === perRegion);
+      check(sameCount, "all nine regions share one target count", perRegion);
+      const sameRespawn = s.configs.every((c) => c.respawnSeconds === s.configs[0].respawnSeconds);
+      check(sameRespawn, "and one respawn interval", s.configs[0].respawnSeconds);
+      const sameKinds = s.configs.every((c) => c.kinds.join(",") === s.configs[0].kinds.join(","));
+      check(sameKinds, "and one archetype mix", s.configs[0].kinds.join(","));
       check(
-        s.configs[0].targetCount === 2 && s.configs[4].targetCount === 6,
-        "corner is the poor tier and centre the rich one",
-        `${s.configs[0].targetCount} vs ${s.configs[4].targetCount}`,
+        s.configs[0].kinds.length === 3,
+        "which is every archetype — no region is a safe one",
+        s.configs[0].kinds.join(","),
       );
-      check(
-        s.configs[0].respawnSeconds > s.configs[4].respawnSeconds,
-        "corner respawns slower than centre",
-        `${s.configs[0].respawnSeconds} vs ${s.configs[4].respawnSeconds}`,
-      );
+      const boxes = new Set(s.configs.map((c) => `${c.x},${c.y}`));
+      check(boxes.size === 9, "but nine distinct cells", boxes.size);
+
       for (const cfg of s.configs) {
         const inside = s.monsters.filter((m) => m.region === cfg.index).every((m) => inRegion(m, cfg));
         if (!inside) check(false, `spawns for region ${cfg.index} land inside it`);
       }
       check(true, "every spawn lands inside its own region");
+    }
+
+    // ── §4.1 The respawn cadence is the player's level's business ─────────
+    //
+    // 5.0s at level 1, 0.1s shorter per level, floored at `respawnSeconds`
+    // = `TUNING.minRespawn`. The point of the check is not the arithmetic — it
+    // is that the cadence is *the same in all nine cells* and moves with the
+    // level rather than with the survival clock.
+    {
+      const base = sim.TUNING.respawnBase;
+      const { escalateEvery, minRespawn, respawnPerLevel, regionTargetCount } = sim.TUNING;
+
+      const s = fresh();
+      check(
+        s.configs.every((c) => c.respawnSeconds === base),
+        "level 1 respawns on the base interval",
+        s.configs[0].respawnSeconds,
+      );
+
+      /**
+       * Kill one monster with `xp` banked, and report the level it left behind.
+       *
+       * Deliberately driven through a real kill rather than by poking `level`:
+       * the kill path is the *only* writer of `respawnSeconds`, so a check that
+       * set the field itself would be checking its own arithmetic.
+       */
+      const killWith = (state, xp) => {
+        state.xp = xp;
+        const m = solo(state, "wanderer", 4, (mm) => {
+          mm.hp = 1;
+          mm.posX = state.player.posX;
+          mm.posY = state.player.posY;
+        });
+        state.attackCooldown = 0;
+        sim.stepSim(state, { dx: 0, dy: 0 }, 0.05);
+        state.monsters.splice(state.monsters.indexOf(m), 1);
+        return state.level;
+      };
+
+      // Levels 1→6 costs Σ 100L for L = 1..5 = 1500 xp. Bank all but the 10 a
+      // wanderer pays, so one kill lands exactly on level 6: 0.5s off the clock,
+      // in every cell at once.
+      const level = killWith(s, 1500 - 10);
+      check(level === 6, "the kill path levelled the player to 6", level);
+      const expected = base - respawnPerLevel * (level - 1);
+      check(
+        s.configs.every((c) => Math.abs(c.respawnSeconds - expected) < 1e-9),
+        "every region tightened with the level, none on its own",
+        `${s.configs[0].respawnSeconds.toFixed(2)} vs ${expected.toFixed(2)}`,
+      );
+      check(expected < base, "and it tightened downwards", expected);
+
+      // The floor holds past the level where the line crosses it: 5.0 − 0.1×(L−1)
+      // reaches 0.8 at L = 43, so level 50 is a comfortable 7 levels past it.
+      // (Σ 100L for L = 6..49 = 121000 xp; minus the wanderer's 10.)
+      const floorLevel = Math.ceil((base - minRespawn) / respawnPerLevel) + 1;
+      const deep = killWith(s, 121000 - 10);
+      check(deep > floorLevel, "the level ran past where the line meets the floor", deep);
+      check(
+        s.configs.every((c) => c.respawnSeconds === minRespawn),
+        "the cadence stops at minRespawn",
+        s.configs[0].respawnSeconds,
+      );
+
+      // And the survival clock raises density without touching the cadence.
+      // Monsters are cleared first: the player has to *survive* the 30s for the
+      // clock to move at all, and this check is not about surviving.
+      const clocked = fresh();
+      clocked.monsters.length = 0;
+      const cadenceBefore = clocked.configs[0].respawnSeconds;
+      for (let i = 0; i < Math.ceil(escalateEvery / 0.05) + 5; i++) {
+        sim.stepSim(clocked, { dx: 0, dy: 0 }, 0.05);
+      }
+      check(
+        clocked.configs[0].respawnSeconds === cadenceBefore,
+        "30s on the clock raises density, not cadence",
+        `${cadenceBefore} → ${clocked.configs[0].respawnSeconds}`,
+      );
+      check(
+        clocked.configs.every((c) => c.targetCount === regionTargetCount + 1),
+        "but density did move, in all nine at once",
+        clocked.configs[0].targetCount,
+      );
     }
 
     // ── §5.1 Movement is a *speed*, in all eight directions ────────────────
@@ -204,16 +303,17 @@ async function run() {
     //
     // This block used to assert the opposite — that a monster never leaves its
     // home region, that it cannot aggro a player elsewhere, and that "the
-    // corner tier really is a refuge". The leash was removed deliberately (the
-    // 3×3 is a spawn partition; it is not a wall), so the same setup now has to
+    // arena's quiet corner really is a refuge". The leash was removed
+    // deliberately (the 3×3 is a spawn partition; it is not a wall), so the
+    // same setup now has to
     // prove the inverse. It is worth keeping as the inverse rather than
     // deleting, because these three facts are exactly what the removal changes
     // and nothing else in the suite would notice them coming back.
     {
       const s = fresh();
-      // A hunter in the centre, with a sense range that reaches right across
-      // the arena. Under the leash this was the case that motivated the rule:
-      // the monster could see the corner and still not come.
+      // A hunter in the middle cell, with a sense range that reaches right
+      // across the arena. Under the leash this was the case that motivated the
+      // rule: the monster could see the far cell and still not come.
       const m = solo(s, "hunter", 4, (mm) => {
         mm.posX = s.configs[4].x + 2;
         mm.posY = s.configs[4].y + 2;
@@ -230,7 +330,7 @@ async function run() {
         mm.hp = 1000;
         mm.maxHp = 1000;
       });
-      // Player parked in the corner region, far outside the hunter's region.
+      // Player parked in the far cell, well outside the hunter's own.
       s.player.posX = s.configs[0].x + s.configs[0].w / 2;
       s.player.posY = s.configs[0].y + s.configs[0].h / 2;
 
@@ -243,7 +343,7 @@ async function run() {
       check(leftRegion, "and chases it across the border");
       check(
         s.player.hp < s.player.maxHp,
-        "so the corner is no longer a refuge from something that saw you",
+        "so distance to a border is no refuge from something that saw you",
         `${s.player.hp}/${s.player.maxHp}`,
       );
     }
@@ -310,7 +410,7 @@ async function run() {
     // ── Respawn (§4, "n 秒后刷新") ─────────────────────────────────────────
     {
       const s = fresh();
-      const home = 4; // centre: the region whose respawn time we are testing
+      const home = 4; // any cell would do — all nine are the same cell now (§4.1)
       const cfg = s.configs[home];
       const m = solo(s, "hunter", home, (mm) => {
         mm.hp = 1;
@@ -427,6 +527,21 @@ async function run() {
       s.time = sim.TUNING.monsterHpEvery; // one minute already survived
       sim.stepSim(s, { dx: 0, dy: 0 }, 0.05);
       check(s.kills === 1, "the puppet dies in both arms of the HP check", s.kills);
+
+      // Walk the player off to the far corner before waiting out the respawn.
+      //
+      // Without this the check is a coin flip, and it was failing on the wrong
+      // side of one: the newborn lands somewhere uniform in a 320×180 cell, so
+      // ~1 spawn in 6 lands inside the player's 55px `attackRange`, takes an
+      // 8hp shot from the automatic attack (§5.1) before the loop ends, and
+      // reads as "spawned damaged" — a spawn-position accident, not a rule.
+      // The wait is also ~5s now rather than 2.5s (§4.1), which re-rolled it.
+      // What the check owns is the multiplier and the full bar, so the player
+      // is parked out of range of both puppets' cells to isolate exactly that.
+      for (const sim2 of [s, early]) {
+        sim2.player.posX = 0;
+        sim2.player.posY = 0;
+      }
 
       let t = 0;
       while (t < cfg.respawnSeconds + 0.3) {
