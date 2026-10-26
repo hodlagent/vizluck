@@ -51,6 +51,12 @@ rustc-hash = "2.0"
 # hex encoding for puzzle JSON parsing
 hex = "0.4"
 
+# ── Random tab: Ethereum + Solana address derivation ────────────────────────
+# keccak256 (not SHA3-256) for Ethereum addresses / EIP-55 checksums.
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# ed25519 public keys: a Solana address is base58(pubkey).
+ed25519-dalek = "2.1"
+
 # RNG — only sys_rng (getrandom 0.4) enabled
 rand = { version = "0.10.2", default-features = false, features = ["sys_rng"] }
 

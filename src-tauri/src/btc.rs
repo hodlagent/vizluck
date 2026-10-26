@@ -5,7 +5,19 @@
 //! candidate lists with non-P2PK addresses (bc1*).
 #![allow(dead_code)]
 
+use std::sync::OnceLock;
+
 use sha2::Digest;
+
+/// One shared libsecp256k1 context for every address-derivation helper.
+///
+/// Context construction is expensive (it allocates and randomises several
+/// precomputed tables), so neither the scanner's hot loop nor `p2tr` may build
+/// one per key.  `Secp256k1<All>` is `Send + Sync`.
+pub(crate) fn secp_context() -> &'static secp256k1::Secp256k1<secp256k1::All> {
+    static SECP: OnceLock<secp256k1::Secp256k1<secp256k1::All>> = OnceLock::new();
+    SECP.get_or_init(secp256k1::Secp256k1::new)
+}
 
 // ── secp256k1 generator point ────────────────────────────────────────────────
 
@@ -45,7 +57,7 @@ pub fn hash160(data: &[u8]) -> [u8; 20] {
 
 const B58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-fn bs58_encode(data: &[u8]) -> String {
+pub fn bs58_encode(data: &[u8]) -> String {
     if data.is_empty() { return String::new(); }
     let mut digits: Vec<u8> = Vec::new();
     for &b in data {
@@ -163,9 +175,20 @@ pub fn p2wpkh(pub_key: &[u8]) -> String {
 }
 
 pub fn p2tr(pub_key: &[u8]) -> String {
-    let x   = &pub_key[1..];
+    let internal = match secp256k1::PublicKey::from_slice(pub_key) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+
+    // BIP341 commits to the *x-only* internal key lifted to even y.  Doing the
+    // x-only conversion first is what makes keys with odd y produce the same
+    // output as their even-y counterpart; tweaking the full point directly
+    // (as this used to) produced a wrong address for half of all keys.
+    let (xonly, _parity) = internal.x_only_public_key();
+    let x = xonly.serialize();
+
     let tag = sha2::Sha256::digest(b"TapTweak");
-    let t   = sha2::Sha256::digest([tag.as_ref(), tag.as_ref(), x].concat());
+    let t = sha2::Sha256::digest([tag.as_ref(), tag.as_ref(), x.as_slice()].concat());
 
     // BIP340: t must be a non-zero scalar < curve order n.
     // We treat t == 0 or t >= n as invalid — same as Python.
@@ -175,18 +198,60 @@ pub fn p2tr(pub_key: &[u8]) -> String {
     let Ok(t_sk) = secp256k1::SecretKey::from_byte_array(t.into()) else {
         return String::new();
     };
-    // SECRET-key → scalar (libsecp256k1 0.29 has Scalar::from（key)
     let t_scalar = secp256k1::Scalar::from(t_sk);
 
-    let secp     = secp256k1::Secp256k1::new();
-    let internal = match secp256k1::PublicKey::from_slice(pub_key) {
-        Ok(p)  => p,
+    let (output, _parity) = match xonly.add_tweak(secp_context(), &t_scalar) {
+        Ok(pair) => pair,
         Err(_) => return String::new(),
     };
-    let tweaked = internal
-        .add_exp_tweak(&secp, &t_scalar)
-        .unwrap_or(internal);
-    let ox = tweaked.x_only_public_key().0.serialize();
-    bech32::segwit::encode(bech32::hrp::BC, bech32::segwit::VERSION_1, &ox)
+    bech32::segwit::encode(bech32::hrp::BC, bech32::segwit::VERSION_1, &output.serialize())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BIP86's first receiving address: internal key → taproot output key →
+    /// bech32m address.  This pins the BIP341 tweak and the address encoding
+    /// together.
+    #[test]
+    fn p2tr_matches_bip86_vector() {
+        let internal_x: [u8; 32] =
+            hex::decode("cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let xonly = secp256k1::XOnlyPublicKey::from_byte_array(internal_x).unwrap();
+        let internal = secp256k1::PublicKey::from_x_only_public_key(
+            xonly,
+            secp256k1::Parity::Even,
+        );
+        assert_eq!(
+            p2tr(&internal.serialize()),
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+        );
+    }
+
+    /// BIP341 tweaks the x-only key lifted to even y, so the compressed
+    /// pubkey's 02/03 prefix must not change the address.  The previous
+    /// implementation tweaked the full point and failed this.
+    #[test]
+    fn p2tr_ignores_input_key_parity() {
+        // Private key 1 is a known-valid point; build both parity encodings of
+        // its x coordinate and check the address cannot tell them apart.
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        let secret = secp256k1::SecretKey::from_byte_array(key).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(secp_context(), &secret);
+        let (xonly, _) = pubkey.x_only_public_key();
+
+        let even =
+            secp256k1::PublicKey::from_x_only_public_key(xonly, secp256k1::Parity::Even);
+        let odd = secp256k1::PublicKey::from_x_only_public_key(xonly, secp256k1::Parity::Odd);
+
+        assert_ne!(even.serialize(), odd.serialize());
+        assert_eq!(p2tr(&even.serialize()), p2tr(&odd.serialize()));
+        assert!(p2tr(&even.serialize()).starts_with("bc1p"));
+    }
 }

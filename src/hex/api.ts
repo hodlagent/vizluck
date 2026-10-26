@@ -17,10 +17,15 @@ export const randomAndDerive = (spec: RangeSpec) =>
 export const randomAndHash160 = (spec: RangeSpec) =>
   invoke<AutoKeyInfo>("random_and_hash160", { spec, network: "mainnet" });
 
-/** Full derivation for one known key. */
+/** Full derivation for one known key (display only — never persists). */
 export const deriveFull = (privateKeyHex: string, spec: RangeSpec) =>
   invoke<KeyInfo>("derive_full", { private_key_hex: privateKeyHex, spec });
 
-/** Derive + match-check a batch; results are index-aligned with the input. */
-export const deriveGroup = (privateKeys: string[]) =>
-  invoke<KeyInfo[]>("derive_group", { private_keys: privateKeys });
+/**
+ * Derive + match-check a batch; results are index-aligned with the input.
+ *
+ * `source` is written into the match file's `Source` line.  Hex and Game share
+ * this command, so Game passes `"game (group)"` to keep hits attributable.
+ */
+export const deriveGroup = (privateKeys: string[], source = "hex (group)") =>
+  invoke<KeyInfo[]>("derive_group", { private_keys: privateKeys, source });

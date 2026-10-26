@@ -542,7 +542,7 @@ export class GameState {
     const gen = this.generation;
 
     try {
-      const results = await deriveGroup([keyHex]);
+      const results = await deriveGroup([keyHex], "game (group)");
       // A restart or a selection change can land during the await, and those
       // are the only two that invalidate this result: both replace the world
       // wholesale, so a key from before them belongs to a run that is gone.
@@ -600,9 +600,10 @@ export class GameState {
   /**
    * A match: freeze everything, then let the reused banner celebrate.
    *
-   * The private key is already on disk — `derive_group` is the one command
-   * that calls `save_match` (src-tauri/src/homepage.rs), which is exactly why
-   * the game routes through it instead of `derive_full`.
+   * The private key is already on disk — `derive_group` persists every hit
+   * through the shared `matches` writer (src-tauri/src/matches.rs), which is
+   * exactly why the game routes through it instead of `derive_full` (display
+   * only, never persists).
    */
   private handleMatch(info: KeyInfo): void {
     this.matched = true;

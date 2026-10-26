@@ -512,8 +512,8 @@ maxHp *= 1.05        （hp 不变）
 > 显示节流：密钥读数与字节条按固定间隔重绘，而 `keysScanned` 每个密钥都计数。两者的职责不同 —— 前者是给人看的，后者是这次运行真实花掉的成本。
 
 > ⚠️ **必须用 `derive_group`，不能用 `derive_full`。**
-> `derive_full`（`src-tauri/src/homepage.rs:618-627`）只做比对，**从不调用 `save_match`**，命中结果不会落盘。
-> `derive_group`（`homepage.rs:640-672`）是唯一对「调用方已知私钥」执行持久化的命令，且在命中时自动写入 `{timestamp}.txt`。
+> `derive_full`（`src-tauri/src/homepage.rs`）只做比对，**从不调用 `save_match`**，命中结果不会落盘。它用于展示/补全一个已知私钥，custom 范围本身也没有目标 hash160。
+> `derive_group` 在命中时自动落盘，走的是与 Hex / Random 共享的 `matches` 模块，文件写在 `<app_data_dir>/matches/{timestamp}.txt`。
 > 这也正是 Hex tab group 模式使用的同一个命令。
 
 ---

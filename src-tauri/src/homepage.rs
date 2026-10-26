@@ -311,87 +311,48 @@ fn derive_key_info(
 
 // ── Match persistence ─────────────────────────────────────────────────────────
 //
-// When a generated key hits a puzzle's target hash160, we persist the full result
-// to `{timestamp}.txt` next to the executable so it survives even if the app
-// closes.  Writing goes through the standard library (`std::fs`), not the Tauri
-// fs plugin, so no capability changes are required.
+// When a generated key hits a puzzle's target hash160, the hit is persisted
+// through `crate::matches`, the same writer the Random tab uses, so every tab
+// produces the same file in `<app_data_dir>/matches/`.
 
-/// Format a UNIX-epoch timestamp as a filesystem-safe, human-readable string:
-/// `YYYYMMDD_HHMMSS`.  Falls back to raw seconds if anything is off.
-fn timestamp_label(now: std::time::SystemTime) -> String {
-    let secs = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Break a UNIX timestamp into UTC date-time fields without pulling in chrono.
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
-    let (year, month, day) = days_to_ymd(days as i64);
-    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, h, m, s)
-}
-
-/// Convert days since the UNIX epoch (1970-01-01) into a `(year, month, day)`
-/// tuple.  Standard Gregorian civil-date algorithm (Hinnant).
-fn days_to_ymd(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i32 + era as i32 * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
-}
-
-/// Write a matched key's full details to `{timestamp}.txt` in the directory that
-/// holds the running executable.  Returns the absolute path written to.
-fn save_match(info: &KeyInfo, puzzle_number: u32, network: &str) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let dir = exe.parent().ok_or_else(|| "exe has no parent dir".to_string())?;
-    let label = timestamp_label(std::time::SystemTime::now());
-    let path = dir.join(format!("{label}.txt"));
-
+/// Persist a puzzle hit.  `source` says which tab/path produced it
+/// (`hex (random)`, `hex (auto)`, `hex/game (group)`); the file layout itself
+/// lives in `crate::matches`.
+fn save_match(
+    info: &KeyInfo,
+    puzzle_number: u32,
+    network: &str,
+    source: &str,
+) -> Result<String, String> {
     let match_line = match info.address_match {
         Some(true) => "YES ✅",
         Some(false) => "no",
         None => "n/a",
     };
-    let content = format!(
-        "============================================\n\
-         vizluck — PUZZLE MATCH FOUND\n\
-         ============================================\n\
-         Timestamp (UTC) : {ts}\n\
-         Puzzle          : #{puzzle}\n\
-         Network         : {net}\n\
-         Match           : {match_line}\n\
-         --------------------------------------------\n\
-         Private Key     : {pk}\n\
-         xprv            : {xprv}\n\
-         xpub            : {xpub}\n\
-         Public Key (compressed)   : {pk_comp}\n\
-         Legacy Address (compressed)   : {addr_comp}\n\
-         hash160 (compressed)   : {h160_comp}\n\
-         ============================================\n",
-        ts = label,
-        puzzle = puzzle_number,
-        net = network,
-        match_line = match_line,
-        pk = info.private_key_hex,
-        xprv = info.xprv,
-        xpub = info.xpub,
-        pk_comp = info.compressed_public_key,
-        addr_comp = info.compressed_legacy_address,
-        h160_comp = info.compressed_hash160,
-    );
-
-    std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path.to_string_lossy().into_owned())
+    crate::matches::save(&crate::matches::MatchRecord {
+        title: "PUZZLE MATCH FOUND".to_string(),
+        source: source.to_string(),
+        private_key_hex: info.private_key_hex.clone(),
+        details: vec![
+            ("Puzzle".to_string(), format!("#{puzzle_number}")),
+            ("Network".to_string(), network.to_string()),
+            ("Match".to_string(), match_line.to_string()),
+            ("xprv".to_string(), info.xprv.clone()),
+            ("xpub".to_string(), info.xpub.clone()),
+            (
+                "Public Key (compressed)".to_string(),
+                info.compressed_public_key.clone(),
+            ),
+            (
+                "Legacy Address (compressed)".to_string(),
+                info.compressed_legacy_address.clone(),
+            ),
+            (
+                "hash160 (compressed)".to_string(),
+                info.compressed_hash160.clone(),
+            ),
+        ],
+    })
 }
 
 // ── Hex parsing ──────────────────────────────────────────────────────────────
@@ -519,9 +480,9 @@ pub fn random_and_derive(
         };
         match derive_key_info(&key, expected_hash160) {
             Ok(mut info) => {
-                // On a puzzle hit, persist the full result next to the exe.
+                // On a puzzle hit, persist the full result through the shared writer.
                 if info.address_match == Some(true) {
-                    match save_match(&info, puzzle_number, "mainnet") {
+                    match save_match(&info, puzzle_number, "mainnet", "hex (random)") {
                         Ok(path) => info.save_path = Some(path),
                         Err(e) => info.save_path = Some(format!("ERROR: {e}")),
                     }
@@ -593,7 +554,7 @@ pub fn random_and_hash160(
                 address_match,
                 save_path: None,
             };
-            save_path = match save_match(&info, puzzle_number, "mainnet") {
+            save_path = match save_match(&info, puzzle_number, "mainnet", "hex (auto)") {
                 Ok(path) => Some(path),
                 Err(e) => Some(format!("ERROR: {e}")),
             };
@@ -610,6 +571,11 @@ pub fn random_and_hash160(
 /// Full derivation of a *known* private key (64-char hex).  Used when auto mode
 /// pauses: the last key the user saw on the grid gets its address / xprv / etc.
 /// filled in so the bottom info cards can update.
+///
+/// **Display only.**  It never persists.  A custom `RangeSpec` carries no
+/// target hash160 (`resolve_range` returns `None` for it), so `address_match`
+/// can only ever be `None`/`false` on this path; the persistence call sites are
+/// the sampling commands and `derive_group`, not this one.
 ///
 /// `rename_all = "snake_case"` is required: Tauri v2 defaults to camelCase keys
 /// on the wire, which would turn `private_key_hex` into `privateKeyHex` and fail
@@ -630,14 +596,22 @@ pub fn derive_full(
 /// Each key's compressed-pubkey hash160 is checked against the *whole* embedded
 /// puzzle set (a key inside a group's key space can only ever belong to that
 /// group's puzzles, and each group's ranges are disjoint), and a match is
-/// persisted next to the executable.  The response is index-aligned with
+/// persisted through `crate::matches`.  The response is index-aligned with
 /// `private_keys`, so the caller already knows which result maps to which puzzle.
 ///
 /// This is the per-hex-iteration workhorse for the group-collision UI: every
 /// grid / puzzle-block hover tick (and each Auto round) sends the group's keys
 /// here in one IPC call.
+///
+/// `source` names the originating tab in the match file.  Hex and Game share
+/// this command, so without it every hit would be labelled the same; the
+/// default keeps older callers working.
 #[tauri::command(rename_all = "snake_case")]
-pub fn derive_group(private_keys: Vec<String>) -> Result<Vec<KeyInfo>, String> {
+pub fn derive_group(
+    private_keys: Vec<String>,
+    source: Option<String>,
+) -> Result<Vec<KeyInfo>, String> {
+    let source = source.as_deref().unwrap_or("hex (group)");
     let ps = crate::puzzles::puzzle_set();
     let mut out = Vec::with_capacity(private_keys.len());
 
@@ -659,7 +633,7 @@ pub fn derive_group(private_keys: Vec<String>) -> Result<Vec<KeyInfo>, String> {
         match puzzle_number {
             Some(puzzle_number) => {
                 info.address_match = Some(true);
-                match save_match(&info, puzzle_number, "mainnet") {
+                match save_match(&info, puzzle_number, "mainnet", source) {
                     Ok(path) => info.save_path = Some(path),
                     Err(e) => info.save_path = Some(format!("ERROR: {e}")),
                 }
@@ -827,27 +801,6 @@ mod tests {
         assert!(r.is_err());
     }
 
-    // ── timestamp + date formatting ─────────────────────────────────────────
-
-    #[test]
-    fn days_to_ymd_known_dates() {
-        // 1970-01-01 = day 0
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-        // 2000-01-01 = day 10957
-        assert_eq!(days_to_ymd(10957), (2000, 1, 1));
-        // 2026-07-28 = day 20662
-        assert_eq!(days_to_ymd(20662), (2026, 7, 28));
-        // 2024-02-29 (leap day)
-        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn timestamp_label_format() {
-        // 2026-07-28 12:34:56 UTC = 1785242096 since epoch.
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1785242096);
-        assert_eq!(timestamp_label(t), "20260728_123456");
-    }
-
     // ── BIP32: validated against the canonical BIP32 test vector ────────────
     //
     // Seed 000102030405060708090a0b0c0d0e0f → master xprv
@@ -980,7 +933,7 @@ mod tests {
             .map(|_| hex::encode(random_key_in_range(&lo, &hi).unwrap()))
             .collect();
 
-        let results = derive_group(keys.clone()).unwrap();
+        let results = derive_group(keys.clone(), None).unwrap();
         assert_eq!(results.len(), keys.len());
         for (r, k) in results.iter().zip(&keys) {
             assert_eq!(r.private_key_hex, *k);

@@ -170,8 +170,12 @@ async function run() {
   assert((await page.locator("#btn-auto").textContent())?.includes("Auto"), "Auto button label");
 
   console.log("\n[2] Tab bar");
-  assert((await page.locator(".tabbar .tab").count()) === 2, "two tabs present");
-  assert((await page.locator(".tabbar .tab").allTextContents()).join(",") === "Hex,Game", "tab labels are Hex,Game");
+  assert((await page.locator(".tabbar .tab").count()) === 4, "four tabs present");
+  assert(
+    (await page.locator(".tabbar .tab").allTextContents()).join(",") ===
+      "Hex,Game,Random,Settings",
+    "tab labels are Hex,Game,Random,Settings",
+  );
   assert(await page.locator("#grid").isVisible(), "Hex content visible on load");
 
   console.log("\n[3] Auto runs in the background across tab switches");
@@ -186,8 +190,7 @@ async function run() {
   await page.waitForTimeout(200);
   assert(!(await page.locator("#grid").isVisible()), "Hex hidden on Game tab");
   // Phaser boots asynchronously, so wait for the canvas rather than asserting
-  // on it directly. Only the placeholder assertion needed changing here — the
-  // "two tabs / labels are Hex,Game" checks above still hold.
+  // on it directly. The tab-bar checks above still hold for the four-tab bar.
   await page.waitForSelector(".game-host canvas", { timeout: 5000 });
   assert(await page.locator(".game-host canvas").isVisible(), "Game canvas mounted");
   const h1 = await gridText();

@@ -19,6 +19,9 @@
   --loot-power: #f7931a;
   --loot-agility: #39c5e0;
   --loot-vitality: #e05fa8;
+  /* The two new tabs (Random / Settings) share a cool accent so they read as
+     a pair, distinct from Hex's Bitcoin orange and Game's green. */
+  --random-accent: #39c5e0;
   --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", Menlo,
     Consolas, monospace;
 
@@ -45,7 +48,7 @@ body {
   padding: 20px 24px 60px;
 }
 
-/* ── Tab bar (Hex / Game) ────────────────────────────────────────────────── */
+/* ── Tab bar (Hex / Game / Random / Settings) ────────────────────────────── */
 
 .tabbar {
   display: flex;
@@ -687,6 +690,420 @@ body.auto-running .pblock:hover {
   transition: width 0.15s linear;
 }
 
+/* ── Random tab ─────────────────────────────────────────────────────────── */
+
+.random-main {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.random-brand {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: var(--random-accent);
+}
+
+.random-brand-row {
+  flex-wrap: wrap;
+  row-gap: 8px;
+  align-items: center;
+}
+
+.random-brand-row .controls {
+  margin-left: auto;
+}
+
+/* Targets / checked readout under the title row. */
+.random-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.random-status b {
+  color: var(--text);
+}
+
+.random-status-note {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.random-hint {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.random-hint b {
+  color: var(--random-accent);
+}
+
+/* The 32 cards.  Two rows on desktop, four on narrow screens, so a byte never
+   shrinks below a readable size. */
+.random-key {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.random-key-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.random-key-copy {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--random-accent);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 1px dotted transparent;
+}
+
+.random-key-copy:hover {
+  border-bottom-color: var(--random-accent);
+}
+
+.random-grid {
+  display: grid;
+  grid-template-columns: repeat(16, 1fr);
+  gap: 6px;
+}
+
+.rand-cell {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: clamp(10px, 1.5vw, 17px);
+  font-weight: 600;
+  color: var(--text);
+  user-select: none;
+}
+
+/* Before the first key lands the cards show a dim placeholder, so the shape of
+   the display is visible without pretending there is a key yet. */
+.rand-cell.placeholder {
+  color: var(--border);
+}
+
+/* One card per chain, with the generated addresses beneath. */
+.random-derived {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.random-chain {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chain-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--random-accent);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.chain-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: -4px;
+}
+
+.chain-count {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.chain-addr-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.chain-type {
+  flex: 0 0 88px;
+  padding-top: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.chain-empty {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+/* Long addresses are buttons so click-to-copy stays available; they wrap
+   instead of forcing the card wider than its grid track. */
+.addr-chip {
+  appearance: none;
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  word-break: break-all;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.addr-chip:hover,
+.addr-chip:focus-visible {
+  border-color: var(--random-accent);
+  color: var(--random-accent);
+}
+
+/* ── Random match banner ───────────────────────────────────────────────── */
+
+.random-match {
+  background: linear-gradient(135deg, #2ecc71, #27ae60);
+  color: #042312;
+  border-radius: 12px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: pop 0.4s ease-out;
+}
+
+.random-match-title {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+
+.random-match-saved {
+  font-family: var(--mono);
+  font-size: 11px;
+  opacity: 0.8;
+  word-break: break-all;
+}
+
+.random-match-save-error {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: #6b1209;
+  word-break: break-all;
+}
+
+.random-match-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.random-match .chain-label {
+  color: #042312;
+  flex: 0 0 76px;
+}
+
+.random-match .addr-chip {
+  background: rgba(4, 35, 18, 0.14);
+  border-color: rgba(4, 35, 18, 0.35);
+  color: #042312;
+  font-weight: 700;
+}
+
+.random-match .addr-chip:hover {
+  border-color: #042312;
+  color: #042312;
+}
+
+.random-match-configured {
+  font-family: var(--mono);
+  font-size: 11px;
+  opacity: 0.75;
+  word-break: break-all;
+}
+
+.random-match-key {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-top: 2px;
+  color: #042312;
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: left;
+  word-break: break-all;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.random-match-key:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+/* ── Settings tab ──────────────────────────────────────────────────────── */
+
+.settings-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-brand {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: var(--random-accent);
+}
+
+.settings-brand-row {
+  flex-wrap: wrap;
+  row-gap: 8px;
+  align-items: center;
+}
+
+.settings-path {
+  flex: 1 1 260px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-brand-row .controls {
+  margin-left: auto;
+}
+
+.settings-dirty {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.chain-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+}
+
+.chain-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.addr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.addr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* `.input` is sized for the Hex range box; address rows need the full width
+   available and no 280px floor. */
+.addr-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.addr-row.invalid .addr-input {
+  border-color: var(--red);
+}
+
+.addr-warning {
+  flex: 0 0 auto;
+  color: var(--red);
+  font-size: 13px;
+  cursor: help;
+}
+
+.addr-del {
+  flex: 0 0 auto;
+  padding: 9px 12px;
+  color: var(--text-dim);
+}
+
+.addr-del:hover:not(:disabled) {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.addr-add {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.addr-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 2px 0;
+}
+
+.settings-note {
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
 /* ── Toast ───────────────────────────────────────────────────────────────── */
 
 .toast {
@@ -712,5 +1129,13 @@ body.auto-running .pblock:hover {
   }
   .btn {
     flex: 1;
+  }
+  /* 32 cards in 4 rows of 8 rather than 2 rows of 16, so the font stays
+     readable on a phone-width window. */
+  .random-grid {
+    grid-template-columns: repeat(8, 1fr);
+  }
+  .settings-path {
+    display: none;
   }
 }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **vizluck** — a Tauri v2 desktop application. Frontend is Svelte 5 (runes) + vanilla TypeScript + Vite; backend is Rust. The frontend runs inside a native Tauri webview and communicates with Rust commands via `@tauri-apps/api`.
 
-Two tabs: **Hex** (`src/hex/`, the original brute-force byte-grid explorer) and **Game** (`src/game/`, a survival game whose player state *is* the key material). Both stay mounted at all times — see [Game tab](#game-tab-srcgame) below.
+Four tabs: **Hex** (`src/hex/`, the original brute-force byte-grid explorer), **Game** (`src/game/`, a survival game whose player state *is* the key material), **Random** (random-key collision scan against a hand-managed address book), and **Settings** (the Bitcoin / Ethereum / Solana address book, persisted as JSON). All four stay mounted at all times — see [Game tab](#game-tab-srcgame) below.
 
 ## Commands
 
@@ -17,7 +17,7 @@ npm run tauri build      # production build: frontend (svelte-check + vite) then
 npm run dev              # frontend-only Vite dev server (http://localhost:1420) without the Tauri shell
 npm run build            # frontend-only build to dist/ (svelte-check + vite build)
 npm run check            # svelte-check --tsconfig ./tsconfig.json (type-check, no emit)
-npm run test:e2e         # hex-tab + game-tab + game-sim; spawns its own dev server
+npm run test:e2e         # hex-tab + game-tab + random-tab + game-sim; spawns its own dev server
 cargo check              # type-check the Rust backend (from repo root; reads src-tauri/Cargo.toml)
 cargo clippy             # lint the Rust backend
 ```
@@ -33,10 +33,12 @@ Two halves glued together by Tauri, plus a GPU-accelerated BTC scanning engine:
 - **`src/` (frontend)** — Svelte 5 + TypeScript. `main.ts` mounts `App.svelte`, which owns the tab bar and keeps **both panels mounted**, toggling only the `hidden` attribute. Vite serves this during dev and bundles it to `dist/` for production. `vite.config.ts` is Tauri-aware: fixed port 1420, `strictPort`, ignores `src-tauri` from watching.
   - `src/hex/` — Hex tab state, byte-range math, and the reused `MatchBanner`.
   - `src/game/` — the Game tab (see below).
+  - `src/random/` — Random tab state and its `random_scan` wrapper. The scan loop is a self-chaining `setTimeout` like the Hex auto loop; the Rust side owns a 40 ms time budget per batch. A hit stops the loop and the panel shows both the matched address and the `matches/` file it was saved to.
+  - `src/addresses.svelte.ts` — the **shared** Bitcoin/Ethereum/Solana address book. Unlike the per-tab `HexState`/`GameState`, this is a module singleton because Settings edits it and Random consumes it; `load_addresses` / `save_addresses` persist it to `addresses.json` in the Tauri app-data dir.
   - `src/styles.css` — one global, **unscoped** stylesheet. Do not add `<style>` blocks to components: the canvas reads colours back out of `:root` via `getComputedStyle`.
 - **`src-tauri/` (Rust backend)** — a Cargo project.
   - `src/main.rs` — binary entry, just calls `vizluck_lib::run()`.
-  - `src/lib.rs` — real entry point: builds the `tauri::Builder`, registers plugins (`tauri_plugin_opener`) and the `invoke_handler`, then runs the app. Also declares the `btc`/`gpu`/`puzzles`/`progress`/`workers` modules.
+  - `src/lib.rs` — real entry point: builds the `tauri::Builder`, registers plugins (`tauri_plugin_opener`) and the `invoke_handler`, then runs the app. Its setup hook initialises `matches` for every scanning tab. Also declares the `addresses`/`btc`/`collision`/`gpu`/`homepage`/`matches`/`puzzles`/`progress`/`workers` modules.
   - `Cargo.toml` — note the library is named `vizluck_lib` (a Tauri default to avoid name collisions with the binary; don't rename casually). BTC/GPU deps are listed under `[dependencies]`; `sha2` is configured per-OS (`asm` on macOS/Linux for ARMv8-Crypto SHA256, pure-Rust on Windows) via `[target.'cfg(...)'.dependencies]`.
   - `tauri.conf.json` — app identity and build config: `identifier` (`com.jerin.vizluck`), window defaults, `beforeDevCommand`/`devUrl`, `beforeBuildCommand`/`frontendDist`.
   - `capabilities/default.json` — Tauri v2 capability/permission model. Lists which windows get which permissions (`core:default`, `opener:default`).
@@ -58,6 +60,15 @@ A Bitcoin dormant-address "lottery" scanner: 100k independent GPU walkers each s
 - **`src-tauri/src/puzzles.rs`** — the embedded 78 unsolved BTC puzzles as a JSON literal, parsed into `PuzzleSet` with range-weighted `pick_random_puzzle`, `generate_key_in_range`, and `puzzle_number_for_hash160` lookup.
 - **`src-tauri/src/progress.rs`** — atomic `Progress` counters shared between workers.
 - **`src-tauri/src/workers.rs`** — trimmed shared types (`RuntimeLimits`, `ScanTarget`, `MatchEvent`) referenced by the GPU worker. The full CPU worker-pool `run()` lives upstream in `luckfind`; bring it in when wiring CPU-side scanning to the Tauri app.
+
+### Random + Settings (address book + collision scan)
+
+- **`src-tauri/src/addresses.rs`** — `AddressBook { bitcoin, ethereum, solana }` persisted as pretty-printed JSON at `<app_data_dir>/addresses.json` via `std::fs` (no fs-plugin permission needed). `load_addresses` treats a missing file as the empty book; `save_addresses` returns the path. Both are `#[tauri::command(async)]` so disk I/O stays off the main thread. Every overwrite first copies the previous file to `addresses.json.bak` — the UI deliberately keeps working when the load failed, so Save could otherwise destroy a corrupt-but-recoverable book.
+- **`src-tauri/src/collision.rs`** — `random_scan(book, time_budget_ms)`. Each 32-byte OS-random draw is used as the secp256k1 key for BTC/ETH **and** the ed25519 seed for SOL. Per key it derives P2PKH (compressed, plus the uncompressed form when a legacy `1…` target exists — a `1…` address does not reveal which key encoding produced it), P2SH-P2WPKH, P2WPKH, P2TR (only when a `bc1p…` target exists), EIP-55 Ethereum, and base58 Solana, then compares every one against every configured address with `eq_ignore_ascii_case` (whitespace and `0x` stripped). Bitcoin forms travel as `{kind, address}` so the UI never labels rows by array index. It scans for the budget (≤500 ms), or breaks early on a hit; the hit is persisted through `matches` and returned as `save_path` (with `save_error` if the write failed). `#[tauri::command(async)]` is load-bearing: it moves the batch to the thread pool.
+- **`src-tauri/src/matches.rs`** — the one writer for every found match. Hex/Game build a `MatchRecord` with title `PUZZLE MATCH FOUND`; Random uses `ADDRESS MATCH FOUND` and lists each configured/derived pair. Files are plain text at `<app_data_dir>/matches/YYYYMMDD_HHMMSS.txt` (next to `addresses.json`), aligned, newline-terminated, and `-2`-suffixed if two hits land in the same second. Because they contain private keys, the directory is `0700` and each file `0600` on Unix, created with `create_new` so nothing is overwritten. `init()` runs once in `lib.rs`'s setup hook; an unwritable directory disables saving with a log line rather than crashing, and callers report the error to the UI. `derive_group` takes an optional `source` so Hex (`hex (group)`) and Game (`game (group)`) hits stay attributable.
+- **Taproot** — `btc::p2tr` tweaks the **x-only** internal key (BIP341), so the compressed key's 02/03 parity cannot change the address. `btc::secp_context()` is the one shared libsecp256k1 context used by both the scanner and `p2tr`.
+
+
 
 ### Game tab (`src/game/`)
 
