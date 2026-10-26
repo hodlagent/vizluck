@@ -23,9 +23,9 @@ export interface BitcoinAddress {
 export interface RandomScanResult {
   private_key_hex: string;
   /**
-   * Every Bitcoin form derived from the key.  P2PKH is always compressed; the
-   * uncompressed form appears when a legacy (`1…`) target is configured, and
-   * P2TR when a taproot target is.
+   * Every Bitcoin form derived from the key.  P2PKH is always derived in both
+   * encodings (compressed and uncompressed); P2TR is added when a taproot
+   * (`bc1p…`) target is configured.
    */
   bitcoin: BitcoinAddress[];
   ethereum: string;

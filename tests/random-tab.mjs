@@ -146,6 +146,7 @@ async function run() {
               private_key_hex: key,
               bitcoin: [
                 { kind: "P2PKH (compressed)", address: "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH" },
+                { kind: "P2PKH (uncompressed)", address: "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm" },
                 { kind: "P2SH-P2WPKH", address: "3JvL6Ymt8MVWiCNHC7oWU6nLeHNJKLZGLN" },
                 { kind: "P2WPKH", address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" },
               ],
@@ -266,8 +267,8 @@ async function run() {
   );
   assert(
     (await page.locator(".random-chain").first().locator(".chain-type").allTextContents()).join(",") ===
-      "P2PKH (compressed),P2SH-P2WPKH,P2WPKH",
-    "Bitcoin rows use the backend-supplied form labels",
+      "P2PKH (compressed),P2PKH (uncompressed),P2SH-P2WPKH,P2WPKH",
+    "Bitcoin rows use the backend-supplied form labels, both key encodings included",
   );
 
   await tab("Hex").click();

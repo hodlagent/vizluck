@@ -35,8 +35,8 @@ pub struct RandomMatch {
 /// One Bitcoin address form derived from a key.
 ///
 /// The `kind` is carried next to the address instead of the frontend labelling
-/// rows by array index: a legacy target can opt into an extra uncompressed
-/// P2PKH row, which would otherwise shift every label after it.
+/// rows by array index, so a form being added or dropped can never shift a
+/// label onto the wrong address.
 #[derive(Serialize, Clone, Debug)]
 pub struct BitcoinAddress {
     /// `P2PKH (compressed)` / `P2PKH (uncompressed)` / `P2SH-P2WPKH` /
@@ -51,8 +51,8 @@ pub struct RandomScanResult {
     /// The last key generated in this batch — the one the 32 byte cards show.
     pub private_key_hex: String,
     /// Every Bitcoin address form derived from that key.  P2PKH is always
-    /// checked in its compressed form, the uncompressed form is added when a
-    /// legacy (`1…`) target is configured, and P2TR when a taproot target is.
+    /// checked in *both* encodings (compressed and uncompressed); P2TR is
+    /// added when a taproot (`bc1p…`) target is configured.
     pub bitcoin: Vec<BitcoinAddress>,
     /// EIP-55 checksummed Ethereum address.
     pub ethereum: String,
@@ -153,32 +153,29 @@ fn check(
 /// All Bitcoin address forms a key can produce, labelled by form.
 ///
 /// P2PKH has two encodings of the same key: the compressed pubkey (33 bytes)
-/// and the 2010-era uncompressed one (65 bytes).  A legacy `1…` address does
-/// not reveal which was used, so a book containing one needs both, or a genuine
-/// match is silently missed.  It is opt-in because the extra hash160 + base58
-/// costs ~20% throughput, and modern books never need it.
+/// and the 2010-era uncompressed one (65 bytes).  Both are derived for every
+/// key — a legacy `1…` target does not reveal which encoding produced it, and
+/// gating it on the current book would make the same key show a different
+/// address set as targets come and go.  The extra hash160 + base58 is small
+/// next to the scalar multiplication that produces the public key at all.
 ///
-/// P2TR is likewise opt-in (`bc1p…` target): the BIP341 tweak is an extra
-/// scalar multiplication and would otherwise be paid for every key.
+/// P2TR stays opt-in (`bc1p…` target): the BIP341 tweak is an extra scalar
+/// multiplication and would otherwise be paid for every key.
 ///
 /// Segwit v0 (P2SH-P2WPKH, P2WPKH) and P2TR use the compressed key by
 /// definition; only legacy P2PKH gets the uncompressed variant.
-fn bitcoin_addresses(
-    pubkey: &PublicKey,
-    want_uncompressed_p2pkh: bool,
-    want_taproot: bool,
-) -> Vec<BitcoinAddress> {
+fn bitcoin_addresses(pubkey: &PublicKey, want_taproot: bool) -> Vec<BitcoinAddress> {
     let compressed = pubkey.serialize();
-    let mut out = vec![BitcoinAddress {
-        kind: "P2PKH (compressed)",
-        address: crate::btc::p2pkh(&compressed),
-    }];
-    if want_uncompressed_p2pkh {
-        out.push(BitcoinAddress {
+    let mut out = vec![
+        BitcoinAddress {
+            kind: "P2PKH (compressed)",
+            address: crate::btc::p2pkh(&compressed),
+        },
+        BitcoinAddress {
             kind: "P2PKH (uncompressed)",
             address: crate::btc::p2pkh(&pubkey.serialize_uncompressed()),
-        });
-    }
+        },
+    ];
     out.push(BitcoinAddress {
         kind: "P2SH-P2WPKH",
         address: crate::btc::p2sh_p2wpkh(&compressed),
@@ -251,12 +248,6 @@ pub fn random_scan(book: AddressBook, time_budget_ms: u64) -> Result<RandomScanR
         .bitcoin
         .iter()
         .any(|a| normalized(a).to_ascii_lowercase().starts_with("bc1p"));
-    // A `1…` target might have come from a compressed or an uncompressed key;
-    // only the address cannot tell us, so check both.
-    let want_uncompressed_p2pkh = book
-        .bitcoin
-        .iter()
-        .any(|a| normalized(a).starts_with('1'));
     let secp = crate::btc::secp_context();
     let started = Instant::now();
 
@@ -280,8 +271,7 @@ pub fn random_scan(book: AddressBook, time_budget_ms: u64) -> Result<RandomScanR
             .expect("random_key() only returns valid secp256k1 scalars");
         let pubkey = PublicKey::from_secret_key(secp, &secret);
 
-        let bitcoin =
-            bitcoin_addresses(&pubkey, want_uncompressed_p2pkh, want_taproot);
+        let bitcoin = bitcoin_addresses(&pubkey, want_taproot);
         let ethereum = ethereum_address(&pubkey);
         let solana = solana_address(&key);
 
@@ -348,45 +338,52 @@ mod tests {
 
     #[test]
     fn bitcoin_derivation_private_key_one() {
-        let addresses = bitcoin_addresses(&key_one_pubkey(), false, false);
+        let addresses = bitcoin_addresses(&key_one_pubkey(), false);
+        // Both encodings of the same key are always present: private key 1's
+        // compressed and 2010-era uncompressed legacy addresses.
         assert_eq!(addresses[0].kind, "P2PKH (compressed)");
-        // Legacy compressed P2PKH for private key 1 (the canonical vector).
         assert_eq!(
             addresses[0].address,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"
         );
-        assert_eq!(addresses[1].kind, "P2SH-P2WPKH");
-        assert!(addresses[1].address.starts_with('3'), "P2SH-P2WPKH: {}", addresses[1].address);
-        assert_eq!(addresses[2].kind, "P2WPKH");
-        assert!(addresses[2].address.starts_with("bc1q"), "P2WPKH: {}", addresses[2].address);
-        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses[1].kind, "P2PKH (uncompressed)");
+        assert_eq!(
+            addresses[1].address,
+            "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm"
+        );
+        assert_eq!(addresses[2].kind, "P2SH-P2WPKH");
+        assert!(addresses[2].address.starts_with('3'), "P2SH-P2WPKH: {}", addresses[2].address);
+        assert_eq!(addresses[3].kind, "P2WPKH");
+        assert!(addresses[3].address.starts_with("bc1q"), "P2WPKH: {}", addresses[3].address);
+        assert_eq!(addresses.len(), 4);
     }
 
     #[test]
-    fn uncompressed_p2pkh_is_opt_in_and_checked_when_enabled() {
-        // Private key 1's 2010-era uncompressed address.  Without the flag we
-        // would never derive it, so a saved `1EHNa…` target could never match.
+    fn both_p2pkh_encodings_are_checked_for_every_key() {
+        // A legacy `1…` target does not reveal which encoding produced it, so
+        // a compressed-only scan would silently miss the uncompressed half.
         let pubkey = key_one_pubkey();
-        let without = bitcoin_addresses(&pubkey, false, false);
-        assert!(without.iter().all(|a| a.kind != "P2PKH (uncompressed)"));
-
-        let with = bitcoin_addresses(&pubkey, true, false);
-        assert_eq!(with.len(), without.len() + 1);
-        assert_eq!(with[1].kind, "P2PKH (uncompressed)");
-        assert_eq!(
-            with[1].address,
-            "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm"
-        );
+        let derived: Vec<String> =
+            bitcoin_addresses(&pubkey, false).into_iter().map(|a| a.address).collect();
+        for expected in [
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", // compressed
+            "1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm", // uncompressed
+        ] {
+            assert!(
+                derived.iter().any(|a| a == expected),
+                "missing {expected}: {derived:?}"
+            );
+        }
     }
 
     #[test]
     fn taproot_is_only_added_on_request() {
         let pubkey = key_one_pubkey();
-        let without = bitcoin_addresses(&pubkey, false, false);
-        let with = bitcoin_addresses(&pubkey, false, true);
+        let without = bitcoin_addresses(&pubkey, false);
+        let with = bitcoin_addresses(&pubkey, true);
         assert_eq!(with.len(), without.len() + 1);
-        assert_eq!(with[3].kind, "P2TR");
-        assert!(with[3].address.starts_with("bc1p"), "P2TR: {}", with[3].address);
+        assert_eq!(with[4].kind, "P2TR");
+        assert!(with[4].address.starts_with("bc1p"), "P2TR: {}", with[4].address);
     }
 
     #[test]
@@ -489,7 +486,15 @@ mod tests {
         let result = random_scan(AddressBook::default(), 1).unwrap();
         assert!(result.checked >= 1);
         assert_eq!(result.private_key_hex.len(), 64);
-        assert_eq!(result.bitcoin.len(), 3);
+        assert_eq!(
+            result.bitcoin.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            vec![
+                "P2PKH (compressed)",
+                "P2PKH (uncompressed)",
+                "P2SH-P2WPKH",
+                "P2WPKH",
+            ]
+        );
         assert!(result.ethereum.starts_with("0x"));
         assert_eq!(result.ethereum.len(), 42);
         assert!(!result.solana.is_empty());
