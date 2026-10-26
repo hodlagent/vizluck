@@ -12,8 +12,9 @@ import {
   deriveFull,
   deriveGroup,
   getPuzzles,
+  hexScanCustom,
+  hexScanGroup,
   randomAndDerive,
-  randomAndHash160,
 } from "./api";
 import {
   hexByteLen,
@@ -26,9 +27,20 @@ import {
   splitRange,
   topByteBounds,
 } from "./range";
-import type { KeyInfo, PuzzleGroup, PuzzleInfo, RangeSpec } from "./types";
+import type {
+  GroupPuzzleSpec,
+  KeyInfo,
+  PuzzleGroup,
+  PuzzleInfo,
+  RangeSpec,
+} from "./types";
 
 const HOVER_INTERVAL_MS = 60;
+/**
+ * How long each Rust-side Auto batch may scan before returning.  Mirrors the
+ * Random tab: the IPC round-trip, not the frontend timer, is the cadence.
+ */
+const BATCH_BUDGET_MS = 40;
 const RATE_WINDOW_MS = 10_000;
 const RATE_IDLE_RESET_MS = 30_000;
 const EDIT_DEBOUNCE_MS = 300;
@@ -311,24 +323,82 @@ export class HexState {
   }
 
   /**
-   * Lightweight auto-mode tick (custom mode): sample a key and compute only its
-   * hash160.  The full info is filled in by `completeLastKey` when auto pauses.
+   * One Rust-side Auto batch in custom mode.  The backend checks as many keys
+   * as fit in `BATCH_BUDGET_MS`, so the grid only has to render the last one
+   * and the frontend no longer pays an IPC round-trip per key.
    */
-  private async autoTick() {
+  private async autoCustomBatch() {
+    const spec = this.rangeSpec;
     this.showError("");
     try {
-      const res = await randomAndHash160(this.rangeSpec);
-      this.recordKeys(1);
+      const res = await hexScanCustom(spec, BATCH_BUDGET_MS);
+      // Drop a batch from a range the user has already left.
+      if (this.mode !== "custom" || this.rangeSpec !== spec) return;
+      // A non-hit batch that lands after Stop is stale by construction: the
+      // visible key and the bottom panel must stay paired (onAuto already ran
+      // `completeLastKey`), so only a hit may still surface.
+      if (!res.matched && this.autoTimer === null) return;
+
+      this.recordKeys(res.checked);
       this.lastKeyHex = res.private_key_hex;
       this.matchCell = null; // the grid was regenerated
 
-      if (res.address_match === true) {
+      if (res.matched) {
         this.matched = true;
         this.stopAuto();
-        await this.completeLastKey(res.private_key_hex);
-        this.matchBanner = res.save_path ?? "";
+        this.customInfo = res.matched;
+        this.matchBanner = res.matched.save_path ?? "";
         this.matchSeq++;
       }
+    } catch (e) {
+      this.showError(String(e));
+      this.stopAuto();
+    }
+  }
+
+  /**
+   * One Rust-side Auto batch in group mode.  The backend draws whole rounds
+   * (shared base bytes + one top byte per puzzle), derives and match-checks
+   * them, and returns the last round's state so the grid and panels follow.
+   */
+  private async autoGroupBatch() {
+    const group = this.activeGroup;
+    if (!group) {
+      // Group mode without a group should be unreachable; stop rather than
+      // let the self-chaining tick spin on nothing.
+      this.stopAuto();
+      return;
+    }
+    const gen = this.groupGen;
+    const puzzles: GroupPuzzleSpec[] = group.puzzles.map((p) => ({
+      puzzle_number: p.puzzle_number,
+      hex_bytes_len: p.hex_bytes_len,
+      start_top: p.start_top,
+      end_top: p.end_top,
+      hash160: p.hash160,
+    }));
+
+    try {
+      const res = await hexScanGroup(puzzles, BATCH_BUDGET_MS);
+      // A different group (or mode) has taken over while the batch ran.
+      if (gen !== this.groupGen || this.mode !== "group" || this.activeGroup !== group) {
+        return;
+      }
+      if (!res.matched && this.autoTimer === null) return;
+
+      this.recordKeys(res.checked);
+      this.baseBytes = res.base_bytes.map((b) => b.toString(16).padStart(2, "0"));
+      this.matchCell = null; // the grid was regenerated
+      for (let i = 0; i < group.puzzles.length; i++) {
+        const p = group.puzzles[i];
+        const info = res.infos[i];
+        if (!p || !info) continue;
+        const top = res.top_bytes[i];
+        if (top !== undefined) this.topByteVals[p.puzzle_number] = top;
+        this.lastInfos[p.puzzle_number] = info;
+      }
+
+      if (res.matched) this.handleGroupMatch(res.matched);
     } catch (e) {
       this.showError(String(e));
       this.stopAuto();
@@ -366,12 +436,14 @@ export class HexState {
   }
 
   /**
-   * Toggle auto-randomize (Auto button): continuous rounds in group mode.
+   * Toggle auto-randomize (Auto button): continuous Rust-side batches.
    *
    * [imperative] The loop is a self-chaining `setTimeout` that awaits its IPC
    * round-trip before scheduling the next tick — that await *is* the
    * backpressure.  Rewriting it as `setInterval` or an `$effect` loop would
-   * let requests pile up unboundedly.
+   * let requests pile up unboundedly.  Each tick scans for `BATCH_BUDGET_MS`
+   * inside Rust, so the timer is only a yield point for rendering, not the
+   * scan cadence.
    */
   onAuto() {
     if (this.autoTimer !== null) {
@@ -386,17 +458,15 @@ export class HexState {
     // (via `body.auto-running`, synced in Hex.svelte).
     this.autoRunning = true;
 
-    // The branch is picked once, as before.  Mode cannot change mid-run anyway:
-    // both `selectGroup` and `onRangeInput` stop auto first.
-    const groupTick = this.mode === "group" && this.activeGroup;
+    // Mode cannot change mid-run: both `selectGroup` and `onRangeInput` stop
+    // auto first, and each batch re-checks the mode before applying its result.
     const tick = async () => {
-      if (groupTick) {
-        this.newRound();
-        await this.deriveGroupAll();
+      if (this.mode === "group") {
+        await this.autoGroupBatch();
       } else {
-        await this.autoTick();
+        await this.autoCustomBatch();
       }
-      if (this.autoTimer !== null) this.autoTimer = window.setTimeout(tick, HOVER_INTERVAL_MS);
+      if (this.autoTimer !== null) this.autoTimer = window.setTimeout(tick, 0);
     };
     this.autoTimer = window.setTimeout(tick, 0);
   }

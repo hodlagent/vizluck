@@ -31,7 +31,7 @@ For desktop development prefer `npm run tauri dev` — it orchestrates both Vite
 Two halves glued together by Tauri, plus a GPU-accelerated BTC scanning engine:
 
 - **`src/` (frontend)** — Svelte 5 + TypeScript. `main.ts` mounts `App.svelte`, which owns the tab bar and keeps **both panels mounted**, toggling only the `hidden` attribute. Vite serves this during dev and bundles it to `dist/` for production. `vite.config.ts` is Tauri-aware: fixed port 1420, `strictPort`, ignores `src-tauri` from watching.
-  - `src/hex/` — Hex tab state, byte-range math, and the reused `MatchBanner`.
+  - `src/hex/` — Hex tab state, byte-range math, and the reused `MatchBanner`. Auto mode scans in 40 ms Rust-side batches (`hex_scan_custom` / `hex_scan_group`) driven by a self-chaining `setTimeout`, so the backend, not the frontend timer, sets the cadence.
   - `src/game/` — the Game tab (see below).
   - `src/random/` — Random tab state and its `random_scan` wrapper. The scan loop is a self-chaining `setTimeout` like the Hex auto loop; the Rust side owns a 40 ms time budget per batch. A hit stops the loop and the panel shows both the matched address and the `matches/` file it was saved to.
   - `src/addresses.svelte.ts` — the **shared** Bitcoin/Ethereum/Solana address book. Unlike the per-tab `HexState`/`GameState`, this is a module singleton because Settings edits it and Random consumes it; `load_addresses` / `save_addresses` persist it to `addresses.json` in the Tauri app-data dir.

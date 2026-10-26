@@ -35,10 +35,36 @@ export interface KeyInfo {
   save_path: string | null;
 }
 
-/** Lightweight auto-mode result: key + hash160 only (no address/xprv). */
-export interface AutoKeyInfo {
+/** Lightweight description of one puzzle in the active group, sent to Rust. */
+export interface GroupPuzzleSpec {
+  puzzle_number: number;
+  hex_bytes_len: number;
+  start_top: number;
+  end_top: number;
+  hash160: string;
+}
+
+/** One time-budgeted batch of the custom-range Auto loop. */
+export interface HexCustomBatch {
+  /** Valid keys checked in this batch. */
+  checked: number;
+  /** The last key checked (drives the grid). */
   private_key_hex: string;
   compressed_hash160: string;
-  address_match: boolean | null;
-  save_path: string | null;
+  /** Full info when the batch hit the range's target; already persisted. */
+  matched: KeyInfo | null;
+}
+
+/** One time-budgeted batch of the group Auto loop. */
+export interface HexGroupBatch {
+  /** Valid keys checked in this batch. */
+  checked: number;
+  /** Shared low bytes of the last round, one per grid cell. */
+  base_bytes: number[];
+  /** Top byte of the last round, index-aligned with the request. */
+  top_bytes: number[];
+  /** Full derived info of the last round, index-aligned with the request. */
+  infos: KeyInfo[];
+  /** The batch's first hit (already persisted); its round is the one returned. */
+  matched: KeyInfo | null;
 }

@@ -135,13 +135,34 @@ async function run() {
             return info(args.private_key_hex);
           case "random_and_derive":
             return info(hex());
-          case "random_and_hash160":
+          case "hex_scan_custom":
             return {
+              checked: 100,
               private_key_hex: hex(),
               compressed_hash160: "9".repeat(40),
-              address_match: window.__MATCH_MODE__ ? true : false,
-              save_path: window.__MATCH_MODE__ ? "/tmp/vizluck-fake-match.txt" : null,
+              matched: window.__MATCH_MODE__ ? info(hex()) : null,
             };
+          case "hex_scan_group": {
+            // Mirror the Rust batch: one shared base tail plus a top byte per
+            // puzzle, and a key shaped exactly like the frontend used to build.
+            const specs = args.puzzles;
+            const len = specs[0]?.hex_bytes_len ?? 1;
+            const base = Array.from(
+              crypto.getRandomValues(new Uint8Array(Math.max(0, len - 1))),
+            );
+            const baseHex = base.map((b) => b.toString(16).padStart(2, "0")).join("");
+            const infos = specs.map((p) => {
+              const top = p.start_top.toString(16).padStart(2, "0");
+              return info("00".repeat(32 - p.hex_bytes_len) + top + baseHex);
+            });
+            return {
+              checked: 42,
+              base_bytes: base,
+              top_bytes: specs.map((p) => p.start_top),
+              infos,
+              matched: window.__MATCH_MODE__ ? infos[0] : null,
+            };
+          }
           default:
             throw new Error("unstubbed command: " + cmd);
         }
@@ -251,6 +272,21 @@ async function run() {
   assert((await page.locator("#info .addr-info").count()) === 1, "single AddrInfo panel in custom mode");
   assert((await page.locator("#info .addr-info-head").count()) === 0, "custom panel has no #N head");
   assert((await page.locator("#error").isVisible()) === false, "no error shown for a valid range");
+
+  console.log("\n[6b] Custom-mode Auto scans in Rust batches");
+  await page.locator("#btn-auto").click();
+  await page.waitForTimeout(200);
+  assert((await page.locator("#btn-auto").textContent())?.includes("Stop"), "custom auto started");
+  const ck1 = await gridText();
+  await page.waitForTimeout(300);
+  assert(ck1 !== (await gridText()), "custom auto advances the grid");
+  await page.locator("#btn-auto").click();
+  await page.waitForTimeout(100);
+  assert(
+    (await page.locator("#btn-auto").textContent())?.includes("Auto"),
+    "custom auto stops",
+  );
+
   await page.locator("#range-input").fill("not-a-range");
   await page.waitForTimeout(600);
   assert(await page.locator("#error").isVisible(), "invalid range surfaces an error");

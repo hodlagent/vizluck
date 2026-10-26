@@ -1,9 +1,15 @@
 //! Homepage backend: puzzle listing, range-constrained random key generation,
 //! BIP32 master key derivation, and address derivation.
 //!
-//! Exposes two Tauri commands used by the homepage UI:
-//!   - `get_puzzles`        → the dropdown dataset
-//!   - `random_and_derive`  → sample a random key in a range + derive everything
+//! Tauri commands used by the Hex tab:
+//!   - `get_puzzles`       → the dropdown dataset
+//!   - `random_and_derive` → sample a random key in a range + derive everything
+//!   - `hex_scan_custom`   → one time-budgeted custom-range Auto batch
+//!   - `hex_scan_group`    → one time-budgeted group Auto batch
+//!   - `derive_full`       → display-only derivation of a known key
+//!   - `derive_group`      → derive a batch of known keys (Hex/Game hover)
+
+use std::time::{Duration, Instant};
 
 use rand::TryRng;
 use serde::Serialize;
@@ -31,7 +37,7 @@ pub struct PuzzleInfo {
 }
 
 /// Everything the frontend needs to render for one sampled key.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct KeyInfo {
     /// Full 32-byte private key, 64-char hex.
     pub private_key_hex: String,
@@ -130,6 +136,14 @@ fn be_bit_length(a: &[u8; 32]) -> usize {
 
 // ── Random sampling ──────────────────────────────────────────────────────────
 
+/// Fill `buf` with OS entropy.  The OS source is always available, so a failure
+/// is unrecoverable rather than something a caller can retry.
+fn fill_random(buf: &mut [u8]) {
+    rand::rngs::SysRng
+        .try_fill_bytes(buf)
+        .expect("OS entropy source always available");
+}
+
 /// Uniform random integer in `[0, r_max)` via k-bit rejection sampling, where
 /// `k = bit_length(r_max)`.  Acceptance rate is >= 50% because
 /// `r_max >= 2^(k-1)`.
@@ -141,9 +155,7 @@ fn random_below(r_max: &[u8; 32]) -> [u8; 32] {
 
     let mut r = [0u8; 32];
     loop {
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut r)
-            .expect("OS entropy source always available");
+        fill_random(&mut r);
         // Zero the top `zero_bits` bits so `r < 2^k`.
         for i in 0..zero_full_bytes {
             r[i] = 0;
@@ -173,13 +185,21 @@ fn random_key_in_range(lo: &[u8; 32], hi_excl: &[u8; 32]) -> Result<[u8; 32], St
 fn random_key_from(lo: &[u8; 32]) -> [u8; 32] {
     let mut r = [0u8; 32];
     loop {
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut r)
-            .expect("OS entropy source always available");
+        fill_random(&mut r);
         if !be_lt(&r, lo) {
             // r >= lo
             return r;
         }
+    }
+}
+
+/// Sample one key from `[lo, hi_excl)`, or from `[lo, 2^256)` when `hi_excl`
+/// carries the overflow marker (`[0; 32]`).
+fn sample_key(lo: &[u8; 32], hi_excl: &[u8; 32]) -> Result<[u8; 32], String> {
+    if be_lt(lo, hi_excl) {
+        random_key_in_range(lo, hi_excl)
+    } else {
+        Ok(random_key_from(lo))
     }
 }
 
@@ -234,20 +254,88 @@ fn serialize_xpub(chain_code: &[u8; 32], compressed_pubkey: &[u8; 33]) -> String
     crate::btc::base58check(&payload)
 }
 
-// ── Lightweight result for auto mode ──────────────────────────────────────────
+// ── Time-budgeted batch scanning (Hex Auto mode) ─────────────────────────────
+//
+// The Hex tab's Auto loop used to live in the frontend: one IPC round-trip (one
+// key in custom mode, one round of N keys in group mode) followed by a 60 ms
+// wait.  These two commands move the loop into Rust, so one call checks as many
+// keys as fit in the time budget before returning the *last* state for the UI.
 
-/// Everything auto mode needs per tick: the key (for the grid), its hash160 (for
-/// the puzzle comparison), and — on the rare match — where it was saved.
+/// One puzzle of the active group, as the Hex tab sees it.  The backend itself
+/// draws the round's shared base bytes and each puzzle's top byte, so the
+/// frontend does not have to pre-generate keys per round.
+#[derive(serde::Deserialize)]
+pub struct GroupPuzzleSpec {
+    pub puzzle_number: u32,
+    /// Puzzle width in low bytes, top byte included (1–32).
+    pub hex_bytes_len: u8,
+    /// Inclusive lower bound of the random top byte.
+    pub start_top: u8,
+    /// Exclusive upper bound; 0 encodes the 0xFF overflow case.
+    pub end_top: u8,
+    /// 40-char hex target hash160 for this puzzle.
+    pub hash160: String,
+}
+
+/// Result of one bounded custom-range batch.
 #[derive(Serialize)]
-pub struct AutoKeyInfo {
-    /// Full 32-byte private key, 64-char hex (drives the grid).
+pub struct HexCustomBatch {
+    /// Valid keys checked in this batch (invalid scalars are retried, not counted).
+    pub checked: u64,
+    /// The last key checked (drives the grid), 64-char hex.
     pub private_key_hex: String,
-    /// 40-char hex hash160 of the compressed pubkey (for puzzle comparison).
+    /// Its compressed-pubkey hash160, 40-char hex.
     pub compressed_hash160: String,
-    /// `None` = custom range; `Some(matched)` = puzzle comparison result.
-    pub address_match: Option<bool>,
-    /// Absolute path saved to on a match, `None` otherwise.
-    pub save_path: Option<String>,
+    /// Full info when the batch hit the range's target; already persisted.
+    pub matched: Option<KeyInfo>,
+}
+
+/// Result of one bounded group batch.
+#[derive(Serialize)]
+pub struct HexGroupBatch {
+    /// Valid keys checked in this batch.
+    pub checked: u64,
+    /// Shared low bytes of the last round, one byte per grid cell.
+    pub base_bytes: Vec<u8>,
+    /// Top byte of the last round, index-aligned with the request.
+    pub top_bytes: Vec<u8>,
+    /// Full derived info of the last round, index-aligned with the request.
+    pub infos: Vec<KeyInfo>,
+    /// The first hit of this batch (already persisted).  The hit's round is the
+    /// one returned in `base_bytes` / `top_bytes` / `infos`, so the UI can
+    /// freeze on exactly what produced it.
+    pub matched: Option<KeyInfo>,
+}
+
+/// Inclusive upper bound of a puzzle's top byte.  `end_top == 0` encodes the
+/// range ending at 0xFF…FF, so its real inclusive bound is 0xFF.
+fn top_byte_max(end_top: u8) -> u8 {
+    if end_top == 0 {
+        0xff
+    } else {
+        end_top - 1
+    }
+}
+
+/// Uniform random top byte in `[start_top, top_byte_max(end_top)]`.
+fn random_top_byte(start_top: u8, end_top: u8) -> u8 {
+    let max = top_byte_max(end_top);
+    if max <= start_top {
+        return start_top;
+    }
+    let range = (max - start_top) as usize + 1;
+    let mut b = [0u8; 1];
+    fill_random(&mut b);
+    start_top + (b[0] as usize % range) as u8
+}
+
+/// Build a group key: `00…00 || top || base`.  `hex_bytes_len` includes `top`,
+/// so `base.len() == hex_bytes_len - 1`.
+fn build_group_key(hex_bytes_len: usize, top: u8, base: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[32 - hex_bytes_len] = top;
+    key[32 - hex_bytes_len + 1..].copy_from_slice(base);
+    key
 }
 
 // ── Core + full derivation ──────────────────────────────────────────────────
@@ -259,10 +347,9 @@ pub struct AutoKeyInfo {
 fn compute_compressed_hash160(
     key: &[u8; 32],
 ) -> Result<([u8; 20], secp256k1::PublicKey), String> {
-    use secp256k1::{PublicKey, Secp256k1, SecretKey};
-    let secp = Secp256k1::new();
+    use secp256k1::{PublicKey, SecretKey};
     let sk = SecretKey::from_byte_array(*key).map_err(|e| format!("invalid scalar: {e}"))?;
-    let pk = PublicKey::from_secret_key(&secp, &sk);
+    let pk = PublicKey::from_secret_key(crate::btc::secp_context(), &sk);
     let h160_compressed = crate::btc::hash160(&pk.serialize());
     Ok((h160_compressed, pk))
 }
@@ -502,69 +589,176 @@ pub fn random_and_derive(
     }
 }
 
-/// Lightweight auto-mode tick: sample a random key in the range and compute its
-/// compressed-pubkey hash160 (plus the puzzle comparison).  Skips address
-/// encoding and BIP32 — everything the grid doesn't need.  On a match the result
-/// is saved and the path returned so the frontend can pause + celebrate.
-#[tauri::command]
-pub fn random_and_hash160(
-    spec: RangeSpec,
-    network: String,
-) -> Result<AutoKeyInfo, String> {
-    // `network` is accepted for a uniform API but hash160 is network-independent;
-    // it only matters once a match is saved (recorded in the file).
-    let _ = network;
-
+/// One time-budgeted batch for the custom-range Auto loop.  Samples as many
+/// keys as fit in `time_budget_ms`, checking only the cheap hash160, and returns
+/// the last one so the grid can follow along.  On a target hit the full info is
+/// derived (once per run), persisted, and returned in `matched`.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn hex_scan_custom(spec: RangeSpec, time_budget_ms: u64) -> Result<HexCustomBatch, String> {
     let (lo, hi_excl, expected_hash160) = resolve_range(&spec)?;
 
+    // Puzzle number for the save file (0 for custom ranges — never matched anyway).
     let puzzle_number = match &spec {
         RangeSpec::Puzzle { puzzle_number } => *puzzle_number,
         RangeSpec::Custom { .. } => 0,
     };
 
-    let mut attempts = 0;
-    loop {
-        let key = if be_lt(&lo, &hi_excl) {
-            random_key_in_range(&lo, &hi_excl)?
-        } else {
-            random_key_from(&lo)
-        };
+    let budget = Duration::from_millis(time_budget_ms.clamp(1, 500));
+    let started = Instant::now();
+
+    let mut checked = 0u64;
+    let mut invalid = 0u32;
+
+    let (last_key, last_h160) = loop {
+        let key = sample_key(&lo, &hi_excl)?;
         let (h160_comp, _pk) = match compute_compressed_hash160(&key) {
             Ok(r) => r,
             Err(_) => {
-                attempts += 1;
-                if attempts >= 1000 {
+                // A custom range spanning near 2^256 rejects ~half of its draws
+                // as invalid scalars; the cap only trips on a degenerate range.
+                invalid += 1;
+                if invalid >= 1000 {
                     return Err("failed to generate a valid key after 1000 attempts".to_string());
                 }
                 continue;
             }
         };
 
-        let address_match = expected_hash160.map(|target| h160_comp == target);
-        let mut save_path = None;
-        if address_match == Some(true) {
-            // Build a minimal KeyInfo to reuse the save helper.
-            let info = KeyInfo {
+        checked += 1;
+
+        if expected_hash160 == Some(h160_comp) {
+            // Rare enough that the full derivation is free in context.  If the
+            // BIP32 master scalar is invalid, fall back to the minimal record:
+            // the hit itself is what matters and it is already known.
+            let mut info = derive_key_info(&key, expected_hash160).unwrap_or_else(|_| KeyInfo {
                 private_key_hex: hex::encode(key),
                 xprv: String::new(),
                 xpub: String::new(),
                 compressed_public_key: String::new(),
                 compressed_legacy_address: String::new(),
                 compressed_hash160: hex::encode(h160_comp),
-                address_match,
+                address_match: Some(true),
                 save_path: None,
-            };
-            save_path = match save_match(&info, puzzle_number, "mainnet", "hex (auto)") {
-                Ok(path) => Some(path),
-                Err(e) => Some(format!("ERROR: {e}")),
-            };
+            });
+            match save_match(&info, puzzle_number, "mainnet", "hex (auto)") {
+                Ok(path) => info.save_path = Some(path),
+                Err(e) => info.save_path = Some(format!("ERROR: {e}")),
+            }
+            return Ok(HexCustomBatch {
+                checked,
+                private_key_hex: hex::encode(key),
+                compressed_hash160: hex::encode(h160_comp),
+                matched: Some(info),
+            });
         }
-        return Ok(AutoKeyInfo {
-            private_key_hex: hex::encode(key),
-            compressed_hash160: hex::encode(h160_comp),
-            address_match,
-            save_path,
-        });
+
+        if started.elapsed() >= budget {
+            break (key, h160_comp);
+        }
+    };
+
+    Ok(HexCustomBatch {
+        checked,
+        private_key_hex: hex::encode(last_key),
+        compressed_hash160: hex::encode(last_h160),
+        matched: None,
+    })
+}
+
+/// One time-budgeted batch for the group Auto loop.  Each round draws one shared
+/// base-byte tail plus one top byte per puzzle, derives the whole group, and
+/// checks every key against its own puzzle target.  The batch returns the last
+/// round's state plus the first hit, if any.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn hex_scan_group(
+    puzzles: Vec<GroupPuzzleSpec>,
+    time_budget_ms: u64,
+) -> Result<HexGroupBatch, String> {
+    let Some(first) = puzzles.first() else {
+        return Err("empty puzzle group".to_string());
+    };
+    let hex_bytes_len = first.hex_bytes_len as usize;
+    if hex_bytes_len == 0 || hex_bytes_len > 32 {
+        return Err(format!(
+            "hex_bytes_len must be 1..=32, got {hex_bytes_len}"
+        ));
+    }
+
+    let mut targets = Vec::with_capacity(puzzles.len());
+    for p in &puzzles {
+        if p.hex_bytes_len as usize != hex_bytes_len {
+            return Err("group puzzles must share a hex_bytes_len".to_string());
+        }
+        if top_byte_max(p.end_top) < p.start_top {
+            return Err(format!(
+                "puzzle {}: empty top-byte range",
+                p.puzzle_number
+            ));
+        }
+        let bytes = hex::decode(&p.hash160)
+            .map_err(|e| format!("puzzle {}: bad hash160: {e}", p.puzzle_number))?;
+        let target: [u8; 20] = bytes
+            .try_into()
+            .map_err(|_| format!("puzzle {}: hash160 is not 20 bytes", p.puzzle_number))?;
+        targets.push(target);
+    }
+
+    let budget = Duration::from_millis(time_budget_ms.clamp(1, 500));
+    let started = Instant::now();
+    let base_len = hex_bytes_len - 1;
+
+    let mut checked = 0u64;
+    loop {
+        let mut base = vec![0u8; base_len];
+        if base_len > 0 {
+            fill_random(&mut base);
+        }
+        let mut top_bytes = Vec::with_capacity(puzzles.len());
+        let mut infos = Vec::with_capacity(puzzles.len());
+        let mut matched: Option<KeyInfo> = None;
+
+        for (p, target) in puzzles.iter().zip(&targets) {
+            // Retry only the astronomically-unlikely invalid BIP32 master key
+            // (≈2^-128); a fresh top byte changes the seed.
+            let mut attempts = 0;
+            let (top, info) = loop {
+                let top = random_top_byte(p.start_top, p.end_top);
+                let key = build_group_key(hex_bytes_len, top, &base);
+                match derive_key_info(&key, Some(*target)) {
+                    Ok(info) => break (top, info),
+                    Err(_) => {
+                        attempts += 1;
+                        if attempts >= 1000 {
+                            return Err("failed to generate a valid group key".to_string());
+                        }
+                    }
+                }
+            };
+            checked += 1;
+            top_bytes.push(top);
+
+            let mut info = info;
+            if info.address_match == Some(true) {
+                match save_match(&info, p.puzzle_number, "mainnet", "hex (group)") {
+                    Ok(path) => info.save_path = Some(path),
+                    Err(e) => info.save_path = Some(format!("ERROR: {e}")),
+                }
+                if matched.is_none() {
+                    matched = Some(info.clone());
+                }
+            }
+            infos.push(info);
+        }
+
+        if matched.is_some() || started.elapsed() >= budget {
+            return Ok(HexGroupBatch {
+                checked,
+                base_bytes: base,
+                top_bytes,
+                infos,
+                matched,
+            });
+        }
     }
 }
 
@@ -864,36 +1058,79 @@ mod tests {
         }
     }
 
-    // ── lightweight auto command ─────────────────────────────────────────────
+    // ── time-budgeted Hex batches ─────────────────────────────────────────────
 
     #[test]
-    fn auto_tick_produces_hash160_in_range() {
-        // Puzzle 71 range; every tick must land in [2^70, 2^71) with a hash160.
-        for _ in 0..50 {
-            let res = random_and_hash160(
-                RangeSpec::Puzzle { puzzle_number: 71 },
-                "mainnet".to_string(),
-            )
-            .unwrap();
-            assert_eq!(res.private_key_hex.len(), 64);
-            assert_eq!(res.compressed_hash160.len(), 40);
-            // address_match is Some (puzzle mode) but almost always false.
-            assert!(res.address_match.is_some());
-        }
+    fn build_group_key_pads_the_high_bytes() {
+        let key = build_group_key(4, 0xab, &[0x11, 0x22, 0x33]);
+        assert_eq!(hex::encode(key), "00".repeat(28) + "ab112233");
+        // A one-byte puzzle has no base tail.
+        let key = build_group_key(1, 0x7f, &[]);
+        assert_eq!(hex::encode(key), "00".repeat(31) + "7f");
     }
 
     #[test]
-    fn auto_tick_custom_range_no_match_field() {
-        let res = random_and_hash160(
+    fn custom_batch_checks_keys_and_returns_the_last_one() {
+        let res = hex_scan_custom(
             RangeSpec::Custom {
                 start_hex: "400000000000000000".to_string(),
                 end_hex: "7fffffffffffffffff".to_string(),
             },
-            "mainnet".to_string(),
+            5,
         )
         .unwrap();
-        assert_eq!(res.address_match, None);
-        assert_eq!(res.save_path, None);
+        assert!(res.checked > 0, "a 5 ms batch must check at least one key");
+        assert_eq!(res.private_key_hex.len(), 64);
+        assert_eq!(res.compressed_hash160.len(), 40);
+        assert!(res.matched.is_none());
+    }
+
+    #[test]
+    fn group_batch_finds_a_known_target() {
+        // The smallest possible group: hex_bytes_len 1, top byte exactly 1, no
+        // base bytes — the only key is 1.  G's compressed-key hash160 is the
+        // well-known target, so the batch must hit and stop after one round.
+        let target = crate::btc::hash160(&crate::btc::GENERATOR_COMPRESSED);
+        let res = hex_scan_group(
+            vec![GroupPuzzleSpec {
+                puzzle_number: 1,
+                hex_bytes_len: 1,
+                start_top: 1,
+                end_top: 2,
+                hash160: hex::encode(target),
+            }],
+            10,
+        )
+        .unwrap();
+        assert_eq!(res.checked, 1);
+        assert_eq!(res.base_bytes, Vec::<u8>::new());
+        assert_eq!(res.top_bytes, vec![1]);
+        assert_eq!(res.infos.len(), 1);
+        let hit = res.matched.expect("the only key in the group must match");
+        assert_eq!(hit.private_key_hex, "00".repeat(31) + "01");
+        assert_eq!(hit.compressed_hash160, hex::encode(target));
+        assert_eq!(hit.address_match, Some(true));
+    }
+
+    #[test]
+    fn group_batch_returns_a_full_round_without_a_hit() {
+        let res = hex_scan_group(
+            vec![GroupPuzzleSpec {
+                puzzle_number: 71,
+                hex_bytes_len: 4,
+                start_top: 1,
+                end_top: 0,
+                hash160: "a".repeat(40),
+            }],
+            5,
+        )
+        .unwrap();
+        assert!(res.checked > 0);
+        assert_eq!(res.base_bytes.len(), 3, "group_4 has 3 base grid cells");
+        assert_eq!(res.top_bytes.len(), 1);
+        assert_eq!(res.infos.len(), 1);
+        assert!(res.matched.is_none());
+        assert_eq!(res.infos[0].address_match, Some(false));
     }
 
     // ── full derivation of a known key (pause path) ──────────────────────────
