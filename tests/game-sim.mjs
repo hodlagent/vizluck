@@ -1274,6 +1274,83 @@ async function run() {
         );
       }
 
+      // ── §14.2 The orbit sign is decided at the latch, not in `flee` ──────
+      //
+      // A net for a silent bug. `orbitSign` is fixed once per retreat, because
+      // re-deriving it every frame from a drifting centroid is exactly the
+      // vibration `dangerCentre` was introduced to end. That decision used to
+      // live in the `flee` rung — the only reader of the field, which made it
+      // look equivalent — but `heal` outranks `flee` in the ladder. So a wounded
+      // robot whose medicine is nearer than the thing hitting it opens the latch
+      // on a `heal` frame, never reaches the assignment, and then runs the whole
+      // retreat on the sign left over from the previous one: a retreat that
+      // still looks like a retreat, curving at the corner it was supposed to
+      // avoid. The frame below is that frame.
+      {
+        const s = fresh();
+        const m = solo(s, "brute", 4, (mm, cfg) => {
+          mm.posX = cfg.x + cfg.w / 2;
+          mm.posY = cfg.y + cfg.h / 2;
+        });
+        // The brute's own numbers (§6), so the reach that makes this contact is
+        // a real one rather than a convenient one — and enough hp that nothing
+        // about the monster changes underfoot.
+        m.attackPower = 18;
+        m.attackSpeed = 0.6;
+        m.attackRange = 34;
+        m.senseRange = 110;
+        m.hp = 1e9;
+        m.maxHp = 1e9;
+
+        // Three points, chosen so the answer is legible by hand: the player
+        // sits due south of the arena centre, the monster 20px due east of the
+        // player, and the medicine 10px due west. So the retreat is westward,
+        // its tangent is due north, and north is *inward* — which makes the
+        // inward-curving sign `+1` and the corner-seeking one `-1`.
+        s.player.posX = s.width / 2;
+        s.player.posY = s.height / 2 + 130;
+        m.posX = s.player.posX + 20;
+        m.posY = s.player.posY;
+        // Wounded enough that `heal` is the intent, and (with contact already
+        // established at 20px against a 34px reach) threatened as well.
+        s.player.hp = Math.round(s.player.maxHp * 0.3);
+        s.items.push({ id: 1, kind: "heal", posX: s.player.posX - 10, posY: s.player.posY, life: 30 });
+
+        // The orbit's tangent, up to a positive scale — and the direction the
+        // sign has to agree with for the retreat to curve inward rather than
+        // into the wall behind it.
+        const ax = s.player.posX - m.posX;
+        const ay = s.player.posY - m.posY;
+        const inward =
+          -ay * (s.width / 2 - s.player.posX) + ax * (s.height / 2 - s.player.posY);
+        check(inward > 0, "the geometry makes the inherited sign the corner-seeking one", inward);
+
+        const st = robot.createRobotState();
+        st.orbitSign = -1; // the previous retreat's sign, had there been one
+        const opening = robot.decide(robot.perceive(s), st);
+        check(
+          opening.intent === "heal" && st.retreating,
+          "a wounded robot opens the retreat latch on a `heal` frame, not a `flee` one",
+          `${opening.intent} / retreating ${st.retreating}`,
+        );
+        check(
+          st.orbitSign * inward > 0,
+          "that frame still sets orbitSign — the pre-set value is replaced, not inherited",
+          `orbitSign ${st.orbitSign}`,
+        );
+
+        // ...and it is set *once*. On the next frame of the same retreat the
+        // field is read, never rewritten: a per-frame recompute here is the
+        // drift the field exists to prevent.
+        st.orbitSign = -1;
+        robot.decide(robot.perceive(s), st);
+        check(
+          st.orbitSign === -1 && st.retreating,
+          "the later frames of the same retreat leave it alone",
+          `orbitSign ${st.orbitSign} / retreating ${st.retreating}`,
+        );
+      }
+
       // ── §14.2 A retreat curves, so a corner is not a dead end ────────────
       //
       // The user's second report of the same symptom — "好点有限，仍然是直奔边

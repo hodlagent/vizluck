@@ -91,8 +91,6 @@ export class GameState {
   error = $state("");
 
   // ── HUD numbers (throttled by the scene) ─────────────────────────────────
-  frames = $state(0);
-  fps = $state(0);
   survival = $state(0);
   bestSurvival = $state(0);
   alive = $state(false);
@@ -175,8 +173,6 @@ export class GameState {
 
   // Arrow-function fields so `off()` can be handed the identical reference.
   private onStats = (stats: GameStats) => {
-    this.frames = stats.frames;
-    this.fps = Math.round(stats.fps);
     this.level = stats.level;
     this.xp = stats.xp;
     this.xpNext = stats.xpNext;

@@ -26,8 +26,6 @@ export const GAME_STATS = "game:stats";
  * reactivity passes a second for digits nobody can read that fast.
  */
 export interface GameStats {
-  frames: number;
-  fps: number;
   /** Seconds survived this run. */
   survival: number;
   /** False once the player has died; the run is over. */

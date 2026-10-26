@@ -528,22 +528,18 @@ export function createSim(opts: SimOptions = {}): SimState {
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
 /**
- * Region index containing `(x, y)`, given the arena size.
+ * Region index containing `(x, y)` — a plain 3×3 partition of the arena.
  *
- * Exported on its own because `robot.ts` asks the same question about positions
- * the player is *not* standing on — every candidate step it weighs — and a
- * second copy of this arithmetic is exactly the kind of thing that drifts out of
- * sync with the walls it is supposed to describe.
+ * A `SimState` overload taking the arena size as two numbers used to sit beside
+ * this one, for a robot that needed the answer for positions the player was not
+ * standing on. That robot no longer asks: §6.2's leash is gone, so the risk
+ * field has no region term and `robot.ts` never imports this. The size is on the
+ * state the caller already has, so one function covers both.
  */
-export function regionIndexAtPoint(width: number, height: number, x: number, y: number): number {
-  const col = clamp(Math.floor(x / (width / 3)), 0, 2);
-  const row = clamp(Math.floor(y / (height / 3)), 0, 2);
-  return row * 3 + col;
-}
-
-/** Region index containing `(x, y)`. */
 export function regionIndexAt(s: SimState, x: number, y: number): number {
-  return regionIndexAtPoint(s.width, s.height, x, y);
+  const col = clamp(Math.floor(x / (s.width / 3)), 0, 2);
+  const row = clamp(Math.floor(y / (s.height / 3)), 0, 2);
+  return row * 3 + col;
 }
 
 /**

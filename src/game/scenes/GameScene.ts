@@ -1,8 +1,8 @@
 // The Game tab's Phaser scene. A renderer over `sim.ts` and nothing more: it
 // owns no game rules, only the canvas, the keyboard and the throttled HUD feed.
 //
-// [imperative] `update()` is a callback over time, not a value, so the frame
-// counter, the effect pools and the sim all stay plain fields. Only the numbers
+// [imperative] `update()` is a callback over time, not a value, so the effect
+// pools, the effect clocks and the sim all stay plain fields. Only the numbers
 // the HUD prints reach Svelte state, and only on the timer below — publishing
 // per frame would mean 60 reactivity passes a second for digits nobody can read
 // that fast.
@@ -383,8 +383,6 @@ interface TrackedShot {
 }
 
 export class GameScene extends Phaser.Scene {
-  /** Plain field on purpose — see the note at the top of this file. */
-  private frames = 0;
   /** Seconds of *rendered* time. Drives every pulse; freezes with the engine. */
   private clock = 0;
 
@@ -535,10 +533,6 @@ export class GameScene extends Phaser.Scene {
     const kind = this.overlayKind;
     this.overlayKind = "none";
     this.setOverlay(kind);
-  }
-
-  isRobotMode(): boolean {
-    return this.robotMode;
   }
 
   /**
@@ -1837,8 +1831,6 @@ export class GameScene extends Phaser.Scene {
   private publishStats(): void {
     const sim = this.sim;
     const stats: GameStats = {
-      frames: this.frames,
-      fps: this.game.loop.actualFps,
       survival: sim?.time ?? 0,
       alive: sim?.alive ?? false,
       ready: sim !== null,
@@ -1863,7 +1855,6 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number): void {
-    this.frames++;
     // The sim clamps its own step; clamping here too keeps the *effect* clocks
     // on the same timeline as the simulation they are illustrating.
     const dt = Math.min(Math.max(delta / 1000, 0), 0.05);

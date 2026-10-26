@@ -204,6 +204,60 @@ export const ROBOT = {
   PROBE_S: 0.25,
 
   /**
+   * How many points along a candidate's path the risk field is sampled at, the
+   * last of which is the `PROBE_S` endpoint the other terms are graded at.
+   *
+   * **This is the fix for "仍然会不停的撞击其它怪物"** — the robot walking through
+   * monster bodies. The cause was a discretisation error with an exact size:
+   * `PROBE_S` judges a candidate at a point ~40px away, and a monster body is
+   * 12–20px across (`playerRadius` 9 + radius 6/7/11), so a body standing
+   * *between* the robot and that point was not merely under-resolved, it was
+   * **never sampled at all** — the scored position was the ground on the far
+   * side of it. Measured over 96 seeds (§14.5): 11.35 body entries per run, of
+   * which 31.7% were the monsters the robot was not even aiming at, and closing
+   * on them along the chosen heading 48.2% of the time.
+   *
+   * The mechanism says the fix is the *path*, not a shorter horizon: `PROBE_S`
+   * is the reach of the consequences for the goal, wall, room and trap terms
+   * too, so shortening it to body scale would re-tune all of them to chase a
+   * 15px feature. Sampling the segment instead leaves every other term where it
+   * is and asks the question the user is actually asking — not "is the
+   * destination dangerous" but "is the walk dangerous" — which is also the
+   * difference between steering around a body and steering *out of* one after
+   * the fact. At 1 this loop does not run and the code is byte-identical to the
+   * endpoint-only version it replaced.
+   *
+   * It is strictly more risk pressure than the endpoint alone, so the failure
+   * mode to watch is the one §`GOAL` documents: a saturated delta outvoting the
+   * goal and stalling the approach. **That is exactly what happens, so this
+   * ships at 1 — off.** 96 seeds (§14.5), arm = `PROBE_SAMPLES`:
+   *
+   *   arm    median   P10   worst   best   kills   body contacts/run
+   *   1       6.27x  2.47x  1.01x  34.69x    81    11.35  (31.7% not the target)
+   *   2       5.48x  2.45x  1.34x  28.25x    72     5.56  ( 9.6%)
+   *   4       5.78x  2.24x  1.66x  21.34x    75     4.91  ( 6.4%)
+   *   8       5.77x  1.91x  1.04x  22.70x    65     5.28  ( 6.9%)
+   *
+   * It **fixes the reported behaviour** — the bumps into monsters the robot is
+   * not even aiming at fall 345 → 30 across the 96 runs, which is the 「撞击其它
+   * 怪物」 the user reported twice, and the floor rises (worst 1.01x → 1.66x at
+   * 4). What it is not is a survival win, and the reason is a dose-response
+   * rather than noise: kills fall 81 → 75 → 65 and the `flee` share rises 68.1%
+   * → 76.1% as the arm rises, because this is *more fear* added to a term the
+   * `GOAL` comment already records as over-weighted against every rung. The
+   * paired per-seed read at 4 is 47 wins / 49 losses, mean −0.51x, and it is
+   * wider in both directions (P10 −9.0x, P90 +7.5x, worst loss −27.6x — seed
+   * 23306, the control's *best* run at 34.69x, falls to 7.12x).
+   *
+   * So the diagnosis is sound and the obvious repair is the wrong one: a
+   * pressure-*neutral* fix — one that steers around a body without adding net
+   * fear — is the shape this needs, and it is not this. Kept rather than
+   * deleted so the table above stays reproducible via `SWEEP_OVERRIDE`
+   * (`SWEEP_OVERRIDE=PROBE_SAMPLES=4 npm run sweep:robot`).
+   */
+  PROBE_SAMPLES: 1,
+
+  /**
    * What an un-revealed monster is assumed to be.
    *
    * This is the load-bearing choice in the whole fog design. Requirement 5
@@ -982,6 +1036,12 @@ export interface RobotState {
    * A retreat always begins with `retreating` false (see `createRobotState`),
    * so the latch's first frame is always available to set this and no separate
    * "unset" marker is needed.
+   *
+   * It is set *at the latch*, not in the rung that reads it. That distinction is
+   * load-bearing: `heal` outranks `flee` in the ladder, so the latch's opening
+   * frame is not always a `flee` frame, and a decision written into the `flee`
+   * rung would be skipped on exactly the retreats that begin wounded — leaving
+   * this field holding the previous retreat's sign for the whole of the new one.
    */
   orbitSign: 1 | -1;
 }
@@ -1191,7 +1251,6 @@ interface Threat {
   reach: number;
   /** The distance it can be expected to close at. */
   speed: number;
-  revealed: boolean;
   dist: number;
 }
 
@@ -1202,7 +1261,6 @@ function asThreat(m: PerceivedMonster, px: number, py: number): Threat {
     dps: s ? s.attackPower * s.attackSpeed : ROBOT.PRIOR_DPS,
     reach: s ? s.attackRange : ROBOT.PRIOR_REACH,
     speed: s ? s.moveSpeed : ROBOT.PRIOR_SPEED,
-    revealed: s !== null,
     dist: Math.hypot(m.posX - px, m.posY - py),
   };
 }
@@ -1513,6 +1571,60 @@ function riskAt(
 }
 
 /**
+ * The worst `riskAt × trapAt` on the ground a candidate actually crosses,
+ * sampled at `PROBE_SAMPLES` points with the `PROBE_S` endpoint as the last.
+ *
+ * A candidate is not a teleport: the robot walks the segment, one ~2.8px step
+ * per frame, so what it is exposed to is the *worst* ground on the way, not the
+ * ground at the far end. Grading only the endpoint is harmless while the field's
+ * features are much larger than `PROBE_S` — which is true of walls, corridors
+ * and the arena itself — and wrong exactly where the feature is smaller than
+ * the probe, which is a monster's body: 12–20px across, against a 40px probe.
+ * A body between the robot and the endpoint is then not under-resolved but
+ * invisible, and the chosen heading is the one whose *destination* clears it.
+ *
+ * **§15 already made this correction once, for bullets** — a step of `520 ×
+ * maxDt` = 26px is wider than any body, so hits are judged on the segment
+ * between the two step positions rather than the endpoint. This is the same
+ * defect in the same shape, one layer up: the probe is the sampling rate there,
+ * and the body is again the thing smaller than the step.
+ *
+ * Taking the max rather than the mean is what makes it a safety term: the robot
+ * is exposed to the worst point regardless of how briefly, and a mean would let
+ * a long safe stretch pay for a body crossed at speed.
+ *
+ * The sample set deliberately **excludes the origin**, which is why the loop
+ * starts at 1. Including it would floor every candidate at the current risk, so
+ * a robot standing in a bomb could not score the step out of it as the gain the
+ * caller's `hereForScore` baseline exists to measure — every candidate would
+ * tie at zero and ties fall to idle, which is the stall §`KITE_CONTACT` and the
+ * idle-streak numbers describe.
+ */
+function pathRisk(
+  threats: readonly Threat[],
+  hazards: readonly Hazard[],
+  px: number,
+  py: number,
+  ux: number,
+  uy: number,
+  step: number,
+  w: number,
+  h: number,
+  exclude: number | null,
+): number {
+  const n = Math.max(1, ROBOT.PROBE_SAMPLES);
+  let worst = -Infinity;
+  for (let j = 1; j <= n; j++) {
+    const f = j / n;
+    const x = clamp(px + ux * step * f, 0, w);
+    const y = clamp(py + uy * step * f, 0, h);
+    const r = riskAt(threats, hazards, x, y, exclude) * trapAt(x, y, w, h);
+    if (r > worst) worst = r;
+  }
+  return worst;
+}
+
+/**
  * Pick a move for this frame.
  *
  * A three-rung ladder: score every candidate position, choose an intent, then
@@ -1550,8 +1662,9 @@ export function decide(
   // kill what you already pulled, and stop treating every new monster as a
   // reason to restart. `PACK_RADIUS`/`PACK_MAX` carry the two numbers and the
   // measurement behind them.
-  const pack = threats.filter((t) => t.dist <= ROBOT.PACK_RADIUS);
-  const committed = pack.length > 0 && pack.length <= ROBOT.PACK_MAX;
+  let packSize = 0;
+  for (const t of threats) if (t.dist <= ROBOT.PACK_RADIUS) packSize++;
+  const committed = packSize > 0 && packSize <= ROBOT.PACK_MAX;
 
   // ── Potions ──────────────────────────────────────────────────────────────
   // Scored by what they do, discounted by how far the walk is, and skipped
@@ -1667,14 +1780,27 @@ export function decide(
    * `nearest.dist <= PACK_RADIUS` whenever `committed` — the nearest threat
    * *is* the nearest pack member, and the "already pulled" set does not need to
    * be searched again to find its closest member.
+   *
+   * The other arm carries no fallback either. `objective` is null exactly when
+   * `pick` is: `nearestToPoint` answers null only for an empty `threats`, which
+   * is the one input that also makes `pickTarget` null. A `?? pick?.t` arm would
+   * be one no run can reach.
    */
-  const target = (committed ? nearest : (objective ?? pick?.t)) ?? null;
+  const target = committed ? nearest : objective;
 
   // Where a retreat is measured from, and what it runs at. One value, shared by
   // the flee goal — a release measured against a different danger than the
   // direction was would let the robot decide it had escaped while still running
   // straight at the thing.
   const danger = dangerCentre(threats);
+  // The radial half of a retreat, taken once here rather than inside the `flee`
+  // rung: the latch's opening frame decides `orbitSign` and that frame's intent
+  // is not always `flee` (see below), so the direction has to exist above the
+  // ladder. Null only when the player is standing on the centroid.
+  const away = danger ? unitTo(danger.cx, danger.cy, px, py) : null;
+  // Which way "inward" is — the tie-break for the orbit, and the fallback goal
+  // when the latch is set with nothing to run from.
+  const toCentre = unitTo(px, py, view.width / 2, view.height / 2);
 
   // ── The retreat latch ────────────────────────────────────────────────────
   // Both ends are now *local*, and that is the repair §14.6 needed. The old
@@ -1706,10 +1832,9 @@ export function decide(
   // by the `kite` rung holding the ring, and the latch is what happens when
   // that failed. See §14.2 for the full attribution.
   const threatened =
-    (nearest !== null && nearest.dist <= nearest.reach) ||
-    (hpFrac < ROBOT.FLEE_HP &&
-      nearest !== null &&
-      nearest.dist <= ROBOT.DISENGAGE_RADIUS);
+    nearest !== null &&
+    (nearest.dist <= nearest.reach ||
+      (hpFrac < ROBOT.FLEE_HP && nearest.dist <= ROBOT.DISENGAGE_RADIUS));
   // Read before the write, so the latch's opening frame can be recognised: that
   // frame is the one place `orbitSign` is decided (see it on `RobotState`).
   const startingRetreat = threatened && !state.retreating;
@@ -1721,9 +1846,38 @@ export function decide(
   ) {
     state.retreating = false;
   }
+  // The sign is decided **here**, on the latch, and not in the `flee` rung that
+  // consumes it. It used to sit in that rung, which reads as equivalent — the
+  // rung is the only reader — but is not: `heal` outranks `flee`, so a wounded
+  // robot whose potion is nearer than the nearest threat opens the latch on a
+  // `heal` frame, never reaches the assignment, and then runs the whole retreat
+  // on the sign left over from the *previous* one (or the initial `+1`). That is
+  // exactly the inherited-sign spiral the field exists to prevent, and it is
+  // silent: the retreat still looks like a retreat, it just curves toward the
+  // corner it was supposed to avoid.
+  //
+  // `away` is non-null whenever this fires. The contact clause puts the nearest
+  // threat inside its own reach (≤34px), and the hp clause inside
+  // `DISENGAGE_RADIUS`; `dangerCentre` takes every threat within that radius, so
+  // the centroid exists. The only remaining gap is `unitTo`'s degeneracy, a
+  // player within 1e-6px of the centroid — the same case the old expression
+  // answered `1` for, and `1` is what it still answers.
+  //
+  // Measured, and the number is the reason this is written as a repair rather
+  // than as a fix to a live complaint: over the 96-seed sweep, **0 of 410**
+  // latch openings had a non-`flee` intent, so no seeded run ever took the
+  // broken branch and the two arms' sweep output is byte-identical. The bug is
+  // latent, not active — it needs a wounded robot, medicine nearer than the
+  // monster already hitting it, and that frame to be the one the latch opens
+  // on, which the shipped tuning does not produce. It is still a bug: the guard
+  // the field promises is enforced by the shape of the code now, not by the
+  // accident that `heal` and the latch have never coincided.
+  if (startingRetreat) {
+    state.orbitSign =
+      away && toCentre && -away[1] * toCentre[0] + away[0] * toCentre[1] < 0 ? -1 : 1;
+  }
   const inDanger = state.retreating;
 
-  const toCentre = unitTo(px, py, view.width / 2, view.height / 2);
   const healDist = bestHeal
     ? Math.hypot(bestHeal.item.posX - px, bestHeal.item.posY - py)
     : Infinity;
@@ -1783,18 +1937,11 @@ export function decide(
     // is under the hunter's 120px/s — does not hold here, because aggro breaks
     // per run *rise* across this range (17.1 → 21.7). See `FLEE_ORBIT`.
     intent = "flee";
-    const from = danger ? unitTo(danger.cx, danger.cy, px, py) : null;
-    if (from) {
-      const tx = -from[1];
-      const ty = from[0];
-      // Which side to curve toward is decided once, on the latch's opening
-      // frame, and then held — see `RobotState.orbitSign` for why re-deriving
-      // it per frame is wrong here when it is right in `kite`.
-      if (startingRetreat) {
-        state.orbitSign = toCentre && tx * toCentre[0] + ty * toCentre[1] < 0 ? -1 : 1;
-      }
-      goalX = from[0] + ROBOT.FLEE_ORBIT * state.orbitSign * tx;
-      goalY = from[1] + ROBOT.FLEE_ORBIT * state.orbitSign * ty;
+    if (away) {
+      const tx = -away[1];
+      const ty = away[0];
+      goalX = away[0] + ROBOT.FLEE_ORBIT * state.orbitSign * tx;
+      goalY = away[1] + ROBOT.FLEE_ORBIT * state.orbitSign * ty;
     } else if (toCentre) {
       // Nothing on us but still latched (the hp clause, usually, or standing
       // exactly on top of the danger): fall back to the middle, which at least
@@ -2009,7 +2156,7 @@ export function decide(
     // See `TRAP_WEIGHT`: pricing the corner takes the escape-proof box out of
     // the running as the risk minimum, which is the entire point.
     const delta =
-      riskAt(threats, view.hazards, nx, ny, ignoring) * trapAt(nx, ny, view.width, view.height) -
+      pathRisk(threats, view.hazards, px, py, ux, uy, step, view.width, view.height, ignoring) -
       hereForScore;
     const risk = clamp(delta, -ROBOT.RISK_CAP, ROBOT.RISK_CAP);
 
@@ -2064,8 +2211,9 @@ export function decide(
     // and re-earned it every time it paused. Measured on contact frames: the
     // choosing was 63% lateral and only 22% away, and the idle winner was
     // routinely a candidate scoring 0 against a real move scoring 0.83.
-    const moving = c.dx !== 0 || c.dy !== 0;
-    const sticky = moving && c.dx === state.lastDx && c.dy === state.lastDy ? ROBOT.HYST : 0;
+    const repeating =
+      (c.dx !== 0 || c.dy !== 0) && c.dx === state.lastDx && c.dy === state.lastDy;
+    const sticky = repeating ? ROBOT.HYST : 0;
 
     // Strict `>` with `CANDIDATES` ordered idle-first: ties fall to the lowest
     // index, so a genuinely indifferent frame stands still instead of jittering.
@@ -2076,10 +2224,9 @@ export function decide(
     }
     // The standing direction's own score, for the commitment test below. Idle
     // is not a standing direction — see `HYST`'s note on what letting it hold
-    // the bonus did.
-    if (moving && c.dx === state.lastDx && c.dy === state.lastDy) {
-      standing = { input: c, total };
-    }
+    // the bonus did. Same predicate as `sticky`, which is the point: the
+    // direction that collects the bonus is the one the test may fall back to.
+    if (repeating) standing = { input: c, total };
   }
 
   // ── Commitment ───────────────────────────────────────────────────────────

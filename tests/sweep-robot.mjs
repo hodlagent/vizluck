@@ -207,6 +207,14 @@ async function run() {
     const DT = 1 / 60;
     const rows = [];
 
+    // Body radii by kind, read off the archetype table rather than transcribed:
+    // the whole point of `radius` is that the drawn radius *is* the judged one
+    // (§8.4), so a hard-coded copy here would be a second source of truth for
+    // the one number that is not allowed to have two.
+    const BODY_R = Object.fromEntries(
+      Object.entries(sim.MONSTER_ARCHETYPES).map(([k, a]) => [k, a.radius]),
+    );
+
     const TAU = Math.PI * 2;
     /** Fold an angle difference into (-π, π] so a wrap is not a 359° turn. */
     const wrapPi = (a) => {
@@ -277,6 +285,14 @@ async function run() {
       let nearWallRadialSum = 0;
       let openMoving = 0;
       let openRadialSum = 0;
+      // The charging tally — see the block that fills it.
+      let engagedMoving = 0;
+      let engagedToward = 0;
+      let engagedLateral = 0;
+      let engagedAway = 0;
+      let engagedTowardSum = 0;
+      let ownRangeMoving = 0;
+      let ownRangeToward = 0;
       // Intent mix, split by band — is it at the wall because it *flees* there?
       const nearIntents = { flee: 0, heal: 0, loot: 0, kite: 0, roam: 0 };
       const openIntents = { flee: 0, heal: 0, loot: 0, kite: 0, roam: 0 };
@@ -326,9 +342,75 @@ async function run() {
       let turnNet = 0;
       let lastHeading = null;
       // Breaking aggro is a per-monster event, so the tally is keyed by id
-      // across frames rather than summed over the crowd.
+      // across frames rather than summed over the crowd. **So is *gaining* it**,
+      // and the two are the same map read in opposite directions: the user's
+      // 「尽量要避免引到更多怪」 is exactly a false→true on `m.attacking`, and
+      // until this pair existed the report could only see the escape half of a
+      // mechanic whose whole cost is on the entry half.
       let aggroBreaks = 0;
+      let aggroPulls = 0;
+      let pullFrames = 0;
       const prevAggro = new Map();
+      // Frame 0 has no previous read, so every monster already aware of the
+      // spawn would post a pull — which is true but is not something the policy
+      // chose. One frame is skipped rather than guessed at.
+      let primed = false;
+
+      // ── Bumping into bodies ───────────────────────────────────────────────
+      // The user's 「仍然会不停的撞击其它怪物」, made countable. It is a different
+      // event from a pull and it needed its own channel, because every
+      // instrument this report had until now measures *circles*:
+      //
+      //  - `riskAt` prices a monster as a circle of `senseRange` with a
+      //    proximity ramp, and a body is not that circle's centre — it is a
+      //    6–11px disc inside a 110–260px ring.
+      //  - The candidate probe is `PROBE_S × moveSpeed` = 40px wide while the
+      //    actual step is ~2.8px, so a body is a feature **below the planner's
+      //    resolution**: the score 40px out is nearly the same whether the path
+      //    crosses a body or passes beside it.
+      //  - And the sim has no player↔monster separation at all. A monster stops
+      //    at `attackRange × 0.7` **only while attacking** (a wanderer's 15.4px
+      //    stop is inside the 15px touch threshold, so a chaser is essentially
+      //    always touching); a wandering one does not yield, and the player is
+      //    never blocked. So nothing in the world prevents the overlap either.
+      //
+      // Counted as an *event* keyed by id — a false→true on "these two bodies
+      // overlap" — so a robot that stands inside a monster scores one bump, not
+      // one per frame.
+      //
+      // **Two buckets this channel started with were deleted because they are
+      // tautologies, and both are worth recording as such.** In all three
+      // archetypes the touch threshold `playerRadius + radius` (15 / 16 / 20) is
+      // *strictly inside* both `senseRange` (140 / 260 / 110) and the chase stop
+      // `attackRange × 0.7` (15.4 / 18.2 / 23.8). So:
+      //
+      //  - "was the monster already chasing it" is always yes — a body you can
+      //    touch is a body that can see you, by 100px of margin. A `blind`
+      //    bucket can never fire.
+      //  - "did it close on the monster" is always yes — overlap can only begin
+      //    by the gap shrinking — so an `away` bucket is 0 by construction.
+      //
+      // Worse, the second one is what makes the *interesting* half readable: the
+      // stop rule means a touched monster **had already stopped moving**, so
+      // every one of these is the robot walking into a stationary body. What is
+      // worth counting is therefore not "did it close" (always) but **how
+      // directly** — `toward` is the straight-at-it cone and `lateral` the rest
+      // — and **which** monster, which is the user's 「其它怪物」: `other` counts
+      // the bumps with something that is *not* the nearest monster, i.e. not the
+      // one the policy is arguing with.
+      let bumpEntries = 0;
+      let bumpFrames = 0;
+      let bumpMoving = 0;
+      let bumpToward = 0;
+      let bumpLateral = 0;
+      let bumpNearest = 0;
+      let bumpOther = 0;
+      const prevBump = new Map();
+      // The move that *produced* the state this frame reads: the loop below
+      // samples positions before `stepSim`, so a body that appears overlapped
+      // now was walked into by the previous frame's decision.
+      let prevMoveDx = 0;
+      let prevMoveDy = 0;
 
       while (run.alive && run.time < CAP) {
         // Sampled *before* the step: "given that we were being hit, did the gap
@@ -350,6 +432,8 @@ async function run() {
         // `close` is the same pass under the tighter radius — see `PACK_EDGES`.
         let crowd = 0;
         let close = 0;
+        let pulledThisFrame = 0;
+        let bumpedThisFrame = 0;
         for (const m of run.monsters) {
           const d = Math.hypot(m.posX - run.player.posX, m.posY - run.player.posY);
           if (d <= m.senseRange) crowd++;
@@ -367,9 +451,39 @@ async function run() {
           // two of these reads is one real break. Monsters that die simply
           // vanish from `run.monsters` and cannot post a false one.
           const was = prevAggro.get(m.id) ?? false;
-          if (was && !m.attacking) aggroBreaks++;
+          if (primed) {
+            if (was && !m.attacking) aggroBreaks++;
+            else if (!was && m.attacking) {
+              aggroPulls++;
+              pulledThisFrame++;
+            }
+          }
           prevAggro.set(m.id, m.attacking);
+
+          // Bodies touching: `playerRadius + radius`, the same "drawn radius is
+          // the judged radius" rule the pickups and bullets use (§8.4).
+          const touching = d <= sim.TUNING.playerRadius + BODY_R[m.kind];
+          const wasBump = prevBump.get(m.id) ?? false;
+          if (primed && touching && !wasBump) {
+            bumpEntries++;
+            bumpedThisFrame++;
+            if (near.m !== null && m.id === near.m.id) bumpNearest++;
+            else bumpOther++;
+            const mlen = Math.hypot(prevMoveDx, prevMoveDy);
+            if (mlen > 0) {
+              const bx = (m.posX - run.player.posX) / (d || 1);
+              const by = (m.posY - run.player.posY) / (d || 1);
+              const toward = (prevMoveDx / mlen) * bx + (prevMoveDy / mlen) * by;
+              bumpMoving++;
+              if (toward > 0.707) bumpToward++;
+              else bumpLateral++;
+            }
+          }
+          prevBump.set(m.id, touching);
         }
+        if (primed && pulledThisFrame > 0) pullFrames++;
+        if (primed && bumpedThisFrame > 0) bumpFrames++;
+        primed = true;
         crowdSum += crowd;
         if (crowd > crowdPeak) crowdPeak = crowd;
         const aware = packBucket(crowd);
@@ -393,6 +507,12 @@ async function run() {
         if (st.retreating && !wasRetreating) retreatEntries++;
         wasRetreating = st.retreating;
         frames++;
+
+        // ── Does it charge? ────────────────────────────────────────────────
+        // `near.m`/`near.d` are the *pre-step* nearest monster, which is the one
+        // the decision below was made against.
+        const nearestMon = near.m;
+        const nearestDist = near.d;
 
         // The radial decomposition, and the zone tally. Only moving frames are
         // classified: idle has no direction, and its share is already reported.
@@ -420,6 +540,28 @@ async function run() {
             } else {
               openMoving++;
               openRadialSum += radial;
+            }
+          }
+          // 「不能直接冲着怪物跑过去」, made countable. The move is decomposed
+          // against the bearing to the nearest monster on the frames that
+          // matter: something is already engaged with the robot (that monster
+          // can see it, i.e. it is chasing and shooting), and — separately —
+          // the closer case where it is already inside the robot's *own* attack
+          // range, where closing further can never be an approach to the ring
+          // because the ring is behind us. Outside its circle, walking at a
+          // monster is what the approach rung is for and is not counted.
+          if (nearestMon !== null && nearestDist <= nearestMon.senseRange && moving0) {
+            const ux = (nearestMon.posX - run.player.posX) / (nearestDist || 1);
+            const uy = (nearestMon.posY - run.player.posY) / (nearestDist || 1);
+            const toward = (dx0 / dlen) * ux + (dy0 / dlen) * uy;
+            engagedMoving++;
+            engagedTowardSum += toward;
+            if (toward > 0.707) engagedToward++;
+            else if (toward < -0.707) engagedAway++;
+            else engagedLateral++;
+            if (nearestDist <= run.player.attackRange) {
+              ownRangeMoving++;
+              if (toward > 0.707) ownRangeToward++;
             }
           }
           if (ZONES) {
@@ -530,6 +672,10 @@ async function run() {
         }
 
         sim.stepSim(run, decision.input, DT);
+        // Carried into the next frame, where the bump channel needs to know
+        // which way the move that produced the new positions was pointing.
+        prevMoveDx = decision.input.dx;
+        prevMoveDy = decision.input.dy;
         if (run.kills > killsBefore) {
           const n = run.kills - killsBefore;
           awareKills[aware] += n;
@@ -588,7 +734,7 @@ async function run() {
       // being a set of basins and becomes a spawn-rate table.
       let homed = 0;
       for (const m of run.monsters) {
-        if (sim.regionIndexAtPoint(run.width, run.height, m.posX, m.posY) === m.region) homed++;
+        if (sim.regionIndexAt(run, m.posX, m.posY) === m.region) homed++;
       }
 
       rows.push({
@@ -614,6 +760,22 @@ async function run() {
         contact,
         escaped,
         aggroBreaks,
+        aggroPulls,
+        pullFrames,
+        bumpEntries,
+        bumpFrames,
+        bumpMoving,
+        bumpToward,
+        bumpLateral,
+        bumpNearest,
+        bumpOther,
+        engagedMoving,
+        engagedToward,
+        engagedLateral,
+        engagedAway,
+        engagedTowardSum,
+        ownRangeMoving,
+        ownRangeToward,
         retreatEntries,
         longestRun,
         reversals,
@@ -723,6 +885,46 @@ async function run() {
     "aggro breaks  total / per run",
     `${sum((r) => r.aggroBreaks)}  /  ${fixed(avg(rows.map((r) => r.aggroBreaks)), 2)}`,
   );
+  // The other direction of the same mechanic, and the one the user's
+  // 「避免引到更多怪」 is about. `pullFrames` is reported as a share of *life*
+  // rather than of frames, because a pull is a thing that happens to a robot
+  // that has been alive a while; the per-run count is the honest headline and
+  // the share says how continuous the pressure is.
+  row(
+    "aggro pulls  total / per run",
+    `${sum((r) => r.aggroPulls)}  /  ${fixed(avg(rows.map((r) => r.aggroPulls)), 2)}`,
+  );
+  row(
+    "frames where something new noticed",
+    `${pct(sum((r) => r.pullFrames) / frames)} of ${frames}`,
+  );
+  // ── Bodies touching — 「仍然会不停的撞击其它怪物」 ───────────────────────────
+  // Entries, not frames: the user's report is that it *keeps happening*, which
+  // is a rate of events. `bumpFrames` is the share of life spent overlapping,
+  // which is a different statement — a robot parked inside a monster scores one
+  // entry and a thousand frames.
+  const bumps = sum((r) => r.bumpEntries);
+  const bMove = sum((r) => r.bumpMoving);
+  row(
+    "body contacts  total / per run",
+    `${bumps}  /  ${fixed(avg(rows.map((r) => r.bumpEntries)), 2)}`,
+  );
+  row("frames overlapping a body", `${pct(sum((r) => r.bumpFrames) / frames)} of ${frames}`);
+  row(
+    "  which monster: the nearest one  /  another",
+    `${pct(bumps ? sum((r) => r.bumpNearest) / bumps : 0)}  /  ${pct(
+      bumps ? sum((r) => r.bumpOther) / bumps : 0,
+    )}`,
+  );
+  // `away` is deliberately absent — see the block that declares these counters.
+  // Overlap can only begin by the gap closing, so every moving bump reads
+  // positive here and a third bucket would be a tautology dressed as a finding.
+  row(
+    "  how directly it closed on it",
+    `toward ${pct(bMove ? sum((r) => r.bumpToward) / bMove : 0)}  lateral ${pct(
+      bMove ? sum((r) => r.bumpLateral) / bMove : 0,
+    )}   of ${bMove} moving`,
+  );
   row("retreat-latch entries", sum((r) => r.retreatEntries));
   console.log("");
   // ── Wall proximity — how much room does it keep to dodge in? ──────────────
@@ -782,6 +984,26 @@ async function run() {
       `near wall ${fixed(nwMoving ? sum((r) => r.nearWallRadialSum) / nwMoving : 0)}   open ${fixed(
         sum((r) => r.openMoving) ? sum((r) => r.openRadialSum) / sum((r) => r.openMoving) : 0,
       )}`,
+    );
+    // ── Charging — 「不能直接冲着怪物跑过去」 ────────────────────────────────
+    // `toward` is the 90° cone at the monster, `away` the opposite one, and
+    // `lateral` the two cones that slide past it. Read against `engagedMoving`
+    // (the denominator), not against all frames.
+    const eng = sum((r) => r.engagedMoving);
+    const own = sum((r) => r.ownRangeMoving);
+    row(
+      "  engaged moves: toward monster",
+      `toward ${pct(eng ? sum((r) => r.engagedToward) / eng : 0)}  lateral ${pct(
+        eng ? sum((r) => r.engagedLateral) / eng : 0,
+      )}  away ${pct(eng ? sum((r) => r.engagedAway) / eng : 0)}   of ${eng}`,
+    );
+    row(
+      "  mean closing component",
+      `${fixed(eng ? sum((r) => r.engagedTowardSum) / eng : 0)}  (+1 straight at it, -1 straight away)`,
+    );
+    row(
+      "  charging inside own range",
+      `${pct(own ? sum((r) => r.ownRangeToward) / own : 0)} of ${own} moving frames`,
     );
     const bandIntents = (key) => {
       const t = { flee: 0, heal: 0, loot: 0, kite: 0, roam: 0 };
